@@ -27,3 +27,18 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 The suite is local and does not open a network connection.
+
+## Read-only Vast discovery
+
+Offer search is separate from job execution. `LIVE_EXTERNAL_PROVIDERS` stays
+false, and this command does not create, start, stop, or destroy a GPU.
+It runs only when both values are present. The key below is a placeholder:
+
+```bash
+VAST_API_KEY=your-key-here VAST_READ_ONLY_DISCOVERY=1 \
+  PYTHONPATH=src python3 -m media_engine.providers.vast_discover
+```
+
+Optional filters, all unset by default: `VAST_MIN_VRAM_GB`,
+`VAST_MAX_HOURLY_PRICE_USD`, `VAST_MIN_RELIABILITY`, `VAST_GPU_COUNT`.
+The command prints normalized offers and does not print the API key.
