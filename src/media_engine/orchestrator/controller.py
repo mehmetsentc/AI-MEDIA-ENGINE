@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from media_engine.auth.clients import ClientDirectory
 from media_engine.engines.image.base import ImageEngine
@@ -24,7 +24,15 @@ from media_engine.jobs.model import (
 )
 from media_engine.jobs.queue import JobQueue
 from media_engine.jobs.recovery import RecoveryReport, recover
-from media_engine.providers.base import GPUProvider, CreateResult, ProviderCapacityError, Quote
+from media_engine.providers.base import (
+    GPUProvider,
+    OBSERVE_FOREIGN,
+    OBSERVE_GONE,
+    OBSERVE_PRESENT,
+    CreateResult,
+    ProviderCapacityError,
+    Quote,
+)
 from media_engine.providers.fake import FakeGPUProvider
 from media_engine.resources.ledger import ResourceLedger, ResourceRecord, ResourceState
 from media_engine.safety.limits import SafetyLimits
@@ -53,7 +61,8 @@ class MediaController:
     def __init__(self, db_path: str, storage_root: str, *, clock: Optional[ManualClock] = None,
                  limits: Optional[SafetyLimits] = None, provider: Optional[GPUProvider] = None,
                  image_engine: Optional[ImageEngine] = None,
-                 clients: Optional[ClientDirectory] = None) -> None:
+                 clients: Optional[ClientDirectory] = None,
+                 idle_wait: Optional[Callable[[threading.Condition], None]] = None) -> None:
         self.clock = clock or ManualClock()
         self.limits = limits or SafetyLimits()
         self.clients = clients or ClientDirectory()
@@ -68,14 +77,58 @@ class MediaController:
         self.storage = LocalStorage(storage_root)
         self.trace: list[str] = []
         self.last_shutdown_reason: Optional[str] = None
+        self.phase_log: list[str] = []
+        self.idle_waits = 0
+        self.recovery_complete = False
         self._worker_id: Optional[str] = None
         self._worker_created_at: Optional[float] = None
         self._worker_idle_since: Optional[float] = None
         self._lock = threading.Lock()
+        self._wake = threading.Condition()
+        self._ready = threading.Event()
+        self._settled = threading.Event()
+        self._stop_requested = False
+        self._thread: Optional[threading.Thread] = None
+        self._idle_wait = idle_wait or (lambda cond: cond.wait())
 
     def startup(self) -> RecoveryReport:
         with self._lock:
-            return recover(self.jobs, self.queue, self.attempts, now_iso=self.clock.iso())
+            report = recover(self.jobs, self.queue, self.attempts, now_iso=self.clock.iso())
+            self._reconcile_ledger()
+            self.recovery_complete = True
+            self.phase_log.append("recovery_complete")
+            return report
+
+    def start(self) -> RecoveryReport:
+        """Recover state, then run one background worker. Recovery finishes first."""
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("runner already started")
+        report = self.startup()
+        self._stop_requested = False
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._run_loop, name="media-engine-runner", daemon=False)
+        self._thread.start()
+        if not self._ready.wait(timeout=2):
+            raise RuntimeError("runner did not start")
+        return report
+
+    def stop(self) -> None:
+        """Stop accepting new runner work, wake the thread, and join it."""
+        with self._lock:
+            self._stop_requested = True
+        with self._wake:
+            self._wake.notify_all()
+        thread = self._thread
+        if thread is not None:
+            thread.join()
+            self._thread = None
+
+    @property
+    def runner_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def wait_settled(self, timeout: float = 2.0) -> bool:
+        return self._settled.wait(timeout)
 
     def submit_job(self, client_id: str, job_type: str, prompt: str) -> Job:
         with self._lock:
@@ -100,7 +153,9 @@ class MediaController:
             self.jobs.insert(job)
             self.queue.enqueue(job.id)
             self.trace.append(f"{job.id}:QUEUED")
-            return job
+            self._settled.clear()
+        self._notify()
+        return job
 
     def get_job(self, job_id: str) -> Job:
         return self.jobs.get(job_id)
@@ -128,6 +183,62 @@ class MediaController:
     def enforce_lifecycle(self) -> Optional[str]:
         with self._lock:
             return self._enforce()
+
+    def _notify(self) -> None:
+        with self._wake:
+            self._wake.notify()
+
+    def _run_loop(self) -> None:
+        announced = False
+        while True:
+            with self._wake:
+                if self._stop_requested:
+                    if not announced:
+                        self._ready.set()
+                    return
+                if not self.queue.pending():
+                    self.idle_waits += 1
+                    if not announced:
+                        self._ready.set()
+                        announced = True
+                    self._idle_wait(self._wake)
+                    continue
+                if not announced:
+                    self._ready.set()
+                    announced = True
+            self._process_next()
+
+    def _process_next(self) -> None:
+        with self._lock:
+            if self._stop_requested:
+                return
+            job_id = self.queue.dequeue()
+            if job_id is None:
+                return
+            self._run_one(job_id)
+            self._enforce()
+        self._settled.set()
+
+    def _reconcile_ledger(self) -> None:
+        for record in self.ledger.unresolved():
+            if record.state not in (ResourceState.READY, ResourceState.TERMINATING):
+                continue
+            observation = self.provider.observe(record.resource_id, record.owner_id)
+            now = self.clock.now()
+            if observation == OBSERVE_GONE:
+                record.state = ResourceState.TERMINATED
+                record.last_error = "RECONCILED_GONE"
+                record.updated_at = now
+                self.ledger.upsert(record)
+                continue
+            if observation == OBSERVE_PRESENT:
+                self._terminate(record.resource_id, "RECONCILED_TERMINATED")
+                continue
+            record.last_error = (
+                "OWNERSHIP_MISMATCH" if observation == OBSERVE_FOREIGN else "PROVIDER_STATUS_UNKNOWN"
+            )
+            record.updated_at = now
+            self.ledger.upsert(record)
 
     def _run_one(self, job_id: str) -> None:
         try:
@@ -182,6 +293,7 @@ class MediaController:
         self._mark_idle(resource_id)
 
     def _create_worker(self, job: Job, quote: Quote) -> Optional[str]:
+        self.phase_log.append("provision")
         provisional = "res_" + uuid.uuid4().hex
         now = self.clock.now()
         self._ledger(provisional, job.client_id, ResourceState.REQUESTED, quote, now, None)
@@ -201,7 +313,7 @@ class MediaController:
             self._ledger(provisional, job.client_id, ResourceState.AMBIGUOUS, quote, now, "AMBIGUOUS_CREATE")
             self._fail(job, "AMBIGUOUS_CREATE")
             return None
-        self._ledger(provisional, job.client_id, ResourceState.FAILED, quote, now, "superseded")
+        self.ledger.delete(provisional)
         created = self.clock.now()
         self._ledger(result.resource_id, job.client_id, ResourceState.READY, quote, created, None)
         self._worker_id = result.resource_id

@@ -27,6 +27,12 @@ class CreateResult:
     resource_id: Optional[str] = None
 
 
+OBSERVE_PRESENT = "present"
+OBSERVE_GONE = "gone"
+OBSERVE_FOREIGN = "foreign"
+OBSERVE_UNKNOWN = "unknown"
+
+
 class GPUProvider(abc.ABC):
     """quote, create, status, terminate, list_owned.
 
@@ -53,6 +59,14 @@ class GPUProvider(abc.ABC):
     @abc.abstractmethod
     def list_owned(self) -> list[dict]:
         raise NotImplementedError
+
+    @abc.abstractmethod
+    def observe(self, resource_id: str, owner: str) -> str:
+        """Return present, gone, foreign, or unknown.
+
+        present requires both the recorded id and the owner to match.
+        unknown means the provider could not be asked. Never guess.
+        """
 
     def begin_busy(self, resource_id: str) -> None:
         """Local lifecycle hook. Remote providers can no-op until a job starts."""

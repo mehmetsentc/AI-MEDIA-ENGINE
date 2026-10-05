@@ -96,6 +96,14 @@ class ResourceLedger:
             conn.close()
         return [_row(row) for row in rows]
 
+    def delete(self, resource_id: str) -> None:
+        conn = connect(self.db_path)
+        try:
+            conn.execute("DELETE FROM external_resources WHERE resource_id = ?", (resource_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
     def unresolved(self) -> list[ResourceRecord]:
         return [record for record in self.list() if is_unresolved(record)]
 

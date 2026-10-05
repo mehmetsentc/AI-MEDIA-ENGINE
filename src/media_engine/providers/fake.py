@@ -7,6 +7,10 @@ from typing import Callable, Optional
 
 from media_engine.providers.base import (
     GPUProvider,
+    OBSERVE_FOREIGN,
+    OBSERVE_GONE,
+    OBSERVE_PRESENT,
+    OBSERVE_UNKNOWN,
     CreateResult,
     ProviderCapacityError,
     ProviderError,
@@ -41,6 +45,8 @@ class FakeGPUProvider(GPUProvider):
         self._now = now
         self.max_workers = max_workers
         self.create_calls = 0
+        self.terminate_calls = 0
+        self.reachable = True
         self._resources: dict[str, _Resource] = {}
 
     def quote(self, owner: str) -> Quote:
@@ -94,7 +100,29 @@ class FakeGPUProvider(GPUProvider):
         resource.history.append(READY)
         resource.idle_since = self._now()
 
+    def observe(self, resource_id: str, owner: str) -> str:
+        if not self.reachable:
+            return OBSERVE_UNKNOWN
+        resource = self._resources.get(resource_id)
+        if resource is None or resource.status == TERMINATED:
+            return OBSERVE_GONE
+        if resource.owner != owner:
+            return OBSERVE_FOREIGN
+        return OBSERVE_PRESENT
+
+    def plant(self, resource_id: str, owner: str, *, status: str = READY) -> None:
+        """Test hook for a resource that already exists before this process."""
+        if resource_id in self._resources:
+            raise ProviderError("resource already exists")
+        resource = _Resource(resource_id, owner, self.hourly_price, self._now())
+        resource.status = status
+        resource.history = [OFF, status] if status != OFF else [OFF]
+        if status == READY:
+            resource.idle_since = resource.created_at
+        self._resources[resource_id] = resource
+
     def terminate(self, resource_id: str) -> None:
+        self.terminate_calls += 1
         resource = self._require(resource_id)
         if resource.status == TERMINATED:
             return

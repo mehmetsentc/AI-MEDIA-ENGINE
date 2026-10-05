@@ -27,19 +27,27 @@ class RecoveryReport:
 
 def recover(jobs: JobStore, queue: JobQueue, attempts: AttemptStore, *, now_iso: str) -> RecoveryReport:
     report = RecoveryReport()
+    pending = set(queue.pending())
+
+    def _enqueue(job_id: str) -> None:
+        if job_id in pending:
+            return
+        queue.enqueue(job_id)
+        pending.add(job_id)
+
     for job in jobs.list():
         if job.status in JobStatus.TERMINAL:
             report.untouched_job_ids.append(job.id)
             continue
         if job.status == JobStatus.QUEUED:
-            queue.enqueue(job.id)
+            _enqueue(job.id)
             report.requeued_job_ids.append(job.id)
             continue
         if job.status == JobStatus.WAITING_FOR_WORKER:
             job.transition_to(JobStatus.QUEUED)
             job.updated_at = now_iso
             jobs.save(job)
-            queue.enqueue(job.id)
+            _enqueue(job.id)
             report.requeued_job_ids.append(job.id)
             continue
         if job.status == JobStatus.RUNNING:
