@@ -19,12 +19,18 @@ class UsageEvent:
     attempt_count: int
     estimated_cost_usd: Optional[str]
     status: str
+    provider: Optional[str] = None
+    gpu_model: Optional[str] = None
+    hourly_price_usd: Optional[str] = None
+    gpu_seconds: Optional[float] = None
+    actual_cost_usd: Optional[str] = None
 
 
 class UsageStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         init_schema(db_path)
+        _ensure_usage_columns(db_path)
 
     def record(self, event: UsageEvent) -> None:
         conn = connect(self.db_path)
@@ -33,13 +39,16 @@ class UsageStore:
                 """
                 INSERT INTO usage_events (
                     job_id, client_id, job_type, engine_id, started_at, finished_at,
-                    duration_seconds, attempt_count, estimated_cost_usd, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    duration_seconds, attempt_count, estimated_cost_usd, status,
+                    provider, gpu_model, hourly_price_usd, gpu_seconds, actual_cost_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.job_id, event.client_id, event.job_type, event.engine_id,
                     event.started_at, event.finished_at, event.duration_seconds,
                     event.attempt_count, event.estimated_cost_usd, event.status,
+                    event.provider, event.gpu_model, event.hourly_price_usd,
+                    event.gpu_seconds, event.actual_cost_usd,
                 ),
             )
             conn.commit()
@@ -68,4 +77,28 @@ class UsageStore:
             attempt_count=int(row["attempt_count"]),
             estimated_cost_usd=row["estimated_cost_usd"],
             status=row["status"],
+            provider=row["provider"],
+            gpu_model=row["gpu_model"],
+            hourly_price_usd=row["hourly_price_usd"],
+            gpu_seconds=row["gpu_seconds"],
+            actual_cost_usd=row["actual_cost_usd"],
         )
+
+
+def _ensure_usage_columns(db_path: str) -> None:
+    columns = (
+        ("provider", "TEXT"),
+        ("gpu_model", "TEXT"),
+        ("hourly_price_usd", "TEXT"),
+        ("gpu_seconds", "REAL"),
+        ("actual_cost_usd", "TEXT"),
+    )
+    conn = connect(db_path)
+    try:
+        have = {row[1] for row in conn.execute("PRAGMA table_info(usage_events)")}
+        for name, kind in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE usage_events ADD COLUMN {name} {kind}")
+        conn.commit()
+    finally:
+        conn.close()

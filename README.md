@@ -40,5 +40,23 @@ VAST_API_KEY=your-key-here VAST_READ_ONLY_DISCOVERY=1 \
 ```
 
 Optional filters, all unset by default: `VAST_MIN_VRAM_GB`,
-`VAST_MAX_HOURLY_PRICE_USD`, `VAST_MIN_RELIABILITY`, `VAST_GPU_COUNT`.
+`VAST_MAX_HOURLY_PRICE_USD`, `VAST_MIN_RELIABILITY`, `VAST_GPU_COUNT`,
+`VAST_GPU_MODEL`, `VAST_LIMIT` (default 64).
 The command prints normalized offers and does not print the API key.
+`dlperf` is only a marketplace heuristic, not measured inference speed.
+
+## Read-only GPU preflight
+
+This command searches offers, ranks them, and stops at human approval.
+It does not create or destroy a GPU. There is no default approval.
+
+```bash
+VAST_API_KEY=your-key-here VAST_READ_ONLY_DISCOVERY=1 \
+  VAST_MIN_VRAM_GB=24 VAST_GPU_COUNT=1 \
+  VAST_MAX_HOURLY_PRICE_USD=0.60 VAST_MIN_RELIABILITY=0.90 \
+  VAST_MAX_JOB_SECONDS=600 \
+  PYTHONPATH=src python3 -m media_engine.providers.vast_preflight
+```
+
+`VAST_GPU_MODEL` is an optional investigation filter, for example a marketplace
+name with spaces or underscores. It is not a built-in model list.

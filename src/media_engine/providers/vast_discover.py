@@ -11,6 +11,8 @@ Optional generic filters, unset by default:
     VAST_MAX_HOURLY_PRICE_USD
     VAST_MIN_RELIABILITY
     VAST_GPU_COUNT
+    VAST_GPU_MODEL
+    VAST_LIMIT
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ def main(
             _requirements(env),
             api_key=key,
             read_only=True,
-            limit=5,
+            limit=_limit(env),
         )
     except Exception as exc:
         print(_redact(str(exc), key), file=sys.stderr)
@@ -58,7 +60,15 @@ def _requirements(env: Mapping[str, str]) -> GpuRequirements:
         max_hourly_price_usd=_optional_decimal(env.get("VAST_MAX_HOURLY_PRICE_USD")),
         min_reliability=_optional_decimal(env.get("VAST_MIN_RELIABILITY")),
         gpu_count=_optional_int(env.get("VAST_GPU_COUNT")),
+        gpu_model=(env.get("VAST_GPU_MODEL") or "").strip() or None,
     )
+
+
+def _limit(env: Mapping[str, str]) -> int:
+    raw = (env.get("VAST_LIMIT") or "").strip()
+    if not raw:
+        return 64
+    return int(raw)
 
 
 def _optional_decimal(value: Optional[str]) -> Optional[Decimal]:

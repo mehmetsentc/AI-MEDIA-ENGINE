@@ -14,6 +14,7 @@ class GpuRequirements:
     max_hourly_price_usd: Optional[Decimal] = None
     min_reliability: Optional[Decimal] = None
     gpu_count: Optional[int] = None
+    gpu_model: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -46,3 +47,8 @@ class GpuOffer:
             "location": self.location,
             "availability": self.availability,
         }
+
+
+def model_key(value: str) -> str:
+    """Compare GPU names without treating punctuation as a different model."""
+    return " ".join(value.replace("_", " ").casefold().split())

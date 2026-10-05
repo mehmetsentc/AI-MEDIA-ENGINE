@@ -6,7 +6,7 @@ import urllib.request
 from decimal import Decimal
 from typing import Callable, Optional
 
-from media_engine.providers.offers import GpuOffer, GpuRequirements
+from media_engine.providers.offers import GpuOffer, GpuRequirements, model_key
 
 SEARCH_METHOD = "POST"
 SEARCH_URL = "https://console.vast.ai/api/v0/bundles/"
@@ -83,8 +83,8 @@ class VastDiscovery:
             raise DiscoveryDisabled("VAST_READ_ONLY_DISCOVERY is required")
         if not isinstance(api_key, str) or not api_key.strip():
             raise MissingApiKey("VAST_API_KEY is required")
-        if limit < 1 or limit > 20:
-            raise VastDiscoveryError("limit must be from 1 to 20")
+        if limit < 1 or limit > 100:
+            raise VastDiscoveryError("limit must be from 1 to 100")
         query = _query(requirements, limit)
         payload = json.dumps(query, separators=(",", ":")).encode("utf-8")
         if api_key.encode("utf-8") in payload:
@@ -110,8 +110,9 @@ def _query(requirements: GpuRequirements, limit: int) -> dict:
         "limit": limit,
         "type": "on-demand",
         "rentable": {"eq": True},
-        "order": [["dph_total", "asc"]],
     }
+    if requirements.gpu_model:
+        query["gpu_name"] = {"eq": requirements.gpu_model}
     if requirements.gpu_count is not None:
         query["num_gpus"] = {"eq": requirements.gpu_count}
     if requirements.min_vram_gb is not None:
@@ -136,7 +137,14 @@ def _normalize(raw: bytes, requirements: GpuRequirements) -> list[GpuOffer]:
         offer = _one(row)
         if offer is not None and _matches(offer, requirements):
             offers.append(offer)
+    offers.sort(key=_offer_sort_key)
     return offers
+
+
+def _offer_sort_key(offer: GpuOffer) -> tuple:
+    if offer.offer_id.isdigit():
+        return (0, int(offer.offer_id))
+    return (1, offer.offer_id)
 
 
 def _one(row: object) -> Optional[GpuOffer]:
@@ -183,5 +191,8 @@ def _matches(offer: GpuOffer, requirements: GpuRequirements) -> bool:
         return False
     if requirements.min_reliability is not None:
         if offer.reliability is None or offer.reliability < requirements.min_reliability:
+            return False
+    if requirements.gpu_model:
+        if model_key(offer.gpu_model) != model_key(requirements.gpu_model):
             return False
     return True

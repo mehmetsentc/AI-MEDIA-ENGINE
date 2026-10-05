@@ -40,7 +40,12 @@ CREATE TABLE IF NOT EXISTS usage_events (
     duration_seconds REAL NOT NULL,
     attempt_count INTEGER NOT NULL,
     estimated_cost_usd TEXT,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    provider TEXT,
+    gpu_model TEXT,
+    hourly_price_usd TEXT,
+    gpu_seconds REAL,
+    actual_cost_usd TEXT
 );
 CREATE TABLE IF NOT EXISTS external_resources (
     resource_id TEXT PRIMARY KEY,
