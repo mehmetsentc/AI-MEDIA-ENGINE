@@ -5,6 +5,7 @@ import json
 import re
 import urllib.request
 from typing import Callable, Optional
+from urllib.parse import quote_plus
 
 from media_engine.providers.base import (
     OBSERVE_FOREIGN,
@@ -23,8 +24,9 @@ _OWNER = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
 _DIGITS = re.compile(r"^[0-9]+$")
 _ASKS = re.compile(r"^https://console.vast.ai/api/v0/asks/([0-9]+)/$")
 _INSTANCE = re.compile(r"^https://console.vast.ai/api/v0/instances/([0-9]+)/$")
-_INSTANCES = "https://console.vast.ai/api/v0/instances/"
+_INSTANCES_V1 = "https://console.vast.ai/api/v1/instances/"
 _MAX_BODY = 1_000_000
+_MAX_INSTANCE_PAGES = 8
 
 Transport = Callable[[str, str, bytes, dict[str, str]], bytes]
 
@@ -51,11 +53,37 @@ def _not_armed(method: str, url: str, body: bytes, headers: dict[str, str]) -> b
     raise VastMutationBlocked("VAST_MUTATION_BLOCKED")
 
 
+def instances_list_url(after_token: Optional[str] = None) -> str:
+    """Read-only list URL used by the current Vast CLI."""
+    pairs = [
+        ("select_filters", json.dumps({})),
+        ("order_by", json.dumps([{"col": "id", "dir": "asc"}])),
+        ("limit", json.dumps(25)),
+    ]
+    if after_token is not None:
+        if after_token == "" or any(char.isspace() for char in after_token):
+            raise ProvisionBlocked("VAST_RESPONSE_INVALID")
+        pairs.append(("after_token", after_token))
+    query = "&".join(name + "=" + quote_plus(value) for name, value in pairs)
+    return _INSTANCES_V1 + "?" + query
+
+
+def _instances_list_allowed(url: str) -> bool:
+    first = instances_list_url()
+    if url == first:
+        return True
+    prefix = first + "&after_token="
+    if not url.startswith(prefix):
+        return False
+    token = url[len(prefix):]
+    return token != "" and "&" not in token and "/" not in token
+
+
 def live_transport(method: str, url: str, body: bytes, headers: dict[str, str]) -> bytes:
     """Live Vast call. Only the phase 2C manual command may pass this in."""
     if method == "PUT" and _ASKS.fullmatch(url):
         allowed = True
-    elif method == "GET" and url == _INSTANCES:
+    elif method == "GET" and _instances_list_allowed(url):
         allowed = True
     elif method == "DELETE" and _INSTANCE.fullmatch(url):
         allowed = True
@@ -200,15 +228,27 @@ class VastLifecycle:
         return OBSERVE_UNKNOWN
 
     def _instances(self, api_key: str) -> list[dict]:
-        raw = self._transport("GET", _INSTANCES, b"", self._headers(api_key))
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            return []
-        rows = payload.get("instances") if isinstance(payload, dict) else None
-        if not isinstance(rows, list):
-            return []
-        return [row for row in rows if isinstance(row, dict)]
+        rows: list[dict] = []
+        token: Optional[str] = None
+        seen: set[str] = set()
+        for _ in range(_MAX_INSTANCE_PAGES):
+            raw = self._transport("GET", instances_list_url(token), b"", self._headers(api_key))
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError):
+                return []
+            page = payload.get("instances") if isinstance(payload, dict) else None
+            if not isinstance(page, list):
+                return []
+            rows.extend(row for row in page if isinstance(row, dict))
+            nxt = payload.get("next_token") if isinstance(payload, dict) else None
+            if nxt in (None, ""):
+                return rows
+            if not isinstance(nxt, str) or nxt in seen:
+                return []
+            seen.add(nxt)
+            token = nxt
+        return []
 
     def _headers(self, api_key: str) -> dict[str, str]:
         return {

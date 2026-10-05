@@ -14,8 +14,14 @@ from media_engine.providers.planner import (
     max_estimated_gpu_cost,
     plan,
 )
-from media_engine.providers.vast import SEARCH_URL, VastDiscovery
-from media_engine.providers.vast_lifecycle import ProvisionBlocked, VastLifecycle, approval_token
+from media_engine.providers.vast import SEARCH_URL, VastDiscovery, VastMutationBlocked
+from media_engine.providers.vast_lifecycle import (
+    ProvisionBlocked,
+    VastLifecycle,
+    approval_token,
+    instances_list_url,
+    live_transport,
+)
 from media_engine.providers.vast_preflight import main
 from media_engine.resources.ledger import ResourceRecord, ResourceState
 from media_engine.safety.limits import ExternalProvidersDisabled, SafetyLimits
@@ -292,6 +298,59 @@ class Phase2BTests(unittest.TestCase):
         self.assertEqual(calls[0][1], "https://console.vast.ai/api/v0/asks/1/")
         self.assertIn(b"media-engine:film-studio", calls[0][2])
         self.assertNotIn(b"unit-test-vast-secret", calls[0][2])
+
+    def test_instance_list_uses_current_read_contract(self) -> None:
+        secret = "unit-test-vast-secret"
+        calls = []
+
+        def transport(method, url, body, headers):
+            calls.append((method, url, body))
+            self.assertNotIn(secret, url)
+            self.assertNotIn(secret, body.decode("utf-8"))
+            self.assertNotIn(secret, headers["Accept"])
+            if len(calls) == 1:
+                return b'{"instances":[{"id":7,"label":"media-engine:film-studio"}],"next_token":"page-2"}'
+            return b'{"instances":[],"next_token":null}'
+
+        lifecycle = VastLifecycle(
+            self.db_path,
+            limits=SafetyLimits(live_external_providers=True),
+            transport=transport,
+        )
+        owned = lifecycle.list_owned("film-studio", api_key=secret, provision=True)
+        self.assertEqual(owned, ["7"])
+        self.assertEqual([method for method, _url, _body in calls], ["GET", "GET"])
+        self.assertEqual(calls[0][1], instances_list_url())
+        self.assertEqual(calls[1][1], instances_list_url("page-2"))
+        self.assertTrue(calls[0][1].startswith("https://console.vast.ai/api/v1/instances/?"))
+        self.assertNotIn("/api/v0/instances/", calls[0][1])
+        with self.assertRaises(VastMutationBlocked):
+            live_transport("GET", "https://console.vast.ai/api/v0/instances/", b"", {})
+        with self.assertRaises(VastMutationBlocked):
+            live_transport("PUT", instances_list_url(), b"{}", {})
+        with self.assertRaises(VastMutationBlocked):
+            live_transport("DELETE", "https://console.vast.ai/api/v1/instances/7/", b"", {})
+
+    def test_instance_list_failure_does_not_reveal_secret(self) -> None:
+        secret = "unit-test-vast-secret"
+
+        def transport(method, url, body, headers):
+            self.assertNotIn(secret, url)
+            raise RuntimeError("list failed")
+
+        lifecycle = VastLifecycle(
+            self.db_path,
+            limits=SafetyLimits(live_external_providers=True),
+            transport=transport,
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            lifecycle.list_owned("film-studio", api_key=secret, provision=True)
+        self.assertNotIn(secret, str(caught.exception))
+        calls = []
+        blocked = self._lifecycle(calls, live=False)
+        with self.assertRaises(ExternalProvidersDisabled):
+            blocked.list_owned("film-studio", api_key=secret, provision=True)
+        self.assertEqual(calls, [])
 
     def _lifecycle(self, calls: list, *, live: bool, body: bytes = b"{}") -> VastLifecycle:
         def transport(method, url, payload, headers):
