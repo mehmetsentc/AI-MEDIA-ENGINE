@@ -27,7 +27,7 @@ from media_engine.resources.ledger import ResourceState
 from media_engine.safety.limits import SafetyLimits
 from media_engine.usage import UsageEvent, UsageStore
 
-APPROVED_OFFER_ID = "43994879"
+APPROVED_OFFER_ID = "43994880"
 APPROVED_GPU_MODEL = "RTX 5090"
 MAX_HOURLY_USD = Decimal("0.40")
 MAX_ESTIMATED_COST_USD = Decimal("0.07")

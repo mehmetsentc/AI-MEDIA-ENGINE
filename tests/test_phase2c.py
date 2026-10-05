@@ -163,7 +163,7 @@ class Phase2CTests(unittest.TestCase):
         self.assertIn("LIFETIME_EXCEEDED", text)
         self.assertEqual([call[0] for call in self.calls].count("PUT"), 1)
         self.assertIn("DELETE", [call[0] for call in self.calls])
-        self.assertTrue(all(call[1].endswith("/asks/43994879/") for call in self.calls if call[0] == "PUT"))
+        self.assertTrue(all(call[1].endswith("/asks/43994880/") for call in self.calls if call[0] == "PUT"))
 
     def _offers(self, row: dict):
         def transport(method, url, body, headers):
@@ -183,7 +183,7 @@ class Phase2CTests(unittest.TestCase):
             if method == "POST":
                 return json.dumps({"offers": [_row()]}).encode("utf-8")
             if method == "PUT":
-                self.assertTrue(url.endswith("/asks/43994879/"))
+                self.assertTrue(url.endswith("/asks/43994880/"))
                 self.assertIn(b"media-engine:phase2c", body)
                 self.assertIn(b"ubuntu:22.04", body)
                 return create_body

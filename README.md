@@ -64,7 +64,7 @@ name with spaces or underscores. It is not a built-in model list.
 ## Phase 2C approved lifecycle
 
 This is the only command that can rent a GPU. It is not run by tests.
-It creates offer `43994879` only, checks ownership, then destroys that
+It creates offer `43994880` only, checks ownership, then destroys that
 instance. It does not download a model or run inference. The instance
 image is `ubuntu:22.04` with 8 GB disk, which is the rental shell, not a
 model. There is no default approval. If any value below is missing or
@@ -74,7 +74,7 @@ the offer is gone or priced above $0.40/hour, it stops before create.
 VAST_API_KEY=your-key-here \
 LIVE_EXTERNAL_PROVIDERS=true \
 VAST_PROVISIONING=1 \
-VAST_APPROVED_OFFER_ID=43994879 \
-VAST_HUMAN_APPROVAL=approve:43994879 \
+VAST_APPROVED_OFFER_ID=43994880 \
+VAST_HUMAN_APPROVAL=approve:43994880 \
 PYTHONPATH=src python3 -m media_engine.providers.phase2c
 ```
