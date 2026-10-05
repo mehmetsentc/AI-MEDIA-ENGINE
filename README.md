@@ -8,11 +8,14 @@ not turn a provider on. The global kill switch fails closed when it is set.
 
 ## Phase 1 path
 
-`POST /v1/jobs` stores an `IMAGE_GENERATE` job as `QUEUED` and returns immediately.
+`POST /v1/jobs` stores a job as `QUEUED` and returns immediately.
 `MediaController.start()` recovers persisted jobs, reconciles the resource
 ledger, then one background thread drains the queue. The thread waits on a
 condition and wakes when a job is queued. `stop()` joins that thread.
-Idle and lifetime shutdown still use an injected clock.
+`LocalAPIServer` boots that controller and joins it on HTTP shutdown.
+`IMAGE_GENERATE` still uses the fake GPU path. `TEXT_GENERATE` uses
+`FakeTextEngine` and does not provision a GPU. Clients seeded today are
+`film-studio` and `nahaber`. Idle and lifetime shutdown still use an injected clock.
 
 SQLite stores job metadata, attempts, and the resource ledger. Artifact bytes
 stay on the filesystem.

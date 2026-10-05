@@ -9,7 +9,8 @@ from typing import Any, Optional
 from media_engine.db import connect, init_schema
 
 IMAGE_GENERATE = "IMAGE_GENERATE"
-SUPPORTED_JOB_TYPES = frozenset({IMAGE_GENERATE})
+TEXT_GENERATE = "TEXT_GENERATE"
+SUPPORTED_JOB_TYPES = frozenset({IMAGE_GENERATE, TEXT_GENERATE})
 
 
 class JobStatus:
@@ -80,6 +81,7 @@ class Job:
     result_uri: Optional[str]
     error_code: Optional[str]
     prompt: str
+    task: Optional[str] = None
 
     def transition_to(self, target: str) -> None:
         allowed = ALLOWED_TRANSITIONS.get(self.status, set())
@@ -119,7 +121,7 @@ class JobStore:
                 (
                     job.id, job.client_id, job.job_type, job.status, job.created_at,
                     job.updated_at, job.attempt_count, job.result_uri, job.error_code,
-                    json.dumps({"prompt": job.prompt}, separators=(",", ":")),
+                    json.dumps(_input_payload(job), separators=(",", ":")),
                 ),
             )
             conn.commit()
@@ -168,6 +170,13 @@ class JobStore:
         return [_row_to_job(row) for row in rows]
 
 
+def _input_payload(job: Job) -> dict[str, Any]:
+    payload: dict[str, Any] = {"prompt": job.prompt}
+    if job.task:
+        payload["task"] = job.task
+    return payload
+
+
 def _row_to_job(row: Any) -> Job:
     payload = json.loads(row["input_json"])
     return Job(
@@ -181,6 +190,7 @@ def _row_to_job(row: Any) -> Job:
         result_uri=row["result_uri"],
         error_code=row["error_code"],
         prompt=payload.get("prompt", ""),
+        task=payload.get("task"),
     )
 
 

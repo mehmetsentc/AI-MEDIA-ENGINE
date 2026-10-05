@@ -160,7 +160,7 @@ class Phase1Tests(unittest.TestCase):
         job = controller.submit_job("film-studio", IMAGE_GENERATE, "owned")
         self.assertEqual(job.client_id, "film-studio")
         with self.assertRaises(UnknownClient):
-            controller.submit_job("nahaber", IMAGE_GENERATE, "other product")
+            controller.submit_job("other-app", IMAGE_GENERATE, "other product")
         controller.clients.allow("future-app")
         later = controller.submit_job("future-app", IMAGE_GENERATE, "later client")
         self.assertEqual(later.client_id, "future-app")

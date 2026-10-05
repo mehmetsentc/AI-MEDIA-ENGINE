@@ -30,6 +30,18 @@ CREATE TABLE IF NOT EXISTS job_attempts (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS usage_events (
+    job_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    job_type TEXT NOT NULL,
+    engine_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    duration_seconds REAL NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    estimated_cost_usd TEXT,
+    status TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS external_resources (
     resource_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,

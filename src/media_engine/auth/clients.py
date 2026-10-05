@@ -1,10 +1,10 @@
-"""Known API clients. Phase 1 seeds film-studio only."""
+"""Known API clients. Seeded clients are film-studio and nahaber."""
 from __future__ import annotations
 
 import re
 
 _CLIENT_RE = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
-SEEDED_CLIENTS = frozenset({"film-studio"})
+SEEDED_CLIENTS = frozenset({"film-studio", "nahaber"})
 
 
 class UnknownClient(Exception):
@@ -16,9 +16,7 @@ class UnknownClient(Exception):
 
 
 class ClientDirectory:
-    """In-memory allow-list. `allow` exists so a later client can be added
-    without an account system. Phase 1 does not seed any client except
-    film-studio."""
+    """In-memory allow-list. `allow` adds a later client without new execution code."""
 
     def __init__(self, clients: frozenset[str] | set[str] | None = None) -> None:
         self._clients = set(SEEDED_CLIENTS if clients is None else clients)

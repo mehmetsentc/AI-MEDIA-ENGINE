@@ -1,17 +1,22 @@
 """Smallest controller that runs one IMAGE_GENERATE job on a fake GPU."""
 from __future__ import annotations
 
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from media_engine.auth.clients import ClientDirectory
+from media_engine.engines.binding import engine_id_for
 from media_engine.engines.image.base import ImageEngine
 from media_engine.engines.image.fake import FakeImageEngine
+from media_engine.engines.text.base import TextEngine
+from media_engine.engines.text.fake import FakeTextEngine
 from media_engine.jobs.model import (
     IMAGE_GENERATE,
     SUPPORTED_JOB_TYPES,
+    TEXT_GENERATE,
     AttemptStatus,
     AttemptStore,
     Job,
@@ -37,6 +42,10 @@ from media_engine.providers.fake import FakeGPUProvider
 from media_engine.resources.ledger import ResourceLedger, ResourceRecord, ResourceState
 from media_engine.safety.limits import SafetyLimits
 from media_engine.storage.local import LocalStorage
+from media_engine.usage import UsageEvent, UsageStore
+
+
+_TASK_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class ManualClock:
@@ -61,6 +70,7 @@ class MediaController:
     def __init__(self, db_path: str, storage_root: str, *, clock: Optional[ManualClock] = None,
                  limits: Optional[SafetyLimits] = None, provider: Optional[GPUProvider] = None,
                  image_engine: Optional[ImageEngine] = None,
+                 text_engine: Optional[TextEngine] = None,
                  clients: Optional[ClientDirectory] = None,
                  idle_wait: Optional[Callable[[threading.Condition], None]] = None) -> None:
         self.clock = clock or ManualClock()
@@ -74,6 +84,8 @@ class MediaController:
             self.clock.now, max_workers=self.limits.max_gpu_workers,
         )
         self.image_engine = image_engine or FakeImageEngine()
+        self.text_engine = text_engine or FakeTextEngine()
+        self.usage = UsageStore(db_path)
         self.storage = LocalStorage(storage_root)
         self.trace: list[str] = []
         self.last_shutdown_reason: Optional[str] = None
@@ -90,6 +102,7 @@ class MediaController:
         self._stop_requested = False
         self._thread: Optional[threading.Thread] = None
         self._idle_wait = idle_wait or (lambda cond: cond.wait())
+        self._usage_opened: dict[str, tuple[float, str]] = {}
 
     def startup(self) -> RecoveryReport:
         with self._lock:
@@ -130,13 +143,19 @@ class MediaController:
     def wait_settled(self, timeout: float = 2.0) -> bool:
         return self._settled.wait(timeout)
 
-    def submit_job(self, client_id: str, job_type: str, prompt: str) -> Job:
+    def submit_job(self, client_id: str, job_type: str, prompt: str, *,
+                   task: Optional[str] = None) -> Job:
         with self._lock:
             self.clients.require(client_id)
             if job_type not in SUPPORTED_JOB_TYPES:
                 raise UnsupportedJobType(job_type)
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
                 raise JobError("PROMPT_REQUIRED")
+            stored_task = None
+            if job_type == TEXT_GENERATE:
+                if not isinstance(task, str) or _TASK_RE.fullmatch(task) is None:
+                    raise JobError("TASK_REQUIRED")
+                stored_task = task
             now = self.clock.iso()
             job = Job(
                 id=new_job_id(),
@@ -149,6 +168,7 @@ class MediaController:
                 result_uri=None,
                 error_code=None,
                 prompt=prompt.strip(),
+                task=stored_task,
             )
             self.jobs.insert(job)
             self.queue.enqueue(job.id)
@@ -253,6 +273,10 @@ class MediaController:
         if job.attempt_count >= self.limits.max_job_attempts:
             self._fail(job, "ATTEMPT_LIMIT")
             return
+        self._usage_opened[job.id] = (self.clock.now(), self.clock.iso())
+        if job.job_type == TEXT_GENERATE:
+            self._run_text(job)
+            return
         quote = self.provider.quote(job.client_id)
         if quote.hourly_price_usd > self.limits.max_hourly_price_usd:
             self._fail(job, "PRICE_ABOVE_CEILING")
@@ -291,6 +315,29 @@ class MediaController:
         job.result_uri = uri
         self._transition(job, JobStatus.SUCCEEDED)
         self._mark_idle(resource_id)
+        self._record_usage(job, JobStatus.SUCCEEDED)
+
+    def _run_text(self, job: Job) -> None:
+        self._transition(job, JobStatus.WAITING_FOR_WORKER)
+        self._transition(job, JobStatus.RUNNING)
+        now_iso = self.clock.iso()
+        attempt_id = self.attempts.start(job.id, now_iso)
+        job.attempt_count += 1
+        job.updated_at = now_iso
+        self.jobs.save(job)
+        try:
+            text = self.text_engine.render(task=job.task or "", prompt=job.prompt)
+            uri = self.storage.put(
+                client_id=job.client_id, job_id=job.id, name="text.txt", data=text.encode("utf-8"),
+            )
+        except Exception:
+            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "GENERATION_FAILED")
+            self._fail(job, "GENERATION_FAILED")
+            return
+        self.attempts.finish(attempt_id, AttemptStatus.SUCCEEDED, self.clock.iso())
+        job.result_uri = uri
+        self._transition(job, JobStatus.SUCCEEDED)
+        self._record_usage(job, JobStatus.SUCCEEDED)
 
     def _create_worker(self, job: Job, quote: Quote) -> Optional[str]:
         self.phase_log.append("provision")
@@ -362,6 +409,26 @@ class MediaController:
         job.updated_at = self.clock.iso()
         self.jobs.save(job)
         self.trace.append(f"{job.id}:FAILED:{code}")
+        self._record_usage(job, JobStatus.FAILED)
+
+    def _record_usage(self, job: Job, status: str) -> None:
+        opened = self._usage_opened.get(job.id)
+        if opened is None:
+            started_epoch, started_at = self.clock.now(), self.clock.iso()
+        else:
+            started_epoch, started_at = opened
+        self.usage.record(UsageEvent(
+            job_id=job.id,
+            client_id=job.client_id,
+            job_type=job.job_type,
+            engine_id=engine_id_for(job.job_type),
+            started_at=started_at,
+            finished_at=self.clock.iso(),
+            duration_seconds=self.clock.now() - started_epoch,
+            attempt_count=job.attempt_count,
+            estimated_cost_usd=None,
+            status=status,
+        ))
 
     def _mark_idle(self, resource_id: str) -> None:
         self.provider.end_busy(resource_id)
