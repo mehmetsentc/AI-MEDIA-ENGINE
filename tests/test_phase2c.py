@@ -10,13 +10,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from media_engine.providers.offers import GpuOffer
-from media_engine.providers.phase2c import (
-    APPROVED_OFFER_ID,
-    Phase2CStop,
-    choose_approved,
-    run_phase2c,
-)
+from media_engine.providers.phase2c import Phase2CStop, choose_approved, run_phase2c
 from media_engine.usage import UsageStore
+
+FIXTURE_OFFER_ID = "555001"
 
 
 def _env(**overrides) -> dict:
@@ -24,8 +21,8 @@ def _env(**overrides) -> dict:
         "VAST_API_KEY": "unit-test-vast-secret",
         "LIVE_EXTERNAL_PROVIDERS": "true",
         "VAST_PROVISIONING": "1",
-        "VAST_APPROVED_OFFER_ID": APPROVED_OFFER_ID,
-        "VAST_HUMAN_APPROVAL": "approve:" + APPROVED_OFFER_ID,
+        "VAST_APPROVED_OFFER_ID": FIXTURE_OFFER_ID,
+        "VAST_HUMAN_APPROVAL": "approve:" + FIXTURE_OFFER_ID,
     }
     env.update(overrides)
     return env
@@ -33,7 +30,7 @@ def _env(**overrides) -> dict:
 
 def _row(**overrides) -> dict:
     row = {
-        "id": int(APPROVED_OFFER_ID),
+        "id": int(FIXTURE_OFFER_ID),
         "gpu_name": "RTX 5090",
         "num_gpus": 1,
         "gpu_ram": 32607,
@@ -90,11 +87,30 @@ class Phase2CTests(unittest.TestCase):
 
         code, text = self._run(transport, _env(VAST_APPROVED_OFFER_ID="111"))
         self.assertEqual(code, 2)
-        self.assertIn("OFFER_NOT_APPROVED", text)
+        self.assertIn("APPROVAL_MISMATCH", text)
         code, text = self._run(self._offers(_row(gpu_name="RTX 3090")))
         self.assertEqual(code, 3)
         self.assertIn("OFFER_MISMATCH", text)
         self.assertNotIn("PUT", [call[0] for call in self.calls])
+
+    def test_missing_offer_and_approval_are_blocked(self) -> None:
+        def transport(*args):
+            raise AssertionError("transport")
+
+        code, text = self._run(transport, _env(VAST_APPROVED_OFFER_ID=""))
+        self.assertEqual(code, 2)
+        self.assertIn("OFFER_NOT_APPROVED", text)
+        code, text = self._run(transport, _env(VAST_HUMAN_APPROVAL=""))
+        self.assertEqual(code, 2)
+        self.assertIn("HUMAN_APPROVAL_REQUIRED", text)
+        code, text = self._run(transport, _env(VAST_HUMAN_APPROVAL="approve:any"))
+        self.assertEqual(code, 2)
+        self.assertIn("APPROVAL_MISMATCH", text)
+        source = Path(__file__).resolve().parents[1].joinpath(
+            "src/media_engine/providers/phase2c.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("43994879", source)
+        self.assertNotIn("43994880", source)
 
     def test_price_increase_rejection(self) -> None:
         code, text = self._run(self._offers(_row(dph_total="0.41")))
@@ -109,11 +125,26 @@ class Phase2CTests(unittest.TestCase):
                 provider="vast", offer_id="111", gpu_model="RTX 5090", gpu_count=1,
                 vram_gb=Decimal("32"), hourly_price_usd=Decimal("0.10"),
                 reliability=Decimal("0.99"),
-            )])
+            )], FIXTURE_OFFER_ID)
         self.assertEqual(caught.exception.code, "NO_FALLBACK_OFFER")
         code, text = self._run(self._offers(other))
         self.assertEqual(code, 3)
         self.assertIn("OFFER_GONE", text)
+        self.assertNotIn("PUT", [call[0] for call in self.calls])
+
+    def test_non_5090_and_cost_ceiling_are_blocked(self) -> None:
+        other_id = "777001"
+        env = _env(
+            VAST_APPROVED_OFFER_ID=other_id,
+            VAST_HUMAN_APPROVAL="approve:" + other_id,
+        )
+        code, text = self._run(self._offers(_row(id=int(other_id), gpu_name="RTX 3090")), env)
+        self.assertEqual(code, 3)
+        self.assertIn("OFFER_MISMATCH", text)
+        self.calls.clear()
+        code, text = self._run(self._offers(_row(dph_total="0.43")))
+        self.assertEqual(code, 3)
+        self.assertIn("COST_ABOVE_CEILING", text)
         self.assertNotIn("PUT", [call[0] for call in self.calls])
 
     def test_one_create_attempt(self) -> None:
@@ -131,7 +162,7 @@ class Phase2CTests(unittest.TestCase):
         self.assertEqual(methods.count("PUT"), 1)
         self.assertEqual(methods.count("DELETE"), 2)
         saved = json.loads(Path(self.db_path).with_suffix(".phase2c.json").read_text(encoding="utf-8"))
-        self.assertEqual(saved["offer_id"], APPROVED_OFFER_ID)
+        self.assertEqual(saved["offer_id"], FIXTURE_OFFER_ID)
         self.assertEqual(saved["owner_label"], "media-engine:phase2c")
         self.assertEqual(saved["cost_basis"], "estimated_from_runtime")
         self.assertIsNone(UsageStore(self.db_path).for_job("phase2c-555").actual_cost_usd)
@@ -163,7 +194,7 @@ class Phase2CTests(unittest.TestCase):
         self.assertIn("LIFETIME_EXCEEDED", text)
         self.assertEqual([call[0] for call in self.calls].count("PUT"), 1)
         self.assertIn("DELETE", [call[0] for call in self.calls])
-        self.assertTrue(all(call[1].endswith("/asks/43994880/") for call in self.calls if call[0] == "PUT"))
+        self.assertTrue(all(call[1].endswith("/asks/" + FIXTURE_OFFER_ID + "/") for call in self.calls if call[0] == "PUT"))
 
     def _offers(self, row: dict):
         def transport(method, url, body, headers):
@@ -183,7 +214,7 @@ class Phase2CTests(unittest.TestCase):
             if method == "POST":
                 return json.dumps({"offers": [_row()]}).encode("utf-8")
             if method == "PUT":
-                self.assertTrue(url.endswith("/asks/43994880/"))
+                self.assertTrue(url.endswith("/asks/" + FIXTURE_OFFER_ID + "/"))
                 self.assertIn(b"media-engine:phase2c", body)
                 self.assertIn(b"ubuntu:22.04", body)
                 return create_body

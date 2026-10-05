@@ -27,8 +27,9 @@ from media_engine.resources.ledger import ResourceState
 from media_engine.safety.limits import SafetyLimits
 from media_engine.usage import UsageEvent, UsageStore
 
-APPROVED_OFFER_ID = "43994880"
 APPROVED_GPU_MODEL = "RTX 5090"
+MIN_VRAM_GB = Decimal("24")
+MIN_RELIABILITY = Decimal("0")
 MAX_HOURLY_USD = Decimal("0.40")
 MAX_ESTIMATED_COST_USD = Decimal("0.07")
 MAX_LIFETIME_SECONDS = 600
@@ -43,7 +44,7 @@ class Phase2CStop(Exception):
         self.code = code
 
 
-def preconditions(env: Mapping[str, str]) -> str:
+def preconditions(env: Mapping[str, str]) -> tuple[str, str]:
     key = env.get("VAST_API_KEY") or ""
     if not key.strip():
         raise Phase2CStop("VAST_API_KEY_MISSING")
@@ -51,36 +52,46 @@ def preconditions(env: Mapping[str, str]) -> str:
         raise Phase2CStop("LIVE_EXTERNAL_PROVIDERS_DISABLED")
     if env.get("VAST_PROVISIONING") != "1":
         raise Phase2CStop("PROVISION_DISABLED")
-    if env.get("VAST_APPROVED_OFFER_ID") != APPROVED_OFFER_ID:
+    offer_id = (env.get("VAST_APPROVED_OFFER_ID") or "").strip()
+    if not offer_id.isdigit() or set(offer_id) == {"0"}:
         raise Phase2CStop("OFFER_NOT_APPROVED")
-    if env.get("VAST_HUMAN_APPROVAL") != approval_token(APPROVED_OFFER_ID):
+    approval = env.get("VAST_HUMAN_APPROVAL") or ""
+    if approval.strip() == "":
         raise Phase2CStop("HUMAN_APPROVAL_REQUIRED")
+    if approval != approval_token(offer_id):
+        raise Phase2CStop("APPROVAL_MISMATCH")
     if SafetyLimits().max_gpu_workers != 1 or SafetyLimits().max_job_attempts != 1:
         raise Phase2CStop("MAX_GPU_WORKERS")
-    return key
+    return key, offer_id
 
 
-def accept_offer(offer: GpuOffer) -> None:
-    if offer.offer_id != APPROVED_OFFER_ID:
+def accept_offer(offer: GpuOffer, offer_id: str) -> None:
+    if offer.offer_id != offer_id:
         raise Phase2CStop("NO_FALLBACK_OFFER")
+    if offer.provider != "vast":
+        raise Phase2CStop("OFFER_MISMATCH")
     if model_key(offer.gpu_model) != model_key(APPROVED_GPU_MODEL):
+        raise Phase2CStop("OFFER_MISMATCH")
+    if offer.vram_gb < MIN_VRAM_GB:
+        raise Phase2CStop("OFFER_MISMATCH")
+    if offer.reliability is None or offer.reliability < MIN_RELIABILITY:
         raise Phase2CStop("OFFER_MISMATCH")
     if offer.availability not in (None, "rentable"):
         raise Phase2CStop("OFFER_GONE")
-    if offer.hourly_price_usd > MAX_HOURLY_USD:
-        raise Phase2CStop("PRICE_ABOVE_CEILING")
     cost = max_estimated_gpu_cost(offer.hourly_price_usd, MAX_LIFETIME_SECONDS)
     if cost > MAX_ESTIMATED_COST_USD:
         raise Phase2CStop("COST_ABOVE_CEILING")
+    if offer.hourly_price_usd > MAX_HOURLY_USD:
+        raise Phase2CStop("PRICE_ABOVE_CEILING")
 
 
-def choose_approved(offers: list[GpuOffer]) -> GpuOffer:
-    matches = [offer for offer in offers if offer.offer_id == APPROVED_OFFER_ID]
+def choose_approved(offers: list[GpuOffer], offer_id: str) -> GpuOffer:
+    matches = [offer for offer in offers if offer.offer_id == offer_id]
     if not matches:
         raise Phase2CStop("NO_FALLBACK_OFFER" if offers else "OFFER_GONE")
     if len(matches) != 1:
         raise Phase2CStop("NO_FALLBACK_OFFER")
-    accept_offer(matches[0])
+    accept_offer(matches[0], offer_id)
     return matches[0]
 
 
@@ -96,19 +107,19 @@ def run_phase2c(
     """Return a process status. Mutation happens only after every gate passes."""
     out = sys.stdout if stdout is None else stdout
     try:
-        key = preconditions(env)
+        key, offer_id = preconditions(env)
     except Phase2CStop as exc:
         _say(out, exc.code)
         return 2
     started = now()
     try:
         offers = VastDiscovery(transport=search_transport).search(
-            GpuRequirements(offer_id=APPROVED_OFFER_ID, gpu_count=1),
+            GpuRequirements(offer_id=offer_id, gpu_count=1),
             api_key=key,
             read_only=True,
             limit=5,
         )
-        selected = choose_approved(offers)
+        selected = choose_approved(offers, offer_id)
     except Phase2CStop as exc:
         _say(out, exc.code)
         return 3
@@ -125,21 +136,21 @@ def run_phase2c(
         now=now,
     )
     requirements = ResourceRequirements(
-        min_vram_gb=Decimal("24"),
+        min_vram_gb=MIN_VRAM_GB,
         gpu_count=1,
         max_hourly_price_usd=MAX_HOURLY_USD,
-        min_reliability=Decimal("0"),
+        min_reliability=MIN_RELIABILITY,
         max_job_seconds=MAX_LIFETIME_SECONDS,
     )
     try:
         created = lifecycle.create(
             offers=[selected],
             requirements=requirements,
-            offer_id=APPROVED_OFFER_ID,
+            offer_id=offer_id,
             owner=OWNER,
             api_key=key,
             provision=True,
-            human_approval=approval_token(APPROVED_OFFER_ID),
+            human_approval=approval_token(offer_id),
             image=INSTANCE_IMAGE,
             disk_gb=DISK_GB,
         )
@@ -150,7 +161,7 @@ def run_phase2c(
     if created.outcome == "ambiguous" or not created.resource_id:
         owned = lifecycle.list_owned(OWNER, api_key=key, provision=True)
         _persist(
-            db_path, selected, created.resource_id or APPROVED_OFFER_ID, started, now(),
+            db_path, selected, created.resource_id or offer_id, started, now(),
             "AMBIGUOUS", None,
         )
         _say(out, "AMBIGUOUS")
@@ -236,7 +247,7 @@ def _persist(
     payload = {
         "provider": "vast",
         "instance_id": instance_id,
-        "offer_id": APPROVED_OFFER_ID,
+        "offer_id": offer.offer_id,
         "owner_label": ownership_label(OWNER),
         "created_at": _iso(started),
         "hourly_price_usd": str(offer.hourly_price_usd),
