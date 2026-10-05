@@ -1,10 +1,11 @@
-"""One approved Vast instance: create, verify ownership, destroy.
+"""One approved Vast policy: discover once, create once, then destroy.
 
 The manual command is the only caller that may arm the live transport.
 Tests pass a fake transport. This module does not run on import.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -14,8 +15,8 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, TextIO
 
 from media_engine.providers.base import OBSERVE_FOREIGN, OBSERVE_GONE, OBSERVE_PRESENT, OBSERVE_UNKNOWN
-from media_engine.providers.offers import GpuOffer, GpuRequirements, model_key
-from media_engine.providers.planner import ResourceRequirements, max_estimated_gpu_cost
+from media_engine.providers.offers import GpuOffer, model_key
+from media_engine.providers.planner import ResourceRequirements, max_estimated_gpu_cost, plan
 from media_engine.providers.vast import VastDiscovery
 from media_engine.providers.vast_lifecycle import (
     VastLifecycle,
@@ -23,16 +24,17 @@ from media_engine.providers.vast_lifecycle import (
     live_transport,
     ownership_label,
 )
-from media_engine.resources.ledger import ResourceState
+from media_engine.resources.ledger import ResourceLedger, ResourceState
 from media_engine.safety.limits import SafetyLimits
 from media_engine.usage import UsageEvent, UsageStore
 
 APPROVED_GPU_MODEL = "RTX 5090"
 MIN_VRAM_GB = Decimal("24")
-MIN_RELIABILITY = Decimal("0")
+MIN_RELIABILITY = Decimal("0.98")
 MAX_HOURLY_USD = Decimal("0.40")
 MAX_ESTIMATED_COST_USD = Decimal("0.07")
 MAX_LIFETIME_SECONDS = 600
+MAX_CREATE_ATTEMPTS = 1
 OWNER = "phase2c"
 INSTANCE_IMAGE = "ubuntu:22.04"
 DISK_GB = 8
@@ -44,7 +46,56 @@ class Phase2CStop(Exception):
         self.code = code
 
 
-def preconditions(env: Mapping[str, str]) -> tuple[str, str]:
+def policy_fields() -> dict[str, str]:
+    return {
+        "provider": "vast",
+        "gpu_model": APPROVED_GPU_MODEL,
+        "min_vram_gb": "24",
+        "gpu_count": "1",
+        "min_reliability": "0.98",
+        "max_hourly_price_usd": "0.40",
+        "max_job_seconds": "600",
+        "max_estimated_gpu_cost_usd": "0.07",
+        "max_create_attempts": "1",
+        "max_gpu_workers": "1",
+    }
+
+
+def fingerprint_for(fields: Mapping[str, str]) -> str:
+    raw = json.dumps(dict(fields), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def policy_fingerprint() -> str:
+    return fingerprint_for(policy_fields())
+
+
+def format_policy() -> str:
+    fields = policy_fields()
+    lines = ["PHASE 2C POLICY"]
+    for key in (
+        "provider", "gpu_model", "min_vram_gb", "gpu_count", "min_reliability",
+        "max_hourly_price_usd", "max_job_seconds", "max_estimated_gpu_cost_usd",
+        "max_create_attempts", "max_gpu_workers",
+    ):
+        lines.append(f"{key}: {fields[key]}")
+    lines.append("POLICY FINGERPRINT: " + policy_fingerprint())
+    lines.append("STATUS: HUMAN_POLICY_APPROVAL_REQUIRED")
+    return "\n".join(lines) + "\n"
+
+
+def policy_requirements() -> ResourceRequirements:
+    return ResourceRequirements(
+        min_vram_gb=MIN_VRAM_GB,
+        gpu_count=1,
+        max_hourly_price_usd=MAX_HOURLY_USD,
+        min_reliability=MIN_RELIABILITY,
+        compatible_gpu_models=(APPROVED_GPU_MODEL,),
+        max_job_seconds=MAX_LIFETIME_SECONDS,
+    )
+
+
+def preconditions(env: Mapping[str, str]) -> str:
     key = env.get("VAST_API_KEY") or ""
     if not key.strip():
         raise Phase2CStop("VAST_API_KEY_MISSING")
@@ -52,25 +103,24 @@ def preconditions(env: Mapping[str, str]) -> tuple[str, str]:
         raise Phase2CStop("LIVE_EXTERNAL_PROVIDERS_DISABLED")
     if env.get("VAST_PROVISIONING") != "1":
         raise Phase2CStop("PROVISION_DISABLED")
-    offer_id = (env.get("VAST_APPROVED_OFFER_ID") or "").strip()
-    if not offer_id.isdigit() or set(offer_id) == {"0"}:
-        raise Phase2CStop("OFFER_NOT_APPROVED")
-    approval = env.get("VAST_HUMAN_APPROVAL") or ""
+    approval = env.get("VAST_HUMAN_POLICY_APPROVAL") or ""
     if approval.strip() == "":
-        raise Phase2CStop("HUMAN_APPROVAL_REQUIRED")
-    if approval != approval_token(offer_id):
+        raise Phase2CStop("HUMAN_POLICY_APPROVAL_REQUIRED")
+    if approval != "approve-policy:" + policy_fingerprint():
         raise Phase2CStop("APPROVAL_MISMATCH")
     if SafetyLimits().max_gpu_workers != 1 or SafetyLimits().max_job_attempts != 1:
         raise Phase2CStop("MAX_GPU_WORKERS")
-    return key, offer_id
+    if MAX_CREATE_ATTEMPTS != 1:
+        raise Phase2CStop("CREATE_LIMIT")
+    return key
 
 
-def accept_offer(offer: GpuOffer, offer_id: str) -> None:
-    if offer.offer_id != offer_id:
-        raise Phase2CStop("NO_FALLBACK_OFFER")
+def accept_offer(offer: GpuOffer) -> None:
     if offer.provider != "vast":
         raise Phase2CStop("OFFER_MISMATCH")
     if model_key(offer.gpu_model) != model_key(APPROVED_GPU_MODEL):
+        raise Phase2CStop("OFFER_MISMATCH")
+    if offer.gpu_count != 1:
         raise Phase2CStop("OFFER_MISMATCH")
     if offer.vram_gb < MIN_VRAM_GB:
         raise Phase2CStop("OFFER_MISMATCH")
@@ -85,14 +135,12 @@ def accept_offer(offer: GpuOffer, offer_id: str) -> None:
         raise Phase2CStop("PRICE_ABOVE_CEILING")
 
 
-def choose_approved(offers: list[GpuOffer], offer_id: str) -> GpuOffer:
-    matches = [offer for offer in offers if offer.offer_id == offer_id]
-    if not matches:
-        raise Phase2CStop("NO_FALLBACK_OFFER" if offers else "OFFER_GONE")
-    if len(matches) != 1:
-        raise Phase2CStop("NO_FALLBACK_OFFER")
-    accept_offer(matches[0], offer_id)
-    return matches[0]
+def select_one(offers: list[GpuOffer]) -> GpuOffer:
+    selected = plan(offers, policy_requirements()).selected
+    if selected is None:
+        raise Phase2CStop("OFFER_GONE")
+    accept_offer(selected)
+    return selected
 
 
 def run_phase2c(
@@ -107,19 +155,22 @@ def run_phase2c(
     """Return a process status. Mutation happens only after every gate passes."""
     out = sys.stdout if stdout is None else stdout
     try:
-        key, offer_id = preconditions(env)
+        key = preconditions(env)
+        if ResourceLedger(db_path).unresolved():
+            raise Phase2CStop("UNRESOLVED_RESOURCE")
     except Phase2CStop as exc:
         _say(out, exc.code)
         return 2
     started = now()
+    requirements = policy_requirements()
     try:
         offers = VastDiscovery(transport=search_transport).search(
-            GpuRequirements(offer_id=offer_id, gpu_count=1),
+            requirements.to_search(gpu_model=APPROVED_GPU_MODEL),
             api_key=key,
             read_only=True,
-            limit=5,
+            limit=64,
         )
-        selected = choose_approved(offers, offer_id)
+        selected = select_one(offers)
     except Phase2CStop as exc:
         _say(out, exc.code)
         return 3
@@ -135,24 +186,12 @@ def run_phase2c(
         transport=lifecycle_transport,
         now=now,
     )
-    requirements = ResourceRequirements(
-        min_vram_gb=MIN_VRAM_GB,
-        gpu_count=1,
-        max_hourly_price_usd=MAX_HOURLY_USD,
-        min_reliability=MIN_RELIABILITY,
-        max_job_seconds=MAX_LIFETIME_SECONDS,
-    )
     try:
-        created = lifecycle.create(
-            offers=[selected],
+        created = _create_once(
+            lifecycle,
+            selected=selected,
             requirements=requirements,
-            offer_id=offer_id,
-            owner=OWNER,
             api_key=key,
-            provision=True,
-            human_approval=approval_token(offer_id),
-            image=INSTANCE_IMAGE,
-            disk_gb=DISK_GB,
         )
     except Exception as exc:
         code = getattr(exc, "code", "CREATE_BLOCKED")
@@ -161,7 +200,7 @@ def run_phase2c(
     if created.outcome == "ambiguous" or not created.resource_id:
         owned = lifecycle.list_owned(OWNER, api_key=key, provision=True)
         _persist(
-            db_path, selected, created.resource_id or offer_id, started, now(),
+            db_path, selected, created.resource_id or selected.offer_id, started, now(),
             "AMBIGUOUS", None,
         )
         _say(out, "AMBIGUOUS")
@@ -206,6 +245,24 @@ def run_phase2c(
     _say(out, final)
     _say(out, f"INSTANCE {instance_id}")
     return 0 if final == "TERMINATED" else 6
+
+
+def _create_once(lifecycle: VastLifecycle, *, selected: GpuOffer,
+                 requirements: ResourceRequirements, api_key: str):
+    if getattr(lifecycle, "_phase2c_creates", 0) >= MAX_CREATE_ATTEMPTS:
+        raise Phase2CStop("CREATE_LIMIT")
+    lifecycle._phase2c_creates = getattr(lifecycle, "_phase2c_creates", 0) + 1
+    return lifecycle.create(
+        offers=[selected],
+        requirements=requirements,
+        offer_id=selected.offer_id,
+        owner=OWNER,
+        api_key=api_key,
+        provision=True,
+        human_approval=approval_token(selected.offer_id),
+        image=INSTANCE_IMAGE,
+        disk_gb=DISK_GB,
+    )
 
 
 def _destroy_owned(lifecycle: VastLifecycle, instance_id: str, key: str) -> None:

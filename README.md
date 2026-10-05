@@ -61,21 +61,25 @@ VAST_API_KEY=your-key-here VAST_READ_ONLY_DISCOVERY=1 \
 `VAST_GPU_MODEL` is an optional investigation filter, for example a marketplace
 name with spaces or underscores. It is not a built-in model list.
 
-## Phase 2C approved lifecycle
+## Phase 2C policy approval
 
-This is the only command that can rent a GPU. It is not run by tests.
-Copy one offer id from a read-only preflight. The approval token must be
-`approve:` plus that same id. There is no default id and no default approval.
-Before create, that exact offer is fetched again and must still be a rentable
-`RTX 5090` at or under `$0.40`/hour, with estimated cost at or under `$0.07`
-for 600 seconds. Any other offer is ignored. The instance image is
-`ubuntu:22.04` with 8 GB disk, which is the rental shell, not a model.
+Print the one-run policy and its fingerprint. This command does not contact
+Vast and does not create a GPU:
+
+```bash
+PYTHONPATH=src python3 -m media_engine.providers.phase2c_policy
+```
+
+The live command rents one RTX 5090 only when the approval token is exactly
+`approve-policy:` plus that fingerprint. It discovers one eligible offer at
+the last moment and creates it once. There is no default approval. The
+instance image is `ubuntu:22.04` with 8 GB disk, which is the rental shell,
+not a model.
 
 ```bash
 VAST_API_KEY=your-key-here \
 LIVE_EXTERNAL_PROVIDERS=true \
 VAST_PROVISIONING=1 \
-VAST_APPROVED_OFFER_ID=<offer-id-from-preflight> \
-VAST_HUMAN_APPROVAL=approve:<same-offer-id> \
+VAST_HUMAN_POLICY_APPROVAL='approve-policy:<fingerprint>' \
 PYTHONPATH=src python3 -m media_engine.providers.phase2c
 ```
