@@ -51,6 +51,20 @@ class Phase11Tests(unittest.TestCase):
         self.controllers.append(controller)
         return controller
 
+    def _ambiguous(self, controller: MediaController, resource_id: str, owner: str = "film-studio") -> None:
+        now = self.clock.now()
+        controller.ledger.upsert(ResourceRecord(
+            resource_id=resource_id,
+            provider="vast",
+            owner_id=owner,
+            state=ResourceState.AMBIGUOUS,
+            create_attempted=True,
+            hourly_price_usd="0.28",
+            created_at=now,
+            updated_at=now,
+            last_error="AMBIGUOUS_CREATE",
+        ))
+
     def _remember(self, controller: MediaController, resource_id: str, owner: str = "film-studio") -> None:
         now = self.clock.now()
         controller.ledger.upsert(ResourceRecord(
@@ -218,6 +232,59 @@ class Phase11Tests(unittest.TestCase):
         record = controller.ledger.get("gpu_foreign")
         self.assertEqual(record.last_error, "OWNERSHIP_MISMATCH")
         self.assertEqual(record.state, ResourceState.READY)
+        _, queued = _post(controller, "do not replace foreign")
+        self.assertTrue(controller.wait_settled())
+        self.assertEqual(controller.get_job(queued["id"]).error_code, "UNRESOLVED_RESOURCE")
+        self.assertEqual(provider.create_calls, 0)
+        self.assertEqual(provider.terminate_calls, 0)
+
+    def test_ambiguous_gone_resource_is_reconciled(self) -> None:
+        provider = FakeGPUProvider(self.clock.now)
+        controller = self._controller(provider=provider)
+        self._ambiguous(controller, "51591537")
+        controller.start()
+        record = controller.ledger.get("51591537")
+        self.assertEqual(record.state, ResourceState.TERMINATED)
+        self.assertEqual(record.last_error, "RECONCILED_GONE")
+        self.assertEqual(record.resource_id, "51591537")
+        self.assertEqual(record.owner_id, "film-studio")
+        self.assertTrue(record.create_attempted)
+        self.assertEqual(record.hourly_price_usd, "0.28")
+        self.assertEqual(provider.terminate_calls, 0)
+        self.assertEqual(controller.ledger.unresolved(), [])
+        _, queued = _post(controller, "after ambiguous gone")
+        self.assertTrue(controller.wait_settled())
+        self.assertEqual(controller.get_job(queued["id"]).status, JobStatus.SUCCEEDED)
+        self.assertEqual(provider.create_calls, 1)
+
+    def test_ambiguous_unknown_stays_unresolved(self) -> None:
+        provider = FakeGPUProvider(self.clock.now)
+        provider.reachable = False
+        controller = self._controller(provider=provider)
+        self._ambiguous(controller, "51591537")
+        controller.start()
+        record = controller.ledger.get("51591537")
+        self.assertEqual(record.state, ResourceState.AMBIGUOUS)
+        self.assertEqual(record.last_error, "PROVIDER_STATUS_UNKNOWN")
+        self.assertEqual(provider.terminate_calls, 0)
+        self.assertEqual(len(controller.ledger.unresolved()), 1)
+        _, queued = _post(controller, "must stay blocked")
+        self.assertTrue(controller.wait_settled())
+        self.assertEqual(controller.get_job(queued["id"]).error_code, "UNRESOLVED_RESOURCE")
+        self.assertEqual(provider.create_calls, 0)
+
+    def test_ambiguous_foreign_is_not_destroyed(self) -> None:
+        provider = FakeGPUProvider(self.clock.now)
+        provider.plant("51591537", "other-engine", status=READY)
+        controller = self._controller(provider=provider)
+        self._ambiguous(controller, "51591537")
+        controller.start()
+        self.assertEqual(provider.terminate_calls, 0)
+        self.assertEqual(provider.status("51591537"), READY)
+        record = controller.ledger.get("51591537")
+        self.assertEqual(record.state, ResourceState.AMBIGUOUS)
+        self.assertEqual(record.last_error, "OWNERSHIP_MISMATCH")
+        self.assertEqual(len(controller.ledger.unresolved()), 1)
         _, queued = _post(controller, "do not replace foreign")
         self.assertTrue(controller.wait_settled())
         self.assertEqual(controller.get_job(queued["id"]).error_code, "UNRESOLVED_RESOURCE")

@@ -241,7 +241,9 @@ class MediaController:
 
     def _reconcile_ledger(self) -> None:
         for record in self.ledger.unresolved():
-            if record.state not in (ResourceState.READY, ResourceState.TERMINATING):
+            if record.state not in (
+                ResourceState.READY, ResourceState.TERMINATING, ResourceState.AMBIGUOUS,
+            ):
                 continue
             observation = self.provider.observe(record.resource_id, record.owner_id)
             now = self.clock.now()
