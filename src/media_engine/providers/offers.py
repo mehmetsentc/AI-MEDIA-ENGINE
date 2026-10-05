@@ -15,6 +15,7 @@ class GpuRequirements:
     min_reliability: Optional[Decimal] = None
     gpu_count: Optional[int] = None
     gpu_model: Optional[str] = None
+    offer_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

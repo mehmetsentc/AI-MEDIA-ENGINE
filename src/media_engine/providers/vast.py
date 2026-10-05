@@ -121,6 +121,10 @@ def _query(requirements: GpuRequirements, limit: int) -> dict:
         query["dph_total"] = {"lte": float(requirements.max_hourly_price_usd)}
     if requirements.min_reliability is not None:
         query["reliability"] = {"gte": float(requirements.min_reliability)}
+    if requirements.offer_id:
+        if not requirements.offer_id.isdigit():
+            raise VastDiscoveryError("offer id must be numeric")
+        query["id"] = {"eq": int(requirements.offer_id)}
     return query
 
 
@@ -195,4 +199,6 @@ def _matches(offer: GpuOffer, requirements: GpuRequirements) -> bool:
     if requirements.gpu_model:
         if model_key(offer.gpu_model) != model_key(requirements.gpu_model):
             return False
+    if requirements.offer_id and offer.offer_id != requirements.offer_id:
+        return False
     return True

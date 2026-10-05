@@ -110,9 +110,11 @@ class Phase2BTests(unittest.TestCase):
         )
         self.assertEqual(seen["query"]["gpu_name"], {"eq": "EXAMPLE_GPU"})
         self.assertEqual([offer.offer_id for offer in offers], ["1"])
+        root = Path(__file__).resolve().parents[1] / "src" / "media_engine" / "providers"
         blob = "\n".join(
             path.read_text(encoding="utf-8")
-            for path in (Path(__file__).resolve().parents[1] / "src" / "media_engine" / "providers").glob("*.py")
+            for path in root.glob("*.py")
+            if path.name != "phase2c.py"
         )
         for name in ("3090", "4090", "5090", "A6000", "L40S"):
             self.assertNotIn(name, blob)

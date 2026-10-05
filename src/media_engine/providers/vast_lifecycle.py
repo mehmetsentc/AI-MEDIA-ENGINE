@@ -52,7 +52,7 @@ def _not_armed(method: str, url: str, body: bytes, headers: dict[str, str]) -> b
 
 
 def live_transport(method: str, url: str, body: bytes, headers: dict[str, str]) -> bytes:
-    """Prepared HTTP call. It is not the default and no command passes it in."""
+    """Live Vast call. Only the phase 2C manual command may pass this in."""
     if method == "PUT" and _ASKS.fullmatch(url):
         allowed = True
     elif method == "GET" and url == _INSTANCES:
