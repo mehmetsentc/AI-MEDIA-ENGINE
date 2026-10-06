@@ -50,6 +50,9 @@ MIN_RELIABILITY = Decimal("0.98")
 MAX_HOURLY_USD = Decimal("0.40")
 MAX_ESTIMATED_COST_USD = Decimal("0.20")
 MAX_LIFETIME_SECONDS = 1800
+SOFT_RUNTIME_SECONDS = 1200
+HARD_CLEANUP_SECONDS = 1500
+READY_POLL_SECONDS = 5
 MAX_CREATE_ATTEMPTS = 1
 OWNER = "phase2d"
 INSTANCE_IMAGE = "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime"
@@ -310,7 +313,11 @@ def run_phase2d(
     try:
         if now() >= deadline or _over_budget(selected, now() - started):
             raise Phase2DStop("COST_ABOVE_CEILING")
-        png, report = generate(instance_id, selected, deadline)
+        cleanup_deadline = min(deadline, started + HARD_CLEANUP_SECONDS)
+        runtime_deadline = min(cleanup_deadline, started + SOFT_RUNTIME_SECONDS)
+        if now() >= runtime_deadline:
+            raise Phase2DStop("SSH_NOT_READY")
+        png, report = generate(instance_id, selected, runtime_deadline)
         image = QwenImageEngine(lambda **_kwargs: png).render(
             FIRST_PROMPT, width=FIRST_WIDTH, height=FIRST_HEIGHT, seed=FIRST_SEED,
         )
@@ -343,41 +350,243 @@ def run_phase2d(
 def ssh_generate(instance_id: str, offer: GpuOffer, deadline: float) -> tuple[bytes, dict]:
     """Copy the runner to the owned instance, generate once, and return the PNG."""
     key = os.environ.get("VAST_API_KEY") or ""
-    row = _wait_ssh(instance_id, key, deadline)
+    diagnostic_dir = Path("runtime/artifacts/phase2d")
+
+    def fetch() -> Optional[dict]:
+        headers = {
+            "Authorization": "Bearer " + key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        raw = live_transport("GET", instances_list_url(), b"", headers)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise Phase2DStop("SSH_NOT_READY") from exc
+        for row in payload.get("instances") or []:
+            if str(row.get("id")) != instance_id:
+                continue
+            _reject_over_price(row)
+            return row
+        return None
+
+    def attach() -> None:
+        _identity, public = _ephemeral_ssh_key()
+        _attach_ssh_key(instance_id, public, key)
+
+    return run_ssh_runtime(
+        instance_id=instance_id,
+        fetch=fetch,
+        attach=attach,
+        ssh=_ssh_live,
+        scp=_scp_live,
+        deadline=deadline,
+        now=time.time,
+        sleep=time.sleep,
+        diagnostic_dir=diagnostic_dir,
+        script=Path(_REMOTE_FILE).read_bytes(),
+        job=json.dumps({
+            "prompt": FIRST_PROMPT,
+            "seed": FIRST_SEED,
+            "width": FIRST_WIDTH,
+            "height": FIRST_HEIGHT,
+            "steps": INFERENCE_STEPS,
+        }).encode("utf-8"),
+        secrets=(key,),
+    )
+
+
+def ssh_endpoint(row: Mapping) -> Optional[tuple[str, str]]:
+    """Return the SSH host and port using the official vastai ssh-url contract."""
+    if str(row.get("actual_status") or "") != "running":
+        return None
+    if str(row.get("intended_status") or "") != "running":
+        return None
+    ports = row.get("ports")
+    if isinstance(ports, dict):
+        mapped = ports.get("22/tcp")
+        if isinstance(mapped, list) and mapped and isinstance(mapped[0], dict):
+            host = str(row.get("public_ipaddr") or "")
+            port = str(mapped[0].get("HostPort") or "")
+            if host and port.isdigit():
+                return host, port
     host = str(row.get("ssh_host") or "")
-    port = str(row.get("ssh_port") or "")
-    if not host or not port.isdigit():
-        raise Phase2DStop("RUNTIME_NOT_READY")
-    identity, public = _ephemeral_ssh_key()
-    _attach_ssh_key(instance_id, public, key)
-    script = Path(_REMOTE_FILE).read_bytes()
-    job = json.dumps({
-        "prompt": FIRST_PROMPT,
-        "seed": FIRST_SEED,
-        "width": FIRST_WIDTH,
-        "height": FIRST_HEIGHT,
-        "steps": INFERENCE_STEPS,
-    }).encode("utf-8")
-    remaining = max(1, int(deadline - time.time()))
-    _ssh(host, port, identity, "mkdir -p /workspace && cat > /workspace/phase2d_gen.py", script, 60)
-    _ssh(host, port, identity, "cat > /workspace/phase2d_job.json", job, 30)
-    try:
-        code, _out, err = _ssh(
-            host,
-            port,
-            identity,
-            "python3 -m pip install -q 'diffusers>=0.35' transformers accelerate safetensors pillow "
-            "&& python3 /workspace/phase2d_gen.py",
-            None,
-            remaining,
+    raw_port = row.get("ssh_port")
+    port = "" if raw_port is None else str(raw_port)
+    if host and port.isdigit():
+        if "jupyter" in str(row.get("image_runtype") or ""):
+            port = str(int(port) + 1)
+        return host, port
+    return None
+
+
+def terminal_ssh_status(row: Mapping) -> bool:
+    actual = str(row.get("actual_status") or "")
+    intended = str(row.get("intended_status") or "")
+    return actual in {"stopped", "exited", "offline"} or intended in {"stopped", "exited"}
+
+
+def classify_ssh_stderr(stderr: bytes) -> str:
+    text = stderr.decode("utf-8", "replace").lower()
+    if "permission denied" in text or "authentication failed" in text:
+        return "SSH_AUTH_FAILED"
+    if (
+        "connection refused" in text
+        or "connection timed out" in text
+        or "operation timed out" in text
+        or "no route to host" in text
+    ):
+        return "SSH_NOT_READY"
+    return "SSH_CONNECT_FAILED"
+
+
+def sanitize_text(text: str, secrets: tuple[str, ...] = ()) -> str:
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = re.sub(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        "[redacted]",
+        text,
+        flags=re.S,
+    )
+    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
+    text = re.sub(r"\b[0-9a-fA-F]{32,}\b", "[redacted]", text)
+    if len(text) > 500:
+        text = text[-500:]
+    return text
+
+
+def write_runtime_diagnostic(
+    directory: Path,
+    instance_id: str,
+    *,
+    stage: str,
+    exception: str,
+    ssh_exit_code: Optional[int],
+    remote_exit_code: Optional[int],
+    stdout: bytes,
+    stderr: bytes,
+    now: float,
+    secrets: tuple[str, ...] = (),
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "stage": stage,
+        "exception": exception,
+        "ssh_exit_code": ssh_exit_code,
+        "remote_exit_code": remote_exit_code,
+        "stdout_tail": sanitize_text(stdout.decode("utf-8", "replace"), secrets),
+        "stderr_tail": sanitize_text(stderr.decode("utf-8", "replace"), secrets),
+        "at": _iso(now),
+    }
+    path = directory / f"phase2d-{instance_id}.diagnostic.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def wait_for_ssh_ready(fetch, deadline: float, now, sleep) -> tuple[dict, str, str]:
+    """Poll until Vast reports running and an SSH endpoint. Sleeps between checks."""
+    while now() < deadline:
+        row = fetch()
+        if isinstance(row, dict):
+            if terminal_ssh_status(row):
+                raise Phase2DStop("SSH_NOT_READY")
+            endpoint = ssh_endpoint(row)
+            if endpoint is not None:
+                return row, endpoint[0], endpoint[1]
+        remaining = deadline - now()
+        if remaining <= 0:
+            break
+        sleep(min(READY_POLL_SECONDS, remaining))
+    raise Phase2DStop("SSH_NOT_READY")
+
+
+def run_ssh_runtime(
+    *,
+    instance_id: str,
+    fetch,
+    attach,
+    ssh,
+    scp,
+    deadline: float,
+    now,
+    sleep,
+    diagnostic_dir: Path,
+    script: bytes,
+    job: bytes,
+    secrets: tuple[str, ...] = (),
+) -> tuple[bytes, dict]:
+    """Wait until SSH accepts a command, then run the remote generator once."""
+    def record(stage: str, ssh_code: Optional[int], remote_code: Optional[int], stdout: bytes, stderr: bytes, exception: str) -> None:
+        write_runtime_diagnostic(
+            diagnostic_dir,
+            instance_id,
+            stage=stage,
+            exception=exception,
+            ssh_exit_code=ssh_code,
+            remote_exit_code=remote_code,
+            stdout=stdout,
+            stderr=stderr,
+            now=now(),
+            secrets=secrets,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise Phase2DStop("MODEL_DOWNLOAD_FAILED") from exc
-    local_dir = Path("runtime/artifacts/phase2d")
+
+    try:
+        _row, host, port = wait_for_ssh_ready(fetch, deadline, now, sleep)
+    except Phase2DStop as exc:
+        record(exc.code, None, None, b"", b"", "Phase2DStop")
+        raise
+    try:
+        attach()
+    except Phase2DStop:
+        raise
+    except Exception as exc:
+        record("SSH_CONNECT_FAILED", None, None, b"", b"", type(exc).__name__)
+        raise Phase2DStop("SSH_CONNECT_FAILED") from exc
+    while now() < deadline:
+        code, out, err = ssh(host, port, "true", None, 20)
+        if code == 0:
+            break
+        kind = classify_ssh_stderr(err)
+        if kind == "SSH_AUTH_FAILED":
+            record(kind, code, None, out, err, "Phase2DStop")
+            raise Phase2DStop(kind)
+        if kind != "SSH_NOT_READY":
+            record("SSH_CONNECT_FAILED", code, None, out, err, "Phase2DStop")
+            raise Phase2DStop("SSH_CONNECT_FAILED")
+        remaining = deadline - now()
+        if remaining <= 0:
+            break
+        sleep(min(READY_POLL_SECONDS, remaining))
+    else:
+        record("SSH_NOT_READY", None, None, b"", b"", "Phase2DStop")
+        raise Phase2DStop("SSH_NOT_READY")
+    if now() >= deadline:
+        record("SSH_NOT_READY", None, None, b"", b"", "Phase2DStop")
+        raise Phase2DStop("SSH_NOT_READY")
+    for command, data, timeout in (
+        ("mkdir -p /workspace && cat > /workspace/phase2d_gen.py", script, 60),
+        ("cat > /workspace/phase2d_job.json", job, 30),
+    ):
+        code, out, err = ssh(host, port, command, data, timeout)
+        if code != 0:
+            record("REMOTE_COMMAND_FAILED", code, code, out, err, "Phase2DStop")
+            raise Phase2DStop("REMOTE_COMMAND_FAILED")
+    remaining = max(1, int(deadline - now()))
+    code, out, err = ssh(
+        host,
+        port,
+        "python3 -m pip install -q 'diffusers>=0.35' transformers accelerate safetensors pillow "
+        "&& python3 /workspace/phase2d_gen.py",
+        None,
+        remaining,
+    )
+    local_dir = diagnostic_dir
     local_dir.mkdir(parents=True, exist_ok=True)
     report_path = local_dir / f".{instance_id}.remote.json"
     png_path = local_dir / f".{instance_id}.download.png"
-    _scp(host, port, identity, "/workspace/phase2d_report.json", report_path, 60)
+    scp(host, port, "/workspace/phase2d_report.json", report_path, 60)
     report: dict = {}
     if report_path.exists():
         try:
@@ -385,57 +594,48 @@ def ssh_generate(instance_id: str, offer: GpuOffer, deadline: float) -> tuple[by
         except json.JSONDecodeError:
             report = {}
     if code != 0:
-        detail = str(report.get("error") or "GENERATION_FAILED")
+        detail = str(report.get("error") or "")
         if "DOWNLOAD" in detail:
-            raise Phase2DStop("MODEL_DOWNLOAD_FAILED")
-        if "IMPORT" in detail or "LOAD" in detail:
-            raise Phase2DStop("MODEL_LOAD_FAILED")
-        raise Phase2DStop("GENERATION_FAILED")
-    _scp(host, port, identity, "/workspace/phase2d_output.png", png_path, 60)
+            stage = "MODEL_DOWNLOAD_FAILED"
+        elif "IMPORT" in detail or "LOAD" in detail:
+            stage = "MODEL_LOAD_FAILED"
+        else:
+            stage = "REMOTE_COMMAND_FAILED"
+        record(stage, None, code, out, err, "Phase2DStop")
+        raise Phase2DStop(stage)
+    if not report_path.exists():
+        record("REMOTE_REPORT_MISSING", None, code, out, err, "Phase2DStop")
+        raise Phase2DStop("REMOTE_REPORT_MISSING")
+    scp(host, port, "/workspace/phase2d_output.png", png_path, 60)
     if not png_path.exists() or png_path.stat().st_size <= 0:
+        record("GENERATION_FAILED", None, code, out, err, "Phase2DStop")
         raise Phase2DStop("GENERATION_FAILED")
-    _ = err
     return png_path.read_bytes(), report
 
 
-def _wait_ssh(instance_id: str, api_key: str, deadline: float) -> dict:
-    headers = {
-        "Authorization": "Bearer " + api_key,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    while time.time() < deadline:
-        raw = live_transport("GET", instances_list_url(), b"", headers)
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise Phase2DStop("RUNTIME_NOT_READY") from exc
-        for row in payload.get("instances") or []:
-            if str(row.get("id")) != instance_id:
-                continue
-            if row.get("ssh_host") and row.get("ssh_port"):
-                _reject_over_price(row)
-                return row
-        time.sleep(5)
-    raise Phase2DStop("RUNTIME_NOT_READY")
-
-
-def _ssh(host: str, port: str, identity: str, command: str, data: Optional[bytes], timeout: int) -> tuple[int, bytes, bytes]:
-    proc = subprocess.run(
-        [
-            "ssh", "-i", identity, "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=20", "-p", port, "root@" + host, command,
-        ],
-        input=data,
-        capture_output=True,
-        timeout=max(1, timeout),
-        check=False,
-    )
+def _ssh_live(host: str, port: str, command: str, data: Optional[bytes], timeout: int) -> tuple[int, bytes, bytes]:
+    identity, _public = _ephemeral_ssh_key()
+    try:
+        proc = subprocess.run(
+            [
+                "ssh", "-i", identity, "-o", "IdentitiesOnly=yes",
+                "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=20", "-p", port, "root@" + host, command,
+            ],
+            input=data,
+            capture_output=True,
+            timeout=max(1, timeout),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        stderr = exc.stderr if isinstance(exc.stderr, bytes) else b"connection timed out"
+        return 255, stdout, stderr
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _scp(host: str, port: str, identity: str, remote: str, local: Path, timeout: int) -> None:
+def _scp_live(host: str, port: str, remote: str, local: Path, timeout: int) -> None:
+    identity, _public = _ephemeral_ssh_key()
     subprocess.run(
         [
             "scp", "-i", identity, "-o", "IdentitiesOnly=yes",

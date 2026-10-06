@@ -30,8 +30,10 @@ from media_engine.providers.phase2d import (
     projected_max_cost,
     quote_all_in,
     run_phase2d,
+    run_ssh_runtime,
     select_one,
     ssh_attach_allowed,
+    ssh_endpoint,
     storage_hourly_usd,
 )
 from media_engine.resources.ledger import ResourceRecord, ResourceState
@@ -98,6 +100,28 @@ class _Clock:
 
     def __call__(self) -> float:
         return self.t
+
+
+def _ready_row() -> dict:
+    return {
+        "id": 555,
+        "actual_status": "running",
+        "intended_status": "running",
+        "ssh_host": "ssh.example",
+        "ssh_port": 12345,
+        "dph_total": "0.39",
+    }
+
+
+class _StepClock:
+    def __init__(self) -> None:
+        self.t = 1_000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
 
 
 class Phase2DTests(unittest.TestCase):
@@ -355,6 +379,203 @@ class Phase2DTests(unittest.TestCase):
             attach_ssh_key(transport, "offer:555", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample", "k")
         with self.assertRaises(Phase2DStop):
             attach_ssh_key(transport, "555", "-----BEGIN OPENSSH PRIVATE KEY-----\n", "k")
+
+    def test_ssh_boot_refusal_retries_then_starts_runtime_once(self) -> None:
+        clock = _StepClock()
+        polls = {"n": 0}
+        probes = {"n": 0}
+        installs = {"n": 0}
+
+        def fetch():
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return {
+                    "actual_status": "loading",
+                    "intended_status": "running",
+                    "ssh_host": "ssh.example",
+                    "ssh_port": 22,
+                }
+            return _ready_row()
+
+        def ssh(host, port, command, data, timeout):
+            self.assertEqual((host, port), ("ssh.example", "12345"))
+            if command == "true":
+                probes["n"] += 1
+                if probes["n"] == 1:
+                    return 255, b"", b"connect to host ssh.example port 12345: Connection refused"
+            if "phase2d_gen.py" in command and data is None:
+                installs["n"] += 1
+            return 0, b"", b""
+
+        def scp(host, port, remote, local, timeout):
+            if str(remote).endswith("phase2d_report.json"):
+                local.write_text('{"strategy": "bf16-cpu-offload"}\n', encoding="utf-8")
+            else:
+                local.write_bytes(_png())
+
+        png, report = run_ssh_runtime(
+            instance_id="555",
+            fetch=fetch,
+            attach=lambda: None,
+            ssh=ssh,
+            scp=scp,
+            deadline=clock.t + 60,
+            now=clock,
+            sleep=clock.sleep,
+            diagnostic_dir=Path(self.artifacts),
+            script=b"print('ok')\n",
+            job=b"{}",
+        )
+        self.assertEqual(installs["n"], 1)
+        self.assertEqual(probes["n"], 2)
+        self.assertGreaterEqual(polls["n"], 2)
+        self.assertGreater(clock.t, 1_000.0)
+        self.assertEqual(report["strategy"], "bf16-cpu-offload")
+        self.assertEqual(validate_png(png), (1024, 1024))
+
+    def test_ssh_never_ready_skips_model_command(self) -> None:
+        clock = _StepClock()
+        installs = {"n": 0}
+
+        def ssh(host, port, command, data, timeout):
+            if "phase2d_gen.py" in command and data is None:
+                installs["n"] += 1
+            return 0, b"", b""
+
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: {
+                    "actual_status": "loading",
+                    "intended_status": "running",
+                    "ssh_host": "ssh.example",
+                    "ssh_port": 22,
+                },
+                attach=lambda: None,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 12,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"",
+                job=b"{}",
+            )
+        self.assertEqual(caught.exception.code, "SSH_NOT_READY")
+        self.assertEqual(installs["n"], 0)
+        saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], "SSH_NOT_READY")
+
+    def test_ssh_auth_failure_keeps_sanitized_evidence(self) -> None:
+        clock = _StepClock()
+        secret = "unit-test-vast-secret"
+        token = "a" * 64
+
+        def ssh(host, port, command, data, timeout):
+            return 255, b"stdout " + secret.encode(), b"Permission denied (publickey) Bearer " + secret.encode() + b" " + token.encode()
+
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: _ready_row(),
+                attach=lambda: None,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 30,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"",
+                job=b"{}",
+                secrets=(secret,),
+            )
+        self.assertEqual(caught.exception.code, "SSH_AUTH_FAILED")
+        text = (Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8")
+        saved = json.loads(text)
+        self.assertEqual(saved["ssh_exit_code"], 255)
+        self.assertIn("Permission denied", saved["stderr_tail"])
+        self.assertNotIn(secret, text)
+        self.assertNotIn(token, text)
+        self.assertNotIn("PRIVATE KEY", text)
+
+    def test_remote_command_failure_retains_exit_and_stderr(self) -> None:
+        clock = _StepClock()
+
+        def ssh(host, port, command, data, timeout):
+            if "phase2d_gen.py" in command and data is None:
+                return 1, b"", b"pip exploded"
+            return 0, b"", b""
+
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: _ready_row(),
+                attach=lambda: None,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 30,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"x",
+                job=b"{}",
+            )
+        self.assertEqual(caught.exception.code, "REMOTE_COMMAND_FAILED")
+        saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["remote_exit_code"], 1)
+        self.assertIn("pip exploded", saved["stderr_tail"])
+
+    def test_missing_remote_report_is_explicit(self) -> None:
+        clock = _StepClock()
+
+        def ssh(host, port, command, data, timeout):
+            return 0, b"", b""
+
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: _ready_row(),
+                attach=lambda: None,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 30,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"x",
+                job=b"{}",
+            )
+        self.assertEqual(caught.exception.code, "REMOTE_REPORT_MISSING")
+        saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], "REMOTE_REPORT_MISSING")
+        self.assertEqual(saved["remote_exit_code"], 0)
+
+    def test_runtime_failure_does_not_create_again(self) -> None:
+        def fail(*_args):
+            raise Phase2DStop("SSH_NOT_READY")
+
+        code, text = self._run(self._machine(), generate=fail)
+        self.assertEqual(code, 7)
+        self.assertIn("SSH_NOT_READY", text)
+        self.assertIn("TERMINATED", text)
+        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
+        self.assertEqual([method for method, _url in self.calls].count("DELETE"), 1)
+
+    def test_ssh_endpoint_uses_published_port_only_when_running(self) -> None:
+        self.assertIsNone(ssh_endpoint({
+            "actual_status": "loading",
+            "intended_status": "running",
+            "ssh_host": "ssh.example",
+            "ssh_port": 22,
+        }))
+        self.assertEqual(ssh_endpoint({
+            "actual_status": "running",
+            "intended_status": "running",
+            "public_ipaddr": "203.0.113.10",
+            "ssh_host": "ssh.example",
+            "ssh_port": 22,
+            "ports": {"22/tcp": [{"HostPort": "34567"}]},
+        }), ("203.0.113.10", "34567"))
 
     def test_unresolved_ledger_blocks_create(self) -> None:
         from media_engine.resources.ledger import ResourceLedger
