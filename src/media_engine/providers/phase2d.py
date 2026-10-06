@@ -4,6 +4,7 @@ Tests pass a fake generator. The manual command is the only live caller.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -61,6 +63,10 @@ DISK_GB = 80
 # Vast storage_cost is $/GB/month. Live search.diskHour equals storage_cost * GB / 720.
 HOURS_PER_STORAGE_MONTH = Decimal(720)
 RUNTYPE = "ssh"
+SSH_DIR = Path("runtime/phase2d-ssh")
+# Vast's SSH banner tells the client to retry publickey auth after a few seconds.
+PROPAGATION_PROBES = 3
+_PROPAGATION_HINT = "try again after a few seconds"
 
 
 class Phase2DStop(Exception):
@@ -224,6 +230,8 @@ def run_phase2d(
     generate: Callable[[str, GpuOffer, float], tuple[bytes, dict]],
     now: Callable[[], float],
     stdout: Optional[TextIO] = None,
+    ssh_dir: Optional[Path] = None,
+    key_transport=None,
 ) -> int:
     """One discovery, one create, one image, then destroy. No second create."""
     out = sys.stdout if stdout is None else stdout
@@ -328,6 +336,12 @@ def run_phase2d(
     except Exception as exc:
         _say(out, getattr(exc, "code", "GENERATION_FAILED"))
     destroyed = _destroy_owned(lifecycle, instance_id, key)
+    key_removed = cleanup_account_ssh_key(
+        instance_id,
+        key,
+        key_transport or _account_ssh_transport,
+        SSH_DIR if ssh_dir is None else ssh_dir,
+    )
     if not destroyed:
         _say(out, "MANUAL_CLEANUP_REQUIRED")
         _say(out, "INSTANCE " + instance_id)
@@ -342,6 +356,9 @@ def run_phase2d(
     _record_usage(db_path, selected, instance_id, started, now(), final, elapsed, report)
     _say(out, final)
     _say(out, "INSTANCE " + instance_id)
+    if not key_removed:
+        _say(out, "SSH_KEY_CLEANUP_REQUIRED")
+        return 9
     if not generated:
         return 7
     return 0 if final == "TERMINATED" else 6
@@ -370,20 +387,29 @@ def ssh_generate(instance_id: str, offer: GpuOffer, deadline: float) -> tuple[by
             return row
         return None
 
+    identity, public = _new_ephemeral_ssh_key(SSH_DIR / instance_id)
+    fingerprint = public_key_fingerprint(public)
+
     def attach() -> None:
-        _identity, public = _ephemeral_ssh_key()
-        _attach_ssh_key(instance_id, public, key)
+        key_id = register_account_ssh_key(_account_ssh_transport, public, key)
+        (SSH_DIR / instance_id).mkdir(parents=True, exist_ok=True)
+        (SSH_DIR / instance_id / "vast_key_id").write_text(key_id + "\n", encoding="utf-8")
 
     return run_ssh_runtime(
         instance_id=instance_id,
         fetch=fetch,
         attach=attach,
-        ssh=_ssh_live,
-        scp=_scp_live,
+        ssh=lambda host, port, command, data, timeout: _ssh_live(
+            identity, host, port, command, data, timeout,
+        ),
+        scp=lambda host, port, remote, local, timeout: _scp_live(
+            identity, host, port, remote, local, timeout,
+        ),
         deadline=deadline,
         now=time.time,
         sleep=time.sleep,
         diagnostic_dir=diagnostic_dir,
+        key_fingerprint=fingerprint,
         script=Path(_REMOTE_FILE).read_bytes(),
         job=json.dumps({
             "prompt": FIRST_PROMPT,
@@ -527,6 +553,7 @@ def write_runtime_diagnostic(
     now: float,
     secrets: tuple[str, ...] = (),
     evidence: Optional[Mapping] = None,
+    key_fingerprint: str = "",
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -549,6 +576,9 @@ def write_runtime_diagnostic(
         ):
             if key in evidence:
                 payload[key] = evidence[key]
+    if key_fingerprint:
+        payload["public_key_fingerprint"] = key_fingerprint
+        payload["attachment_stage"] = stage
     path = directory / f"phase2d-{instance_id}.diagnostic.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
@@ -618,6 +648,7 @@ def run_ssh_runtime(
     script: bytes,
     job: bytes,
     secrets: tuple[str, ...] = (),
+    key_fingerprint: str = "",
 ) -> tuple[bytes, dict]:
     """Wait until SSH accepts a command, then run the remote generator once."""
     snapshots: list[dict] = []
@@ -639,6 +670,7 @@ def run_ssh_runtime(
             now=now(),
             secrets=secrets,
             evidence=startup_evidence(snapshots),
+            key_fingerprint=key_fingerprint,
         )
 
     try:
@@ -650,19 +682,30 @@ def run_ssh_runtime(
         raise
     try:
         attach()
-    except Phase2DStop:
+    except Phase2DStop as exc:
+        record(exc.code, None, None, b"", b"", "Phase2DStop")
         raise
     except Exception as exc:
-        record("SSH_CONNECT_FAILED", None, None, b"", b"", type(exc).__name__)
-        raise Phase2DStop("SSH_CONNECT_FAILED") from exc
+        record("SSH_KEY_ATTACH_FAILED", None, None, b"", b"", type(exc).__name__)
+        raise Phase2DStop("SSH_KEY_ATTACH_FAILED") from exc
+    auth_attempts = 0
     while now() < deadline:
         code, out, err = ssh(host, port, "true", None, 20)
         if code == 0:
             break
         kind = classify_ssh_stderr(err)
         if kind == "SSH_AUTH_FAILED":
-            record(kind, code, None, out, err, "Phase2DStop")
-            raise Phase2DStop(kind)
+            decision = auth_failure_code(err, auth_attempts)
+            auth_attempts += 1
+            if decision == "":
+                remaining = deadline - now()
+                if remaining <= 0:
+                    decision = "SSH_KEY_PROPAGATION_TIMEOUT"
+                else:
+                    sleep(min(READY_POLL_SECONDS, remaining))
+                    continue
+            record(decision, code, None, out, err, "Phase2DStop")
+            raise Phase2DStop(decision)
         if kind != "SSH_NOT_READY":
             record("SSH_CONNECT_FAILED", code, None, out, err, "Phase2DStop")
             raise Phase2DStop("SSH_CONNECT_FAILED")
@@ -724,8 +767,27 @@ def run_ssh_runtime(
     return png_path.read_bytes(), report
 
 
-def _ssh_live(host: str, port: str, command: str, data: Optional[bytes], timeout: int) -> tuple[int, bytes, bytes]:
-    identity, _public = _ephemeral_ssh_key()
+def auth_failure_code(stderr: bytes, attempts: int) -> str:
+    """Return a retry sentinel or the terminal auth code.
+
+    Vast's own SSH banner says to retry after a few seconds. A publickey
+    rejection without that hint is a deterministic authentication failure.
+    """
+    text = stderr.decode("utf-8", "replace").lower()
+    if _PROPAGATION_HINT in text and attempts + 1 < PROPAGATION_PROBES:
+        return ""
+    if _PROPAGATION_HINT in text:
+        return "SSH_KEY_PROPAGATION_TIMEOUT"
+    return "SSH_AUTH_FAILED"
+
+
+def public_key_fingerprint(public_key: str) -> str:
+    blob = base64.b64decode(public_key.strip().split()[1])
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+    return "SHA256:" + digest
+
+
+def _ssh_live(identity: str, host: str, port: str, command: str, data: Optional[bytes], timeout: int) -> tuple[int, bytes, bytes]:
     try:
         proc = subprocess.run(
             [
@@ -745,8 +807,7 @@ def _ssh_live(host: str, port: str, command: str, data: Optional[bytes], timeout
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _scp_live(host: str, port: str, remote: str, local: Path, timeout: int) -> None:
-    identity, _public = _ephemeral_ssh_key()
+def _scp_live(identity: str, host: str, port: str, remote: str, local: Path, timeout: int) -> None:
     subprocess.run(
         [
             "scp", "-i", identity, "-o", "IdentitiesOnly=yes",
@@ -797,19 +858,110 @@ def _ssh_attach_transport(method: str, url: str, body: bytes, headers: dict) -> 
         return response.read()
 
 
-def _ephemeral_ssh_key() -> tuple[str, str]:
-    root = Path("runtime/phase2d-ssh")
-    root.mkdir(parents=True, exist_ok=True)
-    private = root / "id_ed25519"
-    public = root / "id_ed25519.pub"
+def _new_ephemeral_ssh_key(directory: Path) -> tuple[str, str]:
+    """One new ed25519 pair for this instance. The private key stays in this directory."""
+    directory.mkdir(parents=True, exist_ok=True)
+    private = directory / "id_ed25519"
+    public = directory / "id_ed25519.pub"
     if not private.exists() or not public.exists():
         subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-f", str(private), "-N", "", "-q"],
+            ["ssh-keygen", "-t", "ed25519", "-f", str(private), "-N", "", "-q", "-C", "phase2d"],
             check=True,
             capture_output=True,
         )
     os.chmod(private, 0o600)
-    return str(private), public.read_text(encoding="utf-8").strip()
+    text = public.read_text(encoding="utf-8").strip()
+    if not text.startswith("ssh-ed25519 ") or "PRIVATE" in text or "\n" in text:
+        raise Phase2DStop("SSH_KEY_REFUSED")
+    return str(private), text
+
+
+_ACCOUNT_SSH = "https://console.vast.ai/api/v0/ssh/"
+_ACCOUNT_SSH_ONE = re.compile(r"https://console\.vast\.ai/api/v0/ssh/([0-9]+)/")
+
+
+def account_ssh_allowed(method: str, url: str) -> bool:
+    if method == "POST" and url == _ACCOUNT_SSH:
+        return True
+    return method == "DELETE" and _ACCOUNT_SSH_ONE.fullmatch(url) is not None
+
+
+def parse_registered_key_id(raw: bytes) -> str:
+    """Confirm the documented create-ssh-key response and return its numeric id."""
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Phase2DStop("SSH_KEY_NOT_REGISTERED") from exc
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        raise Phase2DStop("SSH_KEY_NOT_REGISTERED")
+    created = payload.get("key")
+    key_id = created.get("id") if isinstance(created, dict) else None
+    if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id < 1:
+        raise Phase2DStop("SSH_KEY_NOT_REGISTERED")
+    return str(key_id)
+
+
+def register_account_ssh_key(transport, public_key: str, api_key: str) -> str:
+    """POST the public key to the account. Returns the confirmed Vast key id."""
+    text = public_key.strip()
+    if not text.startswith("ssh-ed25519 ") or "PRIVATE" in text or "\n" in text:
+        raise Phase2DStop("SSH_KEY_ATTACH_FAILED")
+    if not account_ssh_allowed("POST", _ACCOUNT_SSH):
+        raise Phase2DStop("COMMAND_BLOCKED")
+    body = json.dumps({"ssh_key": text}, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + api_key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    try:
+        raw = transport("POST", _ACCOUNT_SSH, body, headers)
+    except Phase2DStop:
+        raise
+    except Exception as exc:
+        raise Phase2DStop("SSH_KEY_ATTACH_FAILED") from exc
+    return parse_registered_key_id(raw)
+
+
+def delete_account_ssh_key(transport, key_id: str, api_key: str) -> None:
+    if not key_id.isdigit():
+        raise Phase2DStop("SSH_KEY_CLEANUP_REQUIRED")
+    url = f"https://console.vast.ai/api/v0/ssh/{key_id}/"
+    if not account_ssh_allowed("DELETE", url):
+        raise Phase2DStop("SSH_KEY_CLEANUP_REQUIRED")
+    headers = {
+        "Authorization": "Bearer " + api_key,
+        "Accept": "application/json",
+    }
+    try:
+        transport("DELETE", url, b"", headers)
+    except Exception as exc:
+        raise Phase2DStop("SSH_KEY_CLEANUP_REQUIRED") from exc
+
+
+def cleanup_account_ssh_key(instance_id: str, api_key: str, transport, directory: Path) -> bool:
+    path = directory / instance_id / "vast_key_id"
+    if not path.exists():
+        return True
+    key_id = path.read_text(encoding="utf-8").strip()
+    try:
+        delete_account_ssh_key(transport, key_id, api_key)
+    except Phase2DStop:
+        return False
+    path.unlink()
+    return True
+
+
+def _account_ssh_transport(method: str, url: str, body: bytes, headers: dict) -> bytes:
+    if not account_ssh_allowed(method, url):
+        raise Phase2DStop("COMMAND_BLOCKED")
+    request = urllib.request.Request(url, data=body or None, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        code = "SSH_KEY_CLEANUP_REQUIRED" if method == "DELETE" else "SSH_KEY_ATTACH_FAILED"
+        raise Phase2DStop(code) from exc
 
 
 def _reject_over_price(row: dict) -> None:

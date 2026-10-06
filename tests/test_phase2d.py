@@ -21,8 +21,12 @@ from media_engine.providers.phase2d import (
     MAX_HOURLY_USD,
     Phase2DStop,
     accept_offer,
+    _new_ephemeral_ssh_key,
     attach_ssh_key,
     budget_status,
+    cleanup_account_ssh_key,
+    public_key_fingerprint,
+    register_account_ssh_key,
     fingerprint_for,
     format_policy,
     policy_fields,
@@ -132,6 +136,7 @@ class Phase2DTests(unittest.TestCase):
         self.artifacts = str(Path(self.tmp.name) / "artifacts")
         self.clock = _Clock()
         self.calls: list[tuple[str, str]] = []
+        self.ssh_deletes: list[str] = []
         self.generated = 0
         self._urlopen = urllib.request.urlopen
         urllib.request.urlopen = self._block
@@ -149,7 +154,7 @@ class Phase2DTests(unittest.TestCase):
         self.assertGreater(deadline, self.clock.t)
         return _png(), {"strategy": "bf16-cpu-offload", "seed": FIRST_SEED}
 
-    def _run(self, transport, env=None, generate=None) -> tuple[int, str]:
+    def _run(self, transport, env=None, generate=None, ssh_dir=None) -> tuple[int, str]:
         stdout = io.StringIO()
         code = run_phase2d(
             _env() if env is None else env,
@@ -160,6 +165,8 @@ class Phase2DTests(unittest.TestCase):
             generate=self._generate if generate is None else generate,
             now=self.clock,
             stdout=stdout,
+            ssh_dir=None if ssh_dir is None else Path(ssh_dir),
+            key_transport=transport,
         )
         text = stdout.getvalue()
         self.assertNotIn("unit-test-vast-secret", text)
@@ -475,7 +482,10 @@ class Phase2DTests(unittest.TestCase):
         token = "a" * 64
 
         def ssh(host, port, command, data, timeout):
-            return 255, b"stdout " + secret.encode(), b"Permission denied (publickey) Bearer " + secret.encode() + b" " + token.encode()
+            return 255, b"stdout " + secret.encode(), (
+                b"Permission denied (publickey) Bearer " + secret.encode() + b" " + token.encode()
+                + b"\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"
+            )
 
         with self.assertRaises(Phase2DStop) as caught:
             run_ssh_runtime(
@@ -743,6 +753,191 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual(len(readiness["transitions"]), 20)
         self.assertEqual(readiness["transition_count"], polls["n"])
 
+    def test_ephemeral_public_key_is_registered_and_private_key_stays_local(self) -> None:
+        directory = Path(self.tmp.name) / "ssh-new"
+        identity, public = _new_ephemeral_ssh_key(directory)
+        private = Path(identity).read_bytes()
+        seen = {}
+
+        def transport(method, url, body, headers):
+            seen["method"] = method
+            seen["url"] = url
+            seen["body"] = body
+            self.assertNotIn(private, body)
+            self.assertNotIn(b"PRIVATE", body)
+            self.assertNotIn(b"unit-test-vast-secret", body)
+            return b'{"success": true, "key": {"id": 77}}'
+
+        key_id = register_account_ssh_key(transport, public, "unit-test-vast-secret")
+        self.assertEqual((seen["method"], seen["url"], key_id), ("POST", "https://console.vast.ai/api/v0/ssh/", "77"))
+        self.assertIn(public.encode(), seen["body"])
+        self.assertTrue(str(public_key_fingerprint(public)).startswith("SHA256:"))
+        self.assertNotIn(public, json.dumps({"fingerprint": public_key_fingerprint(public)}))
+
+    def test_ssh_probe_waits_for_confirmed_key_registration(self) -> None:
+        order = []
+
+        def attach():
+            order.append("attach")
+
+        def ssh(host, port, command, data, timeout):
+            order.append(command)
+            self.assertEqual(order[0], "attach")
+            return 0, b"", b""
+
+        def scp(host, port, remote, local, timeout):
+            if str(remote).endswith("phase2d_report.json"):
+                local.write_text('{"strategy": "bf16-cpu-offload"}\n', encoding="utf-8")
+            else:
+                local.write_bytes(_png())
+
+        clock = _StepClock()
+        png, _report = run_ssh_runtime(
+            instance_id="555",
+            fetch=lambda: _ready_row(),
+            attach=attach,
+            ssh=ssh,
+            scp=scp,
+            deadline=clock.t + 30,
+            now=clock,
+            sleep=clock.sleep,
+            diagnostic_dir=Path(self.artifacts),
+            script=b"print('ok')\n",
+            job=b"{}",
+            key_fingerprint="SHA256:test",
+        )
+        self.assertEqual(validate_png(png), (1024, 1024))
+        self.assertEqual(order[0], "attach")
+        self.assertEqual(order[1], "true")
+
+    def test_key_attachment_failure_does_not_probe_ssh(self) -> None:
+        probes = {"n": 0}
+
+        def attach():
+            raise Phase2DStop("SSH_KEY_ATTACH_FAILED")
+
+        def ssh(host, port, command, data, timeout):
+            probes["n"] += 1
+            return 0, b"", b""
+
+        clock = _StepClock()
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: _ready_row(),
+                attach=attach,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 30,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"",
+                job=b"{}",
+            )
+        self.assertEqual(caught.exception.code, "SSH_KEY_ATTACH_FAILED")
+        self.assertEqual(probes["n"], 0)
+        saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], "SSH_KEY_ATTACH_FAILED")
+
+        with self.assertRaises(Phase2DStop) as unregistered:
+            register_account_ssh_key(lambda *args: b'{"success": false}', "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample phase2d", "k")
+        self.assertEqual(unregistered.exception.code, "SSH_KEY_NOT_REGISTERED")
+
+    def test_propagation_hint_retries_then_accepts_true(self) -> None:
+        clock = _StepClock()
+        probes = {"n": 0}
+
+        def ssh(host, port, command, data, timeout):
+            if command == "true":
+                probes["n"] += 1
+                if probes["n"] == 1:
+                    return 255, b"", b"If authentication fails, try again after a few seconds, and double check your ssh key.\nPermission denied (publickey).\n"
+            return 0, b"", b""
+
+        def scp(host, port, remote, local, timeout):
+            if str(remote).endswith("phase2d_report.json"):
+                local.write_text('{"strategy": "bf16-cpu-offload"}\n', encoding="utf-8")
+            else:
+                local.write_bytes(_png())
+
+        png, _report = run_ssh_runtime(
+            instance_id="555",
+            fetch=lambda: _ready_row(),
+            attach=lambda: None,
+            ssh=ssh,
+            scp=scp,
+            deadline=clock.t + 60,
+            now=clock,
+            sleep=clock.sleep,
+            diagnostic_dir=Path(self.artifacts),
+            script=b"print('ok')\n",
+            job=b"{}",
+        )
+        self.assertEqual(probes["n"], 2)
+        self.assertEqual(validate_png(png), (1024, 1024))
+        self.assertGreater(clock.t, 1_000.0)
+
+    def test_propagation_timeout_is_bounded(self) -> None:
+        calls = {"n": 0}
+
+        def ssh(host, port, command, data, timeout):
+            calls["n"] += 1
+            return 255, b"", b"try again after a few seconds\nPermission denied (publickey).\n"
+
+        exc, _probes = self._runtime(lambda: _ready_row(), ssh=ssh)
+        self.assertEqual(exc.code, "SSH_KEY_PROPAGATION_TIMEOUT")
+        self.assertEqual(calls["n"], 3)
+
+    def test_plain_publickey_rejection_is_auth_failure(self) -> None:
+        calls = {"n": 0}
+
+        def ssh(host, port, command, data, timeout):
+            calls["n"] += 1
+            return 255, b"", b"Permission denied (publickey).\n"
+
+        exc, _probes = self._runtime(lambda: _ready_row(), ssh=ssh)
+        self.assertEqual(exc.code, "SSH_AUTH_FAILED")
+        self.assertEqual(calls["n"], 1)
+
+    def test_account_key_is_deleted_after_destroy(self) -> None:
+        ssh_dir = Path(self.tmp.name) / "keys"
+
+        def generate(instance_id, offer, deadline):
+            root = ssh_dir / instance_id
+            root.mkdir(parents=True)
+            (root / "vast_key_id").write_text("77\n", encoding="utf-8")
+            return _png(), {"strategy": "bf16-cpu-offload"}
+
+        code, text = self._run(self._machine(), generate=generate, ssh_dir=ssh_dir)
+        self.assertEqual(code, 0)
+        self.assertIn("https://console.vast.ai/api/v0/ssh/77/", self.ssh_deletes)
+        self.assertFalse((ssh_dir / "555" / "vast_key_id").exists())
+        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
+
+    def test_failed_key_cleanup_is_reported_without_another_create(self) -> None:
+        ssh_dir = Path(self.tmp.name) / "keys-fail"
+
+        def generate(instance_id, offer, deadline):
+            root = ssh_dir / instance_id
+            root.mkdir(parents=True)
+            (root / "vast_key_id").write_text("77\n", encoding="utf-8")
+            raise Phase2DStop("SSH_AUTH_FAILED")
+
+        base = self._machine()
+
+        def transport(method, url, body, headers):
+            if method == "DELETE" and "/api/v0/ssh/" in url:
+                raise RuntimeError("cleanup failed")
+            return base(method, url, body, headers)
+
+        code, text = self._run(transport, generate=generate, ssh_dir=ssh_dir)
+        self.assertEqual(code, 9)
+        self.assertIn("SSH_KEY_CLEANUP_REQUIRED", text)
+        self.assertIn("TERMINATED", text)
+        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
+        self.assertEqual([method for method, _url in self.calls].count("DELETE"), 1)
+
     def test_ssh_endpoint_uses_published_port_only_when_running(self) -> None:
         self.assertIsNone(ssh_endpoint({
             "actual_status": "loading",
@@ -787,6 +982,9 @@ class Phase2DTests(unittest.TestCase):
                 self.assertIn(b"pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime", body)
                 self.assertIn(b"media-engine:phase2d", body)
                 return b'{"new_contract": 555}'
+            if method == "DELETE" and "/api/v0/ssh/" in url:
+                self.ssh_deletes.append(url)
+                return b'{"success": true}'
             if method == "DELETE":
                 state["destroyed"] = True
                 return b"{}"
