@@ -825,10 +825,16 @@ def remote_python_stages() -> list[tuple[str, str]]:
     system site-packages. python3-venv is installed only when venv creation fails.
     """
     bootstrap = (
+        "apt_used=no; "
         "if ! python3 -m venv --system-site-packages /workspace/phase2d-venv; then "
-        "rm -rf /workspace/phase2d-venv && apt-get update && "
+        "apt_used=yes; rm -rf /workspace/phase2d-venv && apt-get update && "
         "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv && "
-        "python3 -m venv --system-site-packages /workspace/phase2d-venv; fi"
+        "python3 -m venv --system-site-packages /workspace/phase2d-venv; fi; "
+        "PHASE2D_APT_FALLBACK=$apt_used "
+        f"{PHASE2D_PYTHON} -c "
+        "'import json,os,sys,importlib.metadata as meta; "
+        "print(json.dumps({\"stage\":\"PYTHON_ENV\",\"python\":sys.version.split()[0],"
+        "\"pip\":meta.version(\"pip\"),\"apt_fallback\":os.environ.get(\"PHASE2D_APT_FALLBACK\",\"no\")}))'"
     )
     install = (
         f"{PHASE2D_PYTHON} -m pip install -q --upgrade pip && "
@@ -837,16 +843,92 @@ def remote_python_stages() -> list[tuple[str, str]]:
     )
     verify = (
         f"{PHASE2D_PYTHON} -c "
-        "'import torch,diffusers,transformers,accelerate;"
-        "print(torch.__version__, diffusers.__version__, transformers.__version__, accelerate.__version__)'"
+        "'import json,torch,diffusers,transformers,accelerate; "
+        "cuda=torch.cuda.is_available(); "
+        "props=torch.cuda.get_device_properties(0) if cuda else None; "
+        "print(json.dumps({\"stage\":\"IMPORT_CHECK\",\"torch\":torch.__version__,"
+        "\"torch_cuda\":torch.version.cuda,\"diffusers\":diffusers.__version__,"
+        "\"transformers\":transformers.__version__,\"accelerate\":accelerate.__version__,"
+        "\"cuda_available\":cuda,\"gpu_name\":torch.cuda.get_device_name(0) if cuda else \"\","
+        "\"gpu_vram_bytes\":int(props.total_memory) if props else 0}))'"
+    )
+    disk = (
+        f"{PHASE2D_PYTHON} -c "
+        "'import json,shutil; usage=shutil.disk_usage(\"/workspace\"); "
+        "print(json.dumps({\"stage\":\"DISK_BEFORE_DOWNLOAD\",\"filesystem\":\"/workspace\","
+        "\"total_bytes\":usage.total,\"free_bytes\":usage.free}))'"
     )
     run = f"{PHASE2D_PYTHON} /workspace/phase2d_gen.py"
     return [
         ("PYTHON_ENV_BOOTSTRAP", bootstrap),
         ("PYTHON_ENV_INSTALL", install),
         ("PYTHON_ENV_VERIFY", verify),
+        ("DISK_BEFORE_DOWNLOAD", disk),
         ("PYTHON_RUNTIME", run),
     ]
+
+
+_FETCH_PROGRESS = re.compile(r"Fetching (\d+) files:.*?(\d+)/(\d+)")
+
+
+def classify_runtime_failure(exit_code: int, stdout: bytes, stderr: bytes, report: Mapping) -> str:
+    """Separate a download deadline from SSH loss, hub errors, disk, and load."""
+    detail = str(report.get("error") or "")
+    if "DOWNLOAD" in detail:
+        return "MODEL_DOWNLOAD_FAILED"
+    if "IMPORT" in detail or "LOAD" in detail:
+        return "MODEL_LOAD_FAILED"
+    text = (stdout + b"\n" + stderr).decode("utf-8", "replace").lower()
+    if "no space left on device" in text:
+        return "DISK_INSUFFICIENT"
+    if exit_code == 255 and "fetching" in text and "files" in text:
+        return "MODEL_DOWNLOAD_TIMEOUT"
+    return "REMOTE_COMMAND_FAILED"
+
+
+def progress_records(stdout: bytes, stderr: bytes) -> list[dict]:
+    records: list[dict] = []
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("stage"), str):
+            records.append(payload)
+    matches = list(_FETCH_PROGRESS.finditer(stderr.decode("utf-8", "replace")))
+    if matches:
+        last = matches[-1]
+        records.append({
+            "stage": "DOWNLOAD",
+            "files_total": int(last.group(1)),
+            "files_complete": int(last.group(2)),
+        })
+    return records
+
+
+def append_stage_records(directory: Path, instance_id: str, records: list[dict], now: float, secrets: tuple[str, ...] = ()) -> None:
+    if not records:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"phase2d-{instance_id}.stages.json"
+    existing: list = []
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            loaded = []
+        if isinstance(loaded, list):
+            existing = loaded
+    for record in records:
+        item = {}
+        for key, value in record.items():
+            item[key] = sanitize_text(value, secrets) if isinstance(value, str) else value
+        item["recorded_at"] = _iso(now)
+        existing.append(item)
+    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
 
 def classify_python_env_failure(stderr: bytes) -> str:
@@ -957,6 +1039,7 @@ def run_ssh_runtime(
     for stage_name, command in remote_python_stages():
         remaining = max(1, int(deadline - now()))
         code, out, err = ssh(host, port, command, None, remaining)
+        append_stage_records(diagnostic_dir, instance_id, progress_records(out, err), now(), secrets)
         if code != 0 and stage_name != "PYTHON_RUNTIME":
             failure = classify_python_env_failure(err)
             record(failure, None, code, out, err, "Phase2DStop")
@@ -975,13 +1058,7 @@ def run_ssh_runtime(
         except json.JSONDecodeError:
             report = {}
     if code != 0:
-        detail = str(report.get("error") or "")
-        if "DOWNLOAD" in detail:
-            stage = "MODEL_DOWNLOAD_FAILED"
-        elif "IMPORT" in detail or "LOAD" in detail:
-            stage = "MODEL_LOAD_FAILED"
-        else:
-            stage = "REMOTE_COMMAND_FAILED"
+        stage = classify_runtime_failure(code, out, err, report)
         record(stage, None, code, out, err, "Phase2DStop")
         raise Phase2DStop(stage)
     if not report_path.exists():

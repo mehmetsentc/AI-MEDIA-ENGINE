@@ -13,6 +13,7 @@ from pathlib import Path
 
 from media_engine.engines.image.base import ImageEngineError
 from media_engine.engines.image.qwen import FIRST_PROMPT, FIRST_SEED, QwenImageEngine, validate_png
+from media_engine.engines.image.qwen_remote import download_progress_snapshot
 from media_engine.providers.offers import GpuOffer
 from media_engine.providers.phase2d import (
     DISK_GB,
@@ -26,6 +27,7 @@ from media_engine.providers.phase2d import (
     Phase2DStop,
     accept_offer,
     classify_python_env_failure,
+    classify_runtime_failure,
     remote_python_stages,
     _new_ephemeral_ssh_key,
     attach_ssh_key,
@@ -589,7 +591,13 @@ class Phase2DTests(unittest.TestCase):
         stages = dict(remote_python_stages())
         self.assertEqual(
             [name for name, _command in remote_python_stages()],
-            ["PYTHON_ENV_BOOTSTRAP", "PYTHON_ENV_INSTALL", "PYTHON_ENV_VERIFY", "PYTHON_RUNTIME"],
+            [
+                "PYTHON_ENV_BOOTSTRAP",
+                "PYTHON_ENV_INSTALL",
+                "PYTHON_ENV_VERIFY",
+                "DISK_BEFORE_DOWNLOAD",
+                "PYTHON_RUNTIME",
+            ],
         )
         self.assertEqual(PHASE2D_VENV, "/workspace/phase2d-venv")
         self.assertEqual(PHASE2D_PYTHON, "/workspace/phase2d-venv/bin/python")
@@ -598,7 +606,9 @@ class Phase2DTests(unittest.TestCase):
         self.assertNotIn("python3 -m pip", blob)
         self.assertIn(f"{PHASE2D_PYTHON} -m pip install", stages["PYTHON_ENV_INSTALL"])
         self.assertIn("'diffusers>=0.35' transformers accelerate safetensors pillow", stages["PYTHON_ENV_INSTALL"])
-        self.assertIn("import torch,diffusers,transformers,accelerate", stages["PYTHON_ENV_VERIFY"])
+        self.assertIn("torch,diffusers,transformers,accelerate", stages["PYTHON_ENV_VERIFY"])
+        self.assertIn("DISK_BEFORE_DOWNLOAD", stages["DISK_BEFORE_DOWNLOAD"])
+        self.assertIn("apt_fallback", stages["PYTHON_ENV_BOOTSTRAP"])
         self.assertEqual(stages["PYTHON_RUNTIME"], f"{PHASE2D_PYTHON} /workspace/phase2d_gen.py")
         self.assertIn("python3 -m venv --system-site-packages /workspace/phase2d-venv", stages["PYTHON_ENV_BOOTSTRAP"])
         self.assertEqual(MAX_CREATE_ATTEMPTS, 1)
@@ -640,6 +650,77 @@ class Phase2DTests(unittest.TestCase):
         self.assertIn("upgrade pip", saved["stdout_tail"])
         self.assertIn("externally-managed-environment", saved["stderr_tail"])
         self.assertIn("T", saved["at"])
+
+    def test_download_deadline_is_classified_and_keeps_earlier_stages(self) -> None:
+        stderr = b"Fetching 31 files:  52%|##### | 16/31 [05:42<14:39, 58.65s/it]\n"
+        self.assertEqual(classify_runtime_failure(255, b"", stderr, {}), "MODEL_DOWNLOAD_TIMEOUT")
+        self.assertEqual(classify_runtime_failure(255, b"", b"connection timed out\n", {}), "REMOTE_COMMAND_FAILED")
+        self.assertEqual(classify_runtime_failure(1, b"", b"No space left on device\n", {}), "DISK_INSUFFICIENT")
+        self.assertEqual(
+            classify_runtime_failure(1, b"", b"", {"error": "DOWNLOAD_FAILED"}),
+            "MODEL_DOWNLOAD_FAILED",
+        )
+        self.assertEqual(
+            classify_runtime_failure(1, b"", b"", {"error": "LOAD_FAILED"}),
+            "MODEL_LOAD_FAILED",
+        )
+        clock = _StepClock()
+
+        def ssh(host, port, command, data, timeout):
+            if "PHASE2D_APT_FALLBACK" in command:
+                return 0, b'{"stage":"PYTHON_ENV","python":"3.12.3","pip":"25.1","apt_fallback":"no"}\n', b""
+            if "IMPORT_CHECK" in command:
+                return 0, (
+                    b'{"stage":"IMPORT_CHECK","torch":"2.11.0","torch_cuda":"12.8",'
+                    b'"diffusers":"0.35.1","transformers":"4.57.0","accelerate":"1.10.0",'
+                    b'"cuda_available":true,"gpu_name":"NVIDIA L40","gpu_vram_bytes":51539607552}\n'
+                ), b""
+            if "DISK_BEFORE_DOWNLOAD" in command:
+                return 0, b'{"stage":"DISK_BEFORE_DOWNLOAD","filesystem":"/workspace","total_bytes":80,"free_bytes":70}\n', b""
+            if "phase2d_gen.py" in command and data is None:
+                return 255, b'{"stage":"DOWNLOAD","cache_bytes":123,"free_bytes":60,"files_complete":4,"last_active_file":"abc.incomplete"}\n', stderr
+            return 0, b"", b""
+
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: _ready_row(),
+                attach=lambda: None,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 30,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"x",
+                job=b"{}",
+            )
+        self.assertEqual(caught.exception.code, "MODEL_DOWNLOAD_TIMEOUT")
+        stages = json.loads((Path(self.artifacts) / "phase2d-555.stages.json").read_text(encoding="utf-8"))
+        names = [row["stage"] for row in stages]
+        self.assertEqual(names[:3], ["PYTHON_ENV", "IMPORT_CHECK", "DISK_BEFORE_DOWNLOAD"])
+        self.assertIn("DOWNLOAD", names)
+        self.assertEqual(stages[0]["python"], "3.12.3")
+        self.assertEqual(stages[0]["apt_fallback"], "no")
+        self.assertEqual(stages[1]["gpu_name"], "NVIDIA L40")
+        self.assertTrue(all(row["recorded_at"] for row in stages))
+        saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], "MODEL_DOWNLOAD_TIMEOUT")
+        self.assertEqual(saved["remote_exit_code"], 255)
+
+    def test_download_progress_counts_incomplete_blobs(self) -> None:
+        cache = Path(self.artifacts) / "hf-cache"
+        blob = cache / "models--Qwen--Qwen-Image" / "blobs"
+        blob.mkdir(parents=True)
+        (blob / "done").write_bytes(b"abc")
+        partial = blob / "abc.incomplete"
+        partial.write_bytes(b"12345")
+        snapshot = download_progress_snapshot(cache)
+        self.assertEqual(snapshot["stage"], "DOWNLOAD")
+        self.assertEqual(snapshot["files_complete"], 1)
+        self.assertEqual(snapshot["cache_bytes"], 8)
+        self.assertEqual(snapshot["last_active_file"], "abc.incomplete")
+        self.assertGreater(snapshot["free_bytes"], 0)
 
     def test_missing_remote_report_is_explicit(self) -> None:
         clock = _StepClock()
