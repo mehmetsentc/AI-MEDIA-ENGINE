@@ -32,6 +32,7 @@ from media_engine.providers.phase2d import (
     policy_fields,
     policy_fingerprint,
     active_quarantine,
+    backfill_quarantine_machine_id,
     projected_max_cost,
     quote_all_in,
     record_host_quarantine,
@@ -1088,6 +1089,76 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("NO_HEALTHY_OFFER_WITHIN_BUDGET", text)
         self.assertNotIn("PUT", [method for method, _url in self.calls])
+
+    def test_backfill_adds_machine_without_extending_expiry(self) -> None:
+        failed = self.clock.t
+        record_host_quarantine(
+            self.db_path,
+            offer=_gpu(offer_id="53395400", machine_id=None),
+            failure_class="CONTAINER_START_FAILED",
+            reason="OCI runtime create failed: unresolvable CDI device gpu=2",
+            now=failed,
+        )
+        backfill_quarantine_machine_id(self.db_path, offer_id="53395400", machine_id="58482")
+        from media_engine.db import connect
+        conn = connect(self.db_path)
+        try:
+            row = conn.execute("SELECT machine_id, failure_class, reason, failed_at, quarantine_until FROM host_quarantine").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["machine_id"], "58482")
+        self.assertEqual(row["failure_class"], "CONTAINER_START_FAILED")
+        self.assertEqual(row["reason"], "OCI runtime create failed: unresolvable CDI device gpu=2")
+        self.assertEqual(row["failed_at"], failed)
+        self.assertEqual(row["quarantine_until"], failed + QUARANTINE_SECONDS)
+        machines, offers = active_quarantine(self.db_path, row["quarantine_until"] - 1)
+        same_offer = _gpu(offer_id="53395400", machine_id="58482")
+        same_machine = _gpu(offer_id="999", machine_id="58482", host_id="362355")
+        other_machine = _gpu(offer_id="300", machine_id="111", host_id="362355")
+        selected = select_one(
+            [same_offer, same_machine, other_machine],
+            excluded_machine_ids=machines,
+            excluded_offer_ids=offers,
+        )
+        self.assertEqual(selected.offer_id, "300")
+        expired_machines, expired_offers = active_quarantine(self.db_path, row["quarantine_until"])
+        again = select_one(
+            [same_machine],
+            excluded_machine_ids=expired_machines,
+            excluded_offer_ids=expired_offers,
+        )
+        self.assertEqual(again.offer_id, "999")
+        self.assertEqual(again.machine_id, "58482")
+
+    def test_backfill_refuses_a_different_machine_id(self) -> None:
+        record_host_quarantine(
+            self.db_path,
+            offer=_gpu(offer_id="53395400", machine_id="111"),
+            failure_class="CONTAINER_START_FAILED",
+            reason="oci",
+            now=self.clock.t,
+        )
+        with self.assertRaises(Phase2DStop) as caught:
+            backfill_quarantine_machine_id(self.db_path, offer_id="53395400", machine_id="58482")
+        self.assertEqual(caught.exception.code, "IDENTITY_CONFLICT")
+        machines, _offers = active_quarantine(self.db_path, self.clock.t)
+        self.assertEqual(machines, frozenset({"111"}))
+
+    def test_selected_machine_is_persisted_before_create(self) -> None:
+        base = self._machine(offers=[_row(machine_id=58482, host_id=362355)])
+
+        def transport(method, url, body, headers):
+            if method == "PUT":
+                saved = json.loads((Path(self.artifacts) / "selection-before-create.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["offer_id"], "200")
+                self.assertEqual(saved["machine_id"], "58482")
+                self.assertEqual(saved["host_id"], "362355")
+            return base(method, url, body, headers)
+
+        code, text = self._run(transport)
+        self.assertEqual(code, 0)
+        self.assertIn("OFFER 200", text)
+        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
 
     def test_policy_ceilings_stay_fixed(self) -> None:
         self.assertEqual(policy_fingerprint(), "f50c24338d52d889ae7d5aa5c2742b15483632096669bf024e21b1093702cbc4")

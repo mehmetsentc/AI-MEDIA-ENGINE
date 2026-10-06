@@ -272,6 +272,71 @@ def active_quarantine(db_path: str, now: float) -> tuple[frozenset[str], frozens
     return frozenset(machines), frozenset(offers)
 
 
+def backfill_quarantine_machine_id(db_path: str, *, offer_id: str, machine_id: str, provider: str = "vast") -> None:
+    """Fill a missing machine id. Expiry, reason, and failure class stay unchanged."""
+    if provider != "vast" or not offer_id.isdigit() or not machine_id.isdigit():
+        raise Phase2DStop("IDENTITY_CONFLICT")
+    init_schema(db_path)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT machine_id, failure_class, reason, failed_at, quarantine_until
+            FROM host_quarantine WHERE provider = ? AND offer_id = ?
+            """,
+            (provider, offer_id),
+        ).fetchall()
+        if len(rows) != 1:
+            raise Phase2DStop("IDENTITY_CONFLICT")
+        current = rows[0]["machine_id"] or ""
+        if current == machine_id:
+            return
+        if current:
+            raise Phase2DStop("IDENTITY_CONFLICT")
+        original = (rows[0]["failure_class"], rows[0]["reason"], rows[0]["failed_at"], rows[0]["quarantine_until"])
+        updated = conn.execute(
+            """
+            UPDATE host_quarantine SET machine_id = ?
+            WHERE provider = ? AND offer_id = ? AND (machine_id = '' OR machine_id IS NULL)
+            """,
+            (machine_id, provider, offer_id),
+        )
+        after = conn.execute(
+            """
+            SELECT machine_id, failure_class, reason, failed_at, quarantine_until
+            FROM host_quarantine WHERE provider = ? AND offer_id = ?
+            """,
+            (provider, offer_id),
+        ).fetchone()
+        unchanged = (
+            after["failure_class"], after["reason"], after["failed_at"], after["quarantine_until"],
+        )
+        if updated.rowcount != 1 or after["machine_id"] != machine_id or unchanged != original:
+            conn.rollback()
+            raise Phase2DStop("IDENTITY_CONFLICT")
+        conn.commit()
+    except Phase2DStop:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def persist_selected_identity(directory: Path, offer: GpuOffer, now: float) -> None:
+    """Save the chosen offer identity before any create. host_id is diagnostic only."""
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "offer_id": offer.offer_id,
+        "machine_id": offer.machine_id,
+        "host_id": offer.host_id,
+        "selected_at": _iso(now),
+    }
+    (directory / "selection-before-create.json").write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def select_one(
     offers: list[GpuOffer],
     *,
@@ -359,6 +424,7 @@ def run_phase2d(
     _say(out, "PERFORMANCE " + str(selected.performance))
     _say(out, "COST600 " + str(max_estimated_gpu_cost(selected.hourly_price_usd, 600)))
     _say(out, "COST1800 " + str(max_estimated_gpu_cost(selected.hourly_price_usd, MAX_LIFETIME_SECONDS)))
+    persist_selected_identity(Path(artifact_dir), selected, started)
     lifecycle = VastLifecycle(
         db_path,
         limits=SafetyLimits(

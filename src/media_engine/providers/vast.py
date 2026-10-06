@@ -174,8 +174,8 @@ def _one(row: object) -> Optional[GpuOffer]:
     if cuda_value is None:
         cuda_value = row.get("compute_cap")
     rentable = row.get("rentable")
-    machine = row.get("machine_id")
-    machine_id = str(machine) if isinstance(machine, int) and not isinstance(machine, bool) else None
+    machine_id = _identity(row.get("machine_id"))
+    host_id = _identity(row.get("host_id"))
     return GpuOffer(
         provider="vast",
         offer_id=str(offer_id),
@@ -192,7 +192,14 @@ def _one(row: object) -> Optional[GpuOffer]:
         gpu_hourly_price_usd=_decimal(row.get("dph_base")),
         storage_price_per_gb_month=_decimal(row.get("storage_cost")),
         machine_id=machine_id,
+        host_id=host_id,
     )
+
+
+def _identity(value: object) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return str(value)
 
 
 def _matches(offer: GpuOffer, requirements: GpuRequirements) -> bool:
