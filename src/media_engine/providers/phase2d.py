@@ -21,6 +21,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Mapping, Optional, TextIO
 
+from media_engine.db import connect, init_schema
 from media_engine.engines.image.qwen import (
     FIRST_HEIGHT,
     FIRST_PROMPT,
@@ -68,12 +69,21 @@ SSH_DIR = Path("runtime/phase2d-ssh")
 # Vast's SSH banner says publickey auth can lag a few seconds after attach.
 PROPAGATION_SECONDS = 45
 _PROPAGATION_HINT = "try again after a few seconds"
+# A host CDI/NVIDIA failure needs the machine operator to repair it.
+# Six hours skips that machine for the rest of a work session and then expires.
+QUARANTINE_SECONDS = 6 * 60 * 60
+INFRASTRUCTURE_QUARANTINE = frozenset({
+    "CONTAINER_START_FAILED",
+    "IMAGE_PULL_FAILED",
+    "HOST_OFFLINE",
+})
 
 
 class Phase2DStop(Exception):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(code)
         self.code = code
+        self.detail = detail
 
 
 def policy_fields() -> dict[str, str]:
@@ -199,15 +209,92 @@ def accept_offer(offer: GpuOffer) -> GpuOffer:
     return replace(offer, hourly_price_usd=total)
 
 
-def select_one(offers: list[GpuOffer]) -> GpuOffer:
+def record_host_quarantine(
+    db_path: str,
+    *,
+    offer: GpuOffer,
+    failure_class: str,
+    reason: str,
+    now: float,
+) -> None:
+    """Remember one infrastructure failure. Application failures are ignored."""
+    if failure_class not in INFRASTRUCTURE_QUARANTINE:
+        return
+    if offer.provider != "vast" or not offer.offer_id:
+        return
+    init_schema(db_path)
+    machine_id = offer.machine_id or ""
+    safe_reason = sanitize_text(reason or failure_class)[:300]
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO host_quarantine (
+                provider, offer_id, machine_id, failure_class, reason, failed_at, quarantine_until
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, offer_id, machine_id) DO UPDATE SET
+                failure_class = excluded.failure_class,
+                reason = excluded.reason,
+                failed_at = excluded.failed_at,
+                quarantine_until = excluded.quarantine_until
+            """,
+            (
+                offer.provider,
+                offer.offer_id,
+                machine_id,
+                failure_class,
+                safe_reason,
+                float(now),
+                float(now) + QUARANTINE_SECONDS,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def active_quarantine(db_path: str, now: float) -> tuple[frozenset[str], frozenset[str]]:
+    """Return machine ids and offer ids whose cooldown has not expired."""
+    init_schema(db_path)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT offer_id, machine_id FROM host_quarantine
+            WHERE provider = ? AND quarantine_until > ?
+            """,
+            ("vast", float(now)),
+        ).fetchall()
+    finally:
+        conn.close()
+    machines = {row["machine_id"] for row in rows if row["machine_id"]}
+    offers = {row["offer_id"] for row in rows if row["offer_id"]}
+    return frozenset(machines), frozenset(offers)
+
+
+def select_one(
+    offers: list[GpuOffer],
+    *,
+    excluded_machine_ids: frozenset[str] = frozenset(),
+    excluded_offer_ids: frozenset[str] = frozenset(),
+) -> GpuOffer:
     eligible: list[GpuOffer] = []
     failures: list[str] = []
+    quarantined = 0
     for offer in offers:
         try:
-            eligible.append(accept_offer(offer))
+            accepted = accept_offer(offer)
         except Phase2DStop as exc:
             failures.append(exc.code)
+            continue
+        machine_id = accepted.machine_id or ""
+        if accepted.offer_id in excluded_offer_ids or (machine_id and machine_id in excluded_machine_ids):
+            quarantined += 1
+            continue
+        eligible.append(accepted)
     if not eligible:
+        if quarantined:
+            raise Phase2DStop("NO_HEALTHY_OFFER_WITHIN_BUDGET")
         if failures and all(code == "PRICE_UNPROVEN" for code in failures):
             raise Phase2DStop("PRICE_UNPROVEN")
         if failures and all(code == "PRICE_ABOVE_CEILING" for code in failures):
@@ -255,7 +342,12 @@ def run_phase2d(
             read_only=True,
             limit=64,
         )
-        selected = select_one(offers)
+        excluded_machines, excluded_offers = active_quarantine(db_path, started)
+        selected = select_one(
+            offers,
+            excluded_machine_ids=excluded_machines,
+            excluded_offer_ids=excluded_offers,
+        )
     except Phase2DStop as exc:
         _say(out, exc.code)
         return 3
@@ -333,7 +425,16 @@ def run_phase2d(
         _say(out, "ARTIFACT " + str(path))
         _say(out, "SHA256 " + sha256_hex(image))
     except Exception as exc:
-        _say(out, getattr(exc, "code", "GENERATION_FAILED"))
+        code = getattr(exc, "code", "GENERATION_FAILED")
+        _say(out, code)
+        if code in INFRASTRUCTURE_QUARANTINE:
+            record_host_quarantine(
+                db_path,
+                offer=selected,
+                failure_class=code,
+                reason=getattr(exc, "detail", "") or code,
+                now=now(),
+            )
     destroyed = _destroy_owned(lifecycle, instance_id, key)
     if not destroyed:
         _say(out, "MANUAL_CLEANUP_REQUIRED")
@@ -619,7 +720,9 @@ def wait_for_ssh_ready(
         if row:
             failure = classify_startup_failure(row)
             if failure:
-                raise Phase2DStop(failure)
+                message = row.get("status_msg")
+                detail = message.strip() if isinstance(message, str) else ""
+                raise Phase2DStop(failure, sanitize_text(detail, secrets))
             endpoint = ssh_endpoint(row)
             if endpoint is not None:
                 return row, endpoint[0], endpoint[1]

@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS external_resources (
     updated_at REAL NOT NULL,
     last_error TEXT
 );
+CREATE TABLE IF NOT EXISTS host_quarantine (
+    provider TEXT NOT NULL,
+    offer_id TEXT NOT NULL,
+    machine_id TEXT NOT NULL,
+    failure_class TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    failed_at REAL NOT NULL,
+    quarantine_until REAL NOT NULL,
+    PRIMARY KEY (provider, offer_id, machine_id)
+);
 """
 
 

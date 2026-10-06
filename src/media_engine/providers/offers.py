@@ -36,6 +36,7 @@ class GpuOffer:
     availability: Optional[str] = None
     gpu_hourly_price_usd: Optional[Decimal] = None
     storage_price_per_gb_month: Optional[Decimal] = None
+    machine_id: Optional[str] = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -51,6 +52,7 @@ class GpuOffer:
             "disk_gb": None if self.disk_gb is None else str(self.disk_gb),
             "location": self.location,
             "availability": self.availability,
+            "machine_id": self.machine_id,
         }
 
 

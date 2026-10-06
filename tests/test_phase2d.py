@@ -19,6 +19,7 @@ from media_engine.providers.phase2d import (
     HOURS_PER_STORAGE_MONTH,
     MAX_ESTIMATED_COST_USD,
     MAX_HOURLY_USD,
+    QUARANTINE_SECONDS,
     Phase2DStop,
     accept_offer,
     _new_ephemeral_ssh_key,
@@ -30,8 +31,10 @@ from media_engine.providers.phase2d import (
     format_policy,
     policy_fields,
     policy_fingerprint,
+    active_quarantine,
     projected_max_cost,
     quote_all_in,
+    record_host_quarantine,
     run_phase2d,
     run_ssh_runtime,
     select_one,
@@ -986,6 +989,112 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("UNRESOLVED_RESOURCE", text)
         self.assertEqual(self.calls, [])
+
+    def test_cdi_failure_quarantines_the_machine_and_does_not_create_again(self) -> None:
+        secret = "ab" * 32
+
+        def fail(*_args):
+            raise Phase2DStop(
+                "CONTAINER_START_FAILED",
+                "OCI runtime create failed: unresolvable CDI devices "
+                "bearer " + secret + "/gpu=2\n"
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nhidden\n-----END OPENSSH PRIVATE KEY-----",
+            )
+
+        code, text = self._run(self._machine(offers=[_row(machine_id=4242)]), generate=fail)
+        self.assertEqual(code, 7)
+        self.assertIn("CONTAINER_START_FAILED", text)
+        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
+        self.assertEqual([method for method, _url in self.calls].count("DELETE"), 1)
+        machines, offers = active_quarantine(self.db_path, self.clock.t)
+        self.assertEqual((machines, offers), (frozenset({"4242"}), frozenset({"200"})))
+        from media_engine.db import connect
+        conn = connect(self.db_path)
+        try:
+            reason = conn.execute("SELECT reason FROM host_quarantine").fetchone()["reason"]
+        finally:
+            conn.close()
+        self.assertIn("OCI runtime create failed", reason)
+        self.assertNotIn(secret, reason)
+        self.assertNotIn("PRIVATE", reason)
+        self.assertNotIn("hidden", reason)
+        self.assertNotIn("bearer " + secret, reason)
+
+    def test_quarantine_excludes_same_machine_and_selects_healthy_offer(self) -> None:
+        record_host_quarantine(
+            self.db_path,
+            offer=_gpu(offer_id="200", machine_id="4242"),
+            failure_class="CONTAINER_START_FAILED",
+            reason="oci runtime",
+            now=self.clock.t,
+        )
+        seen = {}
+
+        def generate(instance_id, offer, deadline):
+            seen["offer"] = offer.offer_id
+            seen["machine"] = offer.machine_id
+            return _png(), {"strategy": "bf16-cpu-offload"}
+
+        offers = [
+            _row(id=200, machine_id=4242, dlperf="100"),
+            _row(id=201, machine_id=777, dlperf="10"),
+        ]
+        code, _text = self._run(self._machine(offers=offers), generate=generate)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, {"offer": "201", "machine": "777"})
+        puts = [url for method, url in self.calls if method == "PUT"]
+        self.assertEqual(puts, ["https://console.vast.ai/api/v0/asks/201/"])
+
+    def test_quarantine_expires(self) -> None:
+        record_host_quarantine(
+            self.db_path,
+            offer=_gpu(offer_id="200", machine_id="4242"),
+            failure_class="HOST_OFFLINE",
+            reason="host offline",
+            now=self.clock.t,
+        )
+        self.clock.t += QUARANTINE_SECONDS + 1
+        code, text = self._run(self._machine(offers=[_row(machine_id=4242)]))
+        self.assertEqual(code, 0)
+        self.assertIn("OFFER 200", text)
+        self.assertEqual([url for method, url in self.calls if method == "PUT"], ["https://console.vast.ai/api/v0/asks/200/"])
+
+    def test_application_failure_does_not_quarantine(self) -> None:
+        def fail(*_args):
+            raise Phase2DStop("GENERATION_FAILED")
+
+        code, text = self._run(self._machine(offers=[_row(machine_id=4242)]), generate=fail)
+        self.assertEqual(code, 7)
+        self.assertIn("GENERATION_FAILED", text)
+        self.assertEqual(active_quarantine(self.db_path, self.clock.t), (frozenset(), frozenset()))
+        self.assertFalse(record_host_quarantine(
+            self.db_path,
+            offer=_gpu(machine_id="4242"),
+            failure_class="MODEL_LOAD_FAILED",
+            reason="model",
+            now=self.clock.t,
+        ))
+        self.assertEqual(active_quarantine(self.db_path, self.clock.t), (frozenset(), frozenset()))
+
+    def test_all_qualifying_offers_quarantined_creates_nothing(self) -> None:
+        record_host_quarantine(
+            self.db_path,
+            offer=_gpu(offer_id="200", machine_id="4242"),
+            failure_class="CONTAINER_START_FAILED",
+            reason="oci runtime",
+            now=self.clock.t,
+        )
+        code, text = self._run(self._machine(offers=[_row(machine_id=4242), _row(id=201, dph_total="0.90", dph_base="0.90")]))
+        self.assertEqual(code, 3)
+        self.assertIn("NO_HEALTHY_OFFER_WITHIN_BUDGET", text)
+        self.assertNotIn("PUT", [method for method, _url in self.calls])
+
+    def test_policy_ceilings_stay_fixed(self) -> None:
+        self.assertEqual(policy_fingerprint(), "f50c24338d52d889ae7d5aa5c2742b15483632096669bf024e21b1093702cbc4")
+        self.assertEqual(MAX_HOURLY_USD, Decimal("0.40"))
+        self.assertEqual(MAX_ESTIMATED_COST_USD, Decimal("0.20"))
+        self.assertEqual(DISK_GB, 80)
+        self.assertEqual(QUARANTINE_SECONDS, 6 * 60 * 60)
 
     def _machine(self, *, label: str = "media-engine:phase2d", offers=None):
         state = {"destroyed": False}
