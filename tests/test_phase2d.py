@@ -461,10 +461,13 @@ class Phase2DTests(unittest.TestCase):
                 script=b"",
                 job=b"{}",
             )
-        self.assertEqual(caught.exception.code, "SSH_NOT_READY")
+        self.assertEqual(caught.exception.code, "SSH_NOT_READY_TIMEOUT")
         self.assertEqual(installs["n"], 0)
         saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
-        self.assertEqual(saved["stage"], "SSH_NOT_READY")
+        self.assertEqual(saved["stage"], "SSH_NOT_READY_TIMEOUT")
+        self.assertGreaterEqual(saved["transition_count"], 2)
+        self.assertEqual(saved["final_actual_status"], "loading")
+        self.assertLessEqual(len(saved["transitions"]), 20)
 
     def test_ssh_auth_failure_keeps_sanitized_evidence(self) -> None:
         clock = _StepClock()
@@ -552,14 +555,193 @@ class Phase2DTests(unittest.TestCase):
 
     def test_runtime_failure_does_not_create_again(self) -> None:
         def fail(*_args):
-            raise Phase2DStop("SSH_NOT_READY")
+            raise Phase2DStop("INSTANCE_EXITED")
 
         code, text = self._run(self._machine(), generate=fail)
         self.assertEqual(code, 7)
-        self.assertIn("SSH_NOT_READY", text)
+        self.assertIn("INSTANCE_EXITED", text)
         self.assertIn("TERMINATED", text)
         self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
         self.assertEqual([method for method, _url in self.calls].count("DELETE"), 1)
+
+    def _runtime(self, fetch, *, deadline: float = 60, ssh=None, secrets: tuple = ()):
+        clock = _StepClock()
+        probes = {"n": 0}
+
+        def default_ssh(host, port, command, data, timeout):
+            probes["n"] += 1
+            return 0, b"", b""
+
+        try:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=fetch,
+                attach=lambda: None,
+                ssh=default_ssh if ssh is None else ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + deadline,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"print('ok')\n",
+                job=b"{}",
+                secrets=secrets,
+            )
+        except Phase2DStop as exc:
+            return exc, probes["n"]
+        return None, probes["n"]
+
+    def _diagnostic(self) -> dict:
+        return json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
+
+    def test_loading_then_running_reaches_ssh_probe(self) -> None:
+        polls = {"n": 0}
+
+        def fetch():
+            polls["n"] += 1
+            if polls["n"] < 4:
+                return {
+                    "actual_status": "loading" if polls["n"] > 1 else "created",
+                    "intended_status": "running",
+                    "status_msg": "pulling image layers",
+                    "ssh_host": "ssh.example",
+                    "ssh_port": 22,
+                }
+            if polls["n"] == 4:
+                return {
+                    "actual_status": "rebooting",
+                    "intended_status": "running",
+                    "status_msg": "restarting",
+                }
+            return _ready_row()
+
+        exc, probes = self._runtime(fetch)
+        self.assertEqual(exc.code, "REMOTE_REPORT_MISSING")
+        self.assertGreaterEqual(probes, 1)
+        self.assertGreaterEqual(polls["n"], 5)
+
+    def test_exited_status_is_retained_and_skips_ssh(self) -> None:
+        clock_start = 1_700_000_030.0
+        polls = {"n": 0}
+
+        def fetch():
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return {
+                    "actual_status": "loading",
+                    "intended_status": "running",
+                    "status_msg": "loading",
+                    "start_date": 1_700_000_000.0,
+                    "public_ipaddr": "203.0.113.50",
+                }
+            return {
+                "actual_status": "exited",
+                "intended_status": "running",
+                "status_msg": "container exited immediately",
+                "start_date": 1_700_000_000.0,
+                "public_ipaddr": "203.0.113.50",
+                "ssh_host": "ssh.example",
+                "ssh_port": 22,
+            }
+
+        clock = _StepClock()
+        clock.t = clock_start
+        probes = {"n": 0}
+
+        def ssh(*_args):
+            probes["n"] += 1
+            return 0, b"", b""
+
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=fetch,
+                attach=lambda: None,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 60,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"",
+                job=b"{}",
+            )
+        self.assertEqual(caught.exception.code, "INSTANCE_EXITED")
+        self.assertEqual(probes["n"], 0)
+        saved = self._diagnostic()
+        text = json.dumps(saved)
+        self.assertEqual(saved["final_actual_status"], "exited")
+        self.assertEqual(saved["final_intended_status"], "running")
+        self.assertIn("container exited immediately", saved["final_status_msg"])
+        self.assertEqual(saved["transition_count"], 2)
+        self.assertEqual(saved["time_since_create"], clock.t - 1_700_000_000.0)
+        self.assertNotIn("203.0.113.50", text)
+        self.assertFalse(saved["transitions"][-1]["ssh_endpoint_available"])
+        self.assertTrue(saved["transitions"][-1]["public_ip_available"])
+
+    def test_stopped_and_offline_classify_without_ssh(self) -> None:
+        exc, probes = self._runtime(lambda: {
+            "actual_status": "stopped",
+            "intended_status": "stopped",
+            "status_msg": "halted",
+        })
+        self.assertEqual(exc.code, "INSTANCE_STOPPED")
+        self.assertEqual(probes, 0)
+        self.assertEqual(self._diagnostic()["final_actual_status"], "stopped")
+
+        exc, probes = self._runtime(lambda: {
+            "actual_status": "offline",
+            "intended_status": "running",
+            "status_msg": "host disconnected",
+        })
+        self.assertEqual(exc.code, "HOST_OFFLINE")
+        self.assertEqual(probes, 0)
+        self.assertEqual(self._diagnostic()["final_status_msg"], "host disconnected")
+
+    def test_image_pull_and_container_start_messages(self) -> None:
+        exc, probes = self._runtime(lambda: {
+            "actual_status": "loading",
+            "intended_status": "running",
+            "status_msg": "Error: pull access denied for pytorch/pytorch",
+        })
+        self.assertEqual(exc.code, "IMAGE_PULL_FAILED")
+        self.assertEqual(probes, 0)
+        exc, probes = self._runtime(lambda: {
+            "actual_status": "exited",
+            "intended_status": "running",
+            "status_msg": "oci runtime error: exec failed",
+        })
+        self.assertEqual(exc.code, "CONTAINER_START_FAILED")
+        self.assertEqual(probes, 0)
+        self.assertIn("oci runtime", self._diagnostic()["final_status_msg"])
+
+    def test_readiness_history_is_bounded_and_sanitized(self) -> None:
+        secret = "unit-test-vast-secret"
+        token = "ab" * 32
+        polls = {"n": 0}
+
+        def fetch():
+            polls["n"] += 1
+            return {
+                "actual_status": "loading",
+                "intended_status": "running",
+                "status_msg": f"still loading {secret} Bearer {secret} {token} poll {polls['n']}",
+            }
+
+        exc, probes = self._runtime(fetch, deadline=130, secrets=(secret,))
+        self.assertEqual(exc.code, "SSH_NOT_READY_TIMEOUT")
+        self.assertEqual(probes, 0)
+        self.assertGreater(polls["n"], 20)
+        saved = self._diagnostic()
+        text = json.dumps(saved)
+        self.assertEqual(saved["transition_count"], polls["n"])
+        self.assertEqual(len(saved["transitions"]), 20)
+        self.assertNotIn(secret, text)
+        self.assertNotIn(token, text)
+        self.assertIn("[redacted]", saved["final_status_msg"])
+        readiness = json.loads((Path(self.artifacts) / "phase2d-555.readiness.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(readiness["transitions"]), 20)
+        self.assertEqual(readiness["transition_count"], polls["n"])
 
     def test_ssh_endpoint_uses_published_port_only_when_running(self) -> None:
         self.assertIsNone(ssh_endpoint({

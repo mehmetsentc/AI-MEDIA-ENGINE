@@ -420,10 +420,67 @@ def ssh_endpoint(row: Mapping) -> Optional[tuple[str, str]]:
     return None
 
 
+MAX_READINESS_SNAPSHOTS = 20
+# Failure phrases from the official vastai status classifier. Bare words such as
+# "pull" or "docker" are omitted so a normal loading message does not abort.
+_IMAGE_PULL_FAILED = re.compile(
+    r"no such image|repository does not exist|pull access denied|"
+    r"requested access to the resource is denied|manifest unknown|"
+    r"manifest invalid|failed to pull|pull failed|error pulling",
+    re.IGNORECASE,
+)
+_CONTAINER_START_FAILED = re.compile(
+    r"oci runtime|failed to start|exec format error|nvidia-container|start container",
+    re.IGNORECASE,
+)
+
+
 def terminal_ssh_status(row: Mapping) -> bool:
     actual = str(row.get("actual_status") or "")
     intended = str(row.get("intended_status") or "")
-    return actual in {"stopped", "exited", "offline"} or intended in {"stopped", "exited"}
+    return actual in {"stopped", "exited", "offline", "unknown"} or intended in {"stopped", "exited"}
+
+
+def classify_startup_failure(row: Mapping) -> Optional[str]:
+    """Return a startup code, or None while Vast is still transitioning."""
+    text = row.get("status_msg")
+    message = text.strip() if isinstance(text, str) else ""
+    if message and _IMAGE_PULL_FAILED.search(message):
+        return "IMAGE_PULL_FAILED"
+    if message and _CONTAINER_START_FAILED.search(message):
+        return "CONTAINER_START_FAILED"
+    if not terminal_ssh_status(row):
+        return None
+    actual = str(row.get("actual_status") or "")
+    intended = str(row.get("intended_status") or "")
+    if actual == "offline":
+        return "HOST_OFFLINE"
+    if actual == "exited" or intended == "exited":
+        return "INSTANCE_EXITED"
+    if actual == "stopped" or intended == "stopped":
+        return "INSTANCE_STOPPED"
+    return "UNKNOWN_STARTUP_FAILURE"
+
+
+def readiness_snapshot(row: Mapping, now: float, secrets: tuple[str, ...] = ()) -> dict:
+    """One bounded, secret-free view of a Vast instance row."""
+    text = row.get("status_msg")
+    message = text.strip() if isinstance(text, str) else ""
+    start = row.get("start_date")
+    start_date = float(start) if isinstance(start, (int, float)) and not isinstance(start, bool) else None
+    elapsed = None
+    if start_date is not None and 1_000_000_000 <= start_date <= 20_000_000_000:
+        elapsed = now - start_date
+    return {
+        "at": _iso(now),
+        "actual_status": sanitize_text(str(row.get("actual_status") or ""), secrets),
+        "intended_status": sanitize_text(str(row.get("intended_status") or ""), secrets),
+        "status_msg": sanitize_text(message, secrets),
+        "ssh_endpoint_available": ssh_endpoint(row) is not None,
+        "public_ip_available": bool(str(row.get("public_ipaddr") or "")),
+        "start_date": start_date,
+        "time_since_create": elapsed,
+    }
 
 
 def classify_ssh_stderr(stderr: bytes) -> str:
@@ -469,6 +526,7 @@ def write_runtime_diagnostic(
     stderr: bytes,
     now: float,
     secrets: tuple[str, ...] = (),
+    evidence: Optional[Mapping] = None,
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -480,18 +538,62 @@ def write_runtime_diagnostic(
         "stderr_tail": sanitize_text(stderr.decode("utf-8", "replace"), secrets),
         "at": _iso(now),
     }
+    if evidence:
+        for key in (
+            "final_actual_status",
+            "final_intended_status",
+            "final_status_msg",
+            "time_since_create",
+            "transition_count",
+            "transitions",
+        ):
+            if key in evidence:
+                payload[key] = evidence[key]
     path = directory / f"phase2d-{instance_id}.diagnostic.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
 
 
-def wait_for_ssh_ready(fetch, deadline: float, now, sleep) -> tuple[dict, str, str]:
+def startup_evidence(snapshots: list) -> dict:
+    kept = snapshots[-MAX_READINESS_SNAPSHOTS:]
+    last = kept[-1] if kept else {}
+    return {
+        "final_actual_status": last.get("actual_status"),
+        "final_intended_status": last.get("intended_status"),
+        "final_status_msg": last.get("status_msg"),
+        "time_since_create": last.get("time_since_create"),
+        "transition_count": len(snapshots),
+        "transitions": kept,
+    }
+
+
+def write_readiness_log(directory: Path, instance_id: str, snapshots: list) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"phase2d-{instance_id}.readiness.json"
+    path.write_text(json.dumps(startup_evidence(snapshots), indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def wait_for_ssh_ready(
+    fetch,
+    deadline: float,
+    now,
+    sleep,
+    on_snapshot: Optional[Callable[[dict], None]] = None,
+    secrets: tuple[str, ...] = (),
+) -> tuple[dict, str, str]:
     """Poll until Vast reports running and an SSH endpoint. Sleeps between checks."""
     while now() < deadline:
         row = fetch()
-        if isinstance(row, dict):
-            if terminal_ssh_status(row):
-                raise Phase2DStop("SSH_NOT_READY")
+        if not isinstance(row, dict):
+            row = {}
+        snapshot = readiness_snapshot(row, now(), secrets)
+        if on_snapshot is not None:
+            on_snapshot(snapshot)
+        if row:
+            failure = classify_startup_failure(row)
+            if failure:
+                raise Phase2DStop(failure)
             endpoint = ssh_endpoint(row)
             if endpoint is not None:
                 return row, endpoint[0], endpoint[1]
@@ -499,7 +601,7 @@ def wait_for_ssh_ready(fetch, deadline: float, now, sleep) -> tuple[dict, str, s
         if remaining <= 0:
             break
         sleep(min(READY_POLL_SECONDS, remaining))
-    raise Phase2DStop("SSH_NOT_READY")
+    raise Phase2DStop("SSH_NOT_READY_TIMEOUT")
 
 
 def run_ssh_runtime(
@@ -518,6 +620,12 @@ def run_ssh_runtime(
     secrets: tuple[str, ...] = (),
 ) -> tuple[bytes, dict]:
     """Wait until SSH accepts a command, then run the remote generator once."""
+    snapshots: list[dict] = []
+
+    def on_snapshot(snapshot: dict) -> None:
+        snapshots.append(snapshot)
+        write_readiness_log(diagnostic_dir, instance_id, snapshots)
+
     def record(stage: str, ssh_code: Optional[int], remote_code: Optional[int], stdout: bytes, stderr: bytes, exception: str) -> None:
         write_runtime_diagnostic(
             diagnostic_dir,
@@ -530,10 +638,13 @@ def run_ssh_runtime(
             stderr=stderr,
             now=now(),
             secrets=secrets,
+            evidence=startup_evidence(snapshots),
         )
 
     try:
-        _row, host, port = wait_for_ssh_ready(fetch, deadline, now, sleep)
+        _row, host, port = wait_for_ssh_ready(
+            fetch, deadline, now, sleep, on_snapshot=on_snapshot, secrets=secrets,
+        )
     except Phase2DStop as exc:
         record(exc.code, None, None, b"", b"", "Phase2DStop")
         raise
