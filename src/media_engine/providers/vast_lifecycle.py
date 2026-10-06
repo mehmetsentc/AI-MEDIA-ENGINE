@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
 import urllib.request
 from typing import Callable, Optional
 from urllib.parse import quote_plus
@@ -35,6 +36,21 @@ class ProvisionBlocked(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class VastCallError(Exception):
+    """Provider call finished with a status or failed in transit. The message has no secrets."""
+
+    def __init__(self, status: int, body: bytes = b"", *, uncertain: bool = False) -> None:
+        super().__init__("TRANSPORT" if status <= 0 else f"HTTP {status}")
+        self.status = status
+        self.body = body
+        self.uncertain = uncertain
+
+
+def offer_record_id(offer_id: str) -> str:
+    """Ledger key for an attempt that has no confirmed instance id."""
+    return "offer:" + offer_id
 
 
 def ownership_label(owner: str) -> str:
@@ -93,8 +109,16 @@ def live_transport(method: str, url: str, body: bytes, headers: dict[str, str]) 
         raise VastMutationBlocked("VAST_MUTATION_BLOCKED")
     request = urllib.request.Request(url, data=body or None, headers=headers, method=method)
     opener = urllib.request.build_opener(_NoRedirect)
-    with opener.open(request, timeout=20) as response:
-        raw = response.read(_MAX_BODY + 1)
+    try:
+        with opener.open(request, timeout=20) as response:
+            raw = response.read(_MAX_BODY + 1)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(_MAX_BODY + 1)
+        if len(raw) > _MAX_BODY:
+            raise ProvisionBlocked("VAST_RESPONSE_TOO_LARGE")
+        raise VastCallError(int(exc.code), raw) from None
+    except urllib.error.URLError:
+        raise VastCallError(0, b"", uncertain=True) from None
     if len(raw) > _MAX_BODY:
         raise ProvisionBlocked("VAST_RESPONSE_TOO_LARGE")
     return raw
@@ -140,17 +164,26 @@ class VastLifecycle:
         url = f"https://console.vast.ai/api/v0/asks/{offer_id}/"
         try:
             raw = self._transport("PUT", url, payload, self._headers(api_key))
+            status, uncertain = 200, False
+        except VastCallError as exc:
+            raw, status, uncertain = exc.body, exc.status, exc.uncertain
         except ProvisionBlocked:
             raise
         except Exception:
-            self._mark(offer_id, owner, ResourceState.AMBIGUOUS, selected, "AMBIGUOUS_CREATE")
+            self._mark(offer_record_id(offer_id), owner, ResourceState.AMBIGUOUS, selected, "AMBIGUOUS_CREATE")
             return CreateResult(outcome="ambiguous")
-        instance_id = _new_contract(raw)
-        if instance_id is None:
-            self._mark(offer_id, owner, ResourceState.AMBIGUOUS, selected, "AMBIGUOUS_CREATE")
-            return CreateResult(outcome="ambiguous")
-        self._mark(instance_id, owner, ResourceState.READY, selected, None)
-        return CreateResult(outcome="created", resource_id=instance_id)
+        if uncertain:
+            outcome, instance_id, error = "ambiguous", None, "AMBIGUOUS_CREATE"
+        else:
+            outcome, instance_id, error = classify_create_response(status, raw)
+        if outcome == "created" and instance_id is not None:
+            self._mark(instance_id, owner, ResourceState.READY, selected, None)
+            return CreateResult(outcome="created", resource_id=instance_id)
+        if outcome == "definite_failure":
+            self._mark(offer_record_id(offer_id), owner, ResourceState.FAILED, selected, error)
+            return CreateResult(outcome="definite_failure")
+        self._mark(offer_record_id(offer_id), owner, ResourceState.AMBIGUOUS, selected, "AMBIGUOUS_CREATE")
+        return CreateResult(outcome="ambiguous")
 
     def observe(self, resource_id: str, owner: str, *, api_key: str = "", provision: bool = False) -> str:
         self._require_common(provision=provision, api_key=api_key)
@@ -272,17 +305,38 @@ class VastLifecycle:
         ))
 
 
-def _new_contract(raw: bytes) -> Optional[str]:
+def _provider_code(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value):
+        return value
+    return "CREATE_REJECTED"
+
+
+def classify_create_response(status: int, raw: bytes) -> tuple[str, Optional[str], str]:
+    """Return created, definite_failure, or ambiguous. No secrets are copied out."""
+    payload = None
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        parsed = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    value = payload.get("new_contract")
-    if isinstance(value, bool) or value is None:
-        return None
-    text = str(value)
-    if _DIGITS.fullmatch(text) is None:
-        return None
-    return text
+        parsed = None
+    if isinstance(parsed, dict):
+        payload = parsed
+    instance_id = None
+    if payload is not None:
+        value = payload.get("new_contract")
+        if not isinstance(value, bool) and value is not None and _DIGITS.fullmatch(str(value)):
+            instance_id = str(value)
+    if instance_id is not None and 200 <= status < 300:
+        return "created", instance_id, ""
+    if status <= 0 or status >= 500 or status in (408, 429):
+        return "ambiguous", None, "AMBIGUOUS_CREATE"
+    explicit = isinstance(payload, dict) and (
+        payload.get("success") is False
+        or isinstance(payload.get("error"), str)
+        or isinstance(payload.get("msg"), str)
+    )
+    if explicit and instance_id is None and (
+        (isinstance(payload, dict) and payload.get("success") is False) or 400 <= status < 500
+    ):
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return "definite_failure", None, _provider_code(error)
+    return "ambiguous", None, "AMBIGUOUS_CREATE"

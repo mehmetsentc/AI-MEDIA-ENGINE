@@ -168,6 +168,9 @@ class Phase2CTests(unittest.TestCase):
         self.assertIn("AMBIGUOUS", text)
         self.assertEqual(len(posts), 1)
         self.assertEqual(puts, ["https://console.vast.ai/api/v0/asks/200/"])
+        saved = json.loads(Path(self.db_path).with_suffix(".phase2c.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["offer_id"], "200")
+        self.assertIsNone(saved["instance_id"])
 
     def test_offer_gone_does_not_fallback_or_create_again(self) -> None:
         code, text = self._run(self._offers(_row(id=100, gpu_name="RTX 3090"), _row(id=300, gpu_ram=8192)))

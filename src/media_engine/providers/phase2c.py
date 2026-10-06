@@ -197,12 +197,13 @@ def run_phase2c(
         code = getattr(exc, "code", "CREATE_BLOCKED")
         _say(out, str(code))
         return 4
+    if created.outcome == "definite_failure":
+        _persist(db_path, selected, None, started, now(), "CREATE_FAILED", None)
+        _say(out, "CREATE_FAILED")
+        return 4
     if created.outcome == "ambiguous" or not created.resource_id:
         owned = lifecycle.list_owned(OWNER, api_key=key, provision=True)
-        _persist(
-            db_path, selected, created.resource_id or selected.offer_id, started, now(),
-            "AMBIGUOUS", None,
-        )
+        _persist(db_path, selected, None, started, now(), "AMBIGUOUS", None)
         _say(out, "AMBIGUOUS")
         _say(out, "OWNED_LIST " + ",".join(owned))
         return 4
@@ -288,7 +289,7 @@ def _mark_terminated(lifecycle: VastLifecycle, instance_id: str, status: str) ->
 def _persist(
     db_path: str,
     offer: GpuOffer,
-    instance_id: str,
+    instance_id: Optional[str],
     started: float,
     finished: float,
     status: str,
@@ -321,7 +322,7 @@ def _persist(
     else:
         estimated_text = None if estimated is None else str(estimated)
     UsageStore(db_path).record(UsageEvent(
-        job_id="phase2c-" + instance_id,
+        job_id="phase2c-" + (instance_id or "offer-" + offer.offer_id),
         client_id=OWNER,
         job_type="PHASE2C_LIFECYCLE",
         engine_id="vast-lifecycle",

@@ -19,8 +19,10 @@ from media_engine.providers.planner import (
 from media_engine.providers.vast import SEARCH_URL, VastDiscovery, VastMutationBlocked
 from media_engine.providers.vast_lifecycle import (
     ProvisionBlocked,
+    VastCallError,
     VastLifecycle,
     approval_token,
+    classify_create_response,
     instances_list_url,
     live_transport,
 )
@@ -275,7 +277,80 @@ class Phase2BTests(unittest.TestCase):
         self.assertEqual(first.outcome, "ambiguous")
         self.assertTrue(second_blocked)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(lifecycle.ledger.unresolved()[0].state, ResourceState.AMBIGUOUS)
+        record = lifecycle.ledger.unresolved()[0]
+        self.assertEqual(record.state, ResourceState.AMBIGUOUS)
+        self.assertEqual(record.resource_id, "offer:1")
+        self.assertNotEqual(record.resource_id, "1")
+
+    def test_official_create_response_extracts_instance_id(self) -> None:
+        calls = []
+        lifecycle = self._lifecycle(
+            calls, live=True, body=b'{"success": true, "new_contract": 7835610}',
+        )
+        created = self._create(lifecycle, human_approval=approval_token("1"))
+        self.assertEqual(created.outcome, "created")
+        self.assertEqual(created.resource_id, "7835610")
+        self.assertEqual(lifecycle.ledger.get("7835610").state, ResourceState.READY)
+        self.assertIsNone(lifecycle.ledger.get("offer:1"))
+        self.assertEqual(classify_create_response(200, b'{"success": true, "new_contract": 7835610}')[1], "7835610")
+
+    def test_explicit_create_rejection_is_not_ambiguous(self) -> None:
+        secret = "unit-test-vast-secret"
+        calls = []
+
+        def transport(method, url, body, headers):
+            calls.append(method)
+            self.assertNotIn(secret, url)
+            raise VastCallError(
+                400,
+                json.dumps({
+                    "success": False,
+                    "error": "insufficient_credit",
+                    "msg": secret,
+                }).encode("utf-8"),
+            )
+
+        lifecycle = VastLifecycle(
+            self.db_path,
+            limits=SafetyLimits(live_external_providers=True),
+            transport=transport,
+        )
+        created = self._create(lifecycle, human_approval=approval_token("1"))
+        self.assertEqual(created.outcome, "definite_failure")
+        self.assertIsNone(created.resource_id)
+        record = lifecycle.ledger.get("offer:1")
+        self.assertEqual(record.state, ResourceState.FAILED)
+        self.assertEqual(record.last_error, "insufficient_credit")
+        self.assertNotIn(secret, record.last_error or "")
+        self.assertNotIn(secret, str(VastCallError(400, b"")))
+        self.assertEqual(lifecycle.ledger.unresolved(), [])
+        self.assertIsNone(lifecycle.ledger.get("1"))
+        again = self._create(lifecycle, human_approval=approval_token("1"))
+        self.assertEqual(again.outcome, "definite_failure")
+        self.assertEqual(calls, ["PUT", "PUT"])
+
+    def test_transport_uncertainty_stays_ambiguous(self) -> None:
+        calls = []
+
+        def transport(method, url, body, headers):
+            calls.append(method)
+            raise VastCallError(0, b"", uncertain=True)
+
+        lifecycle = VastLifecycle(
+            self.db_path,
+            limits=SafetyLimits(live_external_providers=True),
+            transport=transport,
+        )
+        created = self._create(lifecycle, human_approval=approval_token("1"))
+        self.assertEqual(created.outcome, "ambiguous")
+        self.assertIsNone(created.resource_id)
+        record = lifecycle.ledger.unresolved()[0]
+        self.assertEqual(record.resource_id, "offer:1")
+        self.assertEqual(record.state, ResourceState.AMBIGUOUS)
+        with self.assertRaises(ProvisionBlocked) as caught:
+            self._create(lifecycle, human_approval=approval_token("1"))
+        self.assertEqual(caught.exception.code, "UNRESOLVED_RESOURCE")
+        self.assertEqual(calls, ["PUT"])
 
     def test_max_gpu_workers_remains_enforced(self) -> None:
         calls = []
