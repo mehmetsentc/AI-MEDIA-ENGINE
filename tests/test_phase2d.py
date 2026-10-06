@@ -17,11 +17,16 @@ from media_engine.providers.offers import GpuOffer
 from media_engine.providers.phase2d import (
     DISK_GB,
     HOURS_PER_STORAGE_MONTH,
+    MAX_CREATE_ATTEMPTS,
     MAX_ESTIMATED_COST_USD,
     MAX_HOURLY_USD,
+    PHASE2D_PYTHON,
+    PHASE2D_VENV,
     QUARANTINE_SECONDS,
     Phase2DStop,
     accept_offer,
+    classify_python_env_failure,
+    remote_python_stages,
     _new_ephemeral_ssh_key,
     attach_ssh_key,
     budget_status,
@@ -579,6 +584,62 @@ class Phase2DTests(unittest.TestCase):
         saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["remote_exit_code"], 1)
         self.assertIn("pip exploded", saved["stderr_tail"])
+
+    def test_python_install_uses_isolated_venv(self) -> None:
+        stages = dict(remote_python_stages())
+        self.assertEqual(
+            [name for name, _command in remote_python_stages()],
+            ["PYTHON_ENV_BOOTSTRAP", "PYTHON_ENV_INSTALL", "PYTHON_ENV_VERIFY", "PYTHON_RUNTIME"],
+        )
+        self.assertEqual(PHASE2D_VENV, "/workspace/phase2d-venv")
+        self.assertEqual(PHASE2D_PYTHON, "/workspace/phase2d-venv/bin/python")
+        blob = "\n".join(stages.values())
+        self.assertNotIn("--break-system-packages", blob)
+        self.assertNotIn("python3 -m pip", blob)
+        self.assertIn(f"{PHASE2D_PYTHON} -m pip install", stages["PYTHON_ENV_INSTALL"])
+        self.assertIn("'diffusers>=0.35' transformers accelerate safetensors pillow", stages["PYTHON_ENV_INSTALL"])
+        self.assertIn("import torch,diffusers,transformers,accelerate", stages["PYTHON_ENV_VERIFY"])
+        self.assertEqual(stages["PYTHON_RUNTIME"], f"{PHASE2D_PYTHON} /workspace/phase2d_gen.py")
+        self.assertIn("python3 -m venv --system-site-packages /workspace/phase2d-venv", stages["PYTHON_ENV_BOOTSTRAP"])
+        self.assertEqual(MAX_CREATE_ATTEMPTS, 1)
+        self.assertEqual(policy_fingerprint(), "b716f03932af9c6621a47aff552765061b0fc64aafe8a2b47f37a792f7ab390d")
+        argv = ssh_argv("/tmp/id", "ssh.example", "22", "true")
+        self.assertIn("IdentitiesOnly=yes", argv)
+
+    def test_pep668_stderr_is_python_env_bootstrap_failure(self) -> None:
+        stderr = (
+            b"error: externally-managed-environment\n"
+            b"hint: See PEP 668 for the detailed specification.\n"
+        )
+        self.assertEqual(classify_python_env_failure(stderr), "PYTHON_ENV_BOOTSTRAP_FAILED")
+        clock = _StepClock()
+
+        def ssh(host, port, command, data, timeout):
+            if " -m pip install " in command:
+                return 1, b"upgrade pip\n", stderr
+            return 0, b"", b""
+
+        with self.assertRaises(Phase2DStop) as caught:
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: _ready_row(),
+                attach=lambda: None,
+                ssh=ssh,
+                scp=lambda *args: None,
+                deadline=clock.t + 30,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"x",
+                job=b"{}",
+            )
+        self.assertEqual(caught.exception.code, "PYTHON_ENV_BOOTSTRAP_FAILED")
+        saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], "PYTHON_ENV_BOOTSTRAP_FAILED")
+        self.assertEqual(saved["remote_exit_code"], 1)
+        self.assertIn("upgrade pip", saved["stdout_tail"])
+        self.assertIn("externally-managed-environment", saved["stderr_tail"])
+        self.assertIn("T", saved["at"])
 
     def test_missing_remote_report_is_explicit(self) -> None:
         clock = _StepClock()

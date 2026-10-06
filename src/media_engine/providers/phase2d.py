@@ -812,6 +812,51 @@ def wait_for_ssh_ready(
     raise Phase2DStop("SSH_NOT_READY_TIMEOUT")
 
 
+PHASE2D_VENV = "/workspace/phase2d-venv"
+PHASE2D_PYTHON = "/workspace/phase2d-venv/bin/python"
+
+
+def remote_python_stages() -> list[tuple[str, str]]:
+    """Bootstrap, install, verify, then run. Absolute paths, no shell activation.
+
+    The runtime image is Ubuntu 24.04. Its published Dockerfile installs python3
+    and python3-pip, leaves the PEP 668 marker in place, and does not install
+    python3-venv or conda. Torch lives under /usr/local, so the venv includes
+    system site-packages. python3-venv is installed only when venv creation fails.
+    """
+    bootstrap = (
+        "if ! python3 -m venv --system-site-packages /workspace/phase2d-venv; then "
+        "rm -rf /workspace/phase2d-venv && apt-get update && "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv && "
+        "python3 -m venv --system-site-packages /workspace/phase2d-venv; fi"
+    )
+    install = (
+        f"{PHASE2D_PYTHON} -m pip install -q --upgrade pip && "
+        f"{PHASE2D_PYTHON} -m pip install -q "
+        "'diffusers>=0.35' transformers accelerate safetensors pillow"
+    )
+    verify = (
+        f"{PHASE2D_PYTHON} -c "
+        "'import torch,diffusers,transformers,accelerate;"
+        "print(torch.__version__, diffusers.__version__, transformers.__version__, accelerate.__version__)'"
+    )
+    run = f"{PHASE2D_PYTHON} /workspace/phase2d_gen.py"
+    return [
+        ("PYTHON_ENV_BOOTSTRAP", bootstrap),
+        ("PYTHON_ENV_INSTALL", install),
+        ("PYTHON_ENV_VERIFY", verify),
+        ("PYTHON_RUNTIME", run),
+    ]
+
+
+def classify_python_env_failure(stderr: bytes) -> str:
+    """Map a setup-stage failure, including Debian PEP 668, to one code."""
+    text = stderr.decode("utf-8", "replace").lower()
+    if "externally-managed-environment" in text or "externally managed" in text or "pep 668" in text:
+        return "PYTHON_ENV_BOOTSTRAP_FAILED"
+    return "PYTHON_ENV_BOOTSTRAP_FAILED"
+
+
 def run_ssh_runtime(
     *,
     instance_id: str,
@@ -908,15 +953,16 @@ def run_ssh_runtime(
         if code != 0:
             record("REMOTE_COMMAND_FAILED", code, code, out, err, "Phase2DStop")
             raise Phase2DStop("REMOTE_COMMAND_FAILED")
-    remaining = max(1, int(deadline - now()))
-    code, out, err = ssh(
-        host,
-        port,
-        "python3 -m pip install -q 'diffusers>=0.35' transformers accelerate safetensors pillow "
-        "&& python3 /workspace/phase2d_gen.py",
-        None,
-        remaining,
-    )
+    code, out, err = 0, b"", b""
+    for stage_name, command in remote_python_stages():
+        remaining = max(1, int(deadline - now()))
+        code, out, err = ssh(host, port, command, None, remaining)
+        if code != 0 and stage_name != "PYTHON_RUNTIME":
+            failure = classify_python_env_failure(err)
+            record(failure, None, code, out, err, "Phase2DStop")
+            raise Phase2DStop(failure)
+        if code != 0:
+            break
     local_dir = diagnostic_dir
     local_dir.mkdir(parents=True, exist_ok=True)
     report_path = local_dir / f".{instance_id}.remote.json"
