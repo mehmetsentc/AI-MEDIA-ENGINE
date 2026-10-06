@@ -32,6 +32,7 @@ from media_engine.engines.image.qwen import (
     QwenImageEngine,
     sha256_hex,
 )
+from media_engine.engines.image.model_cache import GENERATE, MOUNT_PATH, __file__ as _CACHE_FILE
 from media_engine.engines.image.qwen_remote import __file__ as _REMOTE_FILE
 from media_engine.providers.base import OBSERVE_FOREIGN, OBSERVE_GONE, OBSERVE_PRESENT, OBSERVE_UNKNOWN
 from media_engine.providers.offers import GpuOffer, model_key
@@ -46,7 +47,7 @@ from media_engine.providers.vast_lifecycle import (
 )
 from media_engine.resources.ledger import ResourceLedger, ResourceState
 from media_engine.safety.limits import SafetyLimits
-from media_engine.usage import UsageEvent, UsageStore
+from media_engine.usage import UsageEvent, UsageStore, cost_observation
 
 # L40 is the only family whose reported VRAM can hold the 38 GB BF16 transformer.
 APPROVED_GPU_MODEL = "L40"
@@ -584,15 +585,22 @@ def ssh_generate(instance_id: str, offer: GpuOffer, deadline: float) -> tuple[by
         key_fingerprint=fingerprint,
         logs=lambda: _instance_logs_live(instance_id, key),
         script=Path(_REMOTE_FILE).read_bytes(),
-        job=json.dumps({
-            "prompt": FIRST_PROMPT,
-            "seed": FIRST_SEED,
-            "width": FIRST_WIDTH,
-            "height": FIRST_HEIGHT,
-            "steps": INFERENCE_STEPS,
-        }).encode("utf-8"),
+        job=json.dumps(generation_job()).encode("utf-8"),
         secrets=(key,),
     )
+
+
+def generation_job() -> dict:
+    """Generation assumes a COMPLETE cache. It does not fill one."""
+    return {
+        "operation": GENERATE,
+        "cache_mount": MOUNT_PATH,
+        "prompt": FIRST_PROMPT,
+        "seed": FIRST_SEED,
+        "width": FIRST_WIDTH,
+        "height": FIRST_HEIGHT,
+        "steps": INFERENCE_STEPS,
+    }
 
 
 def ssh_endpoint(row: Mapping) -> Optional[tuple[str, str]]:
@@ -874,6 +882,8 @@ _FETCH_PROGRESS = re.compile(r"Fetching (\d+) files:.*?(\d+)/(\d+)")
 def classify_runtime_failure(exit_code: int, stdout: bytes, stderr: bytes, report: Mapping) -> str:
     """Separate a download deadline from SSH loss, hub errors, disk, and load."""
     detail = str(report.get("error") or "")
+    if detail == "MODEL_CACHE_NOT_READY":
+        return "MODEL_CACHE_NOT_READY"
     if "DOWNLOAD" in detail:
         return "MODEL_DOWNLOAD_FAILED"
     if "IMPORT" in detail or "LOAD" in detail:
@@ -1028,7 +1038,8 @@ def run_ssh_runtime(
         record("SSH_NOT_READY", None, None, b"", b"", "Phase2DStop")
         raise Phase2DStop("SSH_NOT_READY")
     for command, data, timeout in (
-        ("mkdir -p /workspace && cat > /workspace/phase2d_gen.py", script, 60),
+        ("mkdir -p /workspace && cat > /workspace/model_cache.py", Path(_CACHE_FILE).read_bytes(), 60),
+        ("cat > /workspace/phase2d_gen.py", script, 60),
         ("cat > /workspace/phase2d_job.json", job, 30),
     ):
         code, out, err = ssh(host, port, command, data, timeout)
@@ -1381,6 +1392,11 @@ def _record_usage(
     report: dict,
 ) -> None:
     estimated = offer.hourly_price_usd * Decimal(str(max(elapsed, 0))) / Decimal(3600)
+    observed = cost_observation(
+        report.get("credit_before") if isinstance(report.get("credit_before"), str) else None,
+        report.get("credit_after") if isinstance(report.get("credit_after"), str) else None,
+        str(estimated),
+    )
     UsageStore(db_path).record(UsageEvent(
         job_id="phase2d-" + instance_id,
         client_id=OWNER,
@@ -1397,6 +1413,11 @@ def _record_usage(
         hourly_price_usd=str(offer.hourly_price_usd),
         gpu_seconds=float(elapsed),
         actual_cost_usd=None,
+        credit_before=observed["credit_before"],
+        credit_after=observed["credit_after"],
+        credit_delta=observed["credit_delta"],
+        calculated_runtime_cost=observed["calculated_runtime_cost"],
+        unexplained_cost_delta=observed["unexplained_cost_delta"],
     ))
     _ = report
 

@@ -45,7 +45,12 @@ CREATE TABLE IF NOT EXISTS usage_events (
     gpu_model TEXT,
     hourly_price_usd TEXT,
     gpu_seconds REAL,
-    actual_cost_usd TEXT
+    actual_cost_usd TEXT,
+    credit_before TEXT,
+    credit_after TEXT,
+    credit_delta TEXT,
+    calculated_runtime_cost TEXT,
+    unexplained_cost_delta TEXT
 );
 CREATE TABLE IF NOT EXISTS external_resources (
     resource_id TEXT PRIMARY KEY,

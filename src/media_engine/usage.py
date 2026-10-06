@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional
 
 from media_engine.db import connect, init_schema
@@ -24,6 +25,11 @@ class UsageEvent:
     hourly_price_usd: Optional[str] = None
     gpu_seconds: Optional[float] = None
     actual_cost_usd: Optional[str] = None
+    credit_before: Optional[str] = None
+    credit_after: Optional[str] = None
+    credit_delta: Optional[str] = None
+    calculated_runtime_cost: Optional[str] = None
+    unexplained_cost_delta: Optional[str] = None
 
 
 class UsageStore:
@@ -40,8 +46,10 @@ class UsageStore:
                 INSERT INTO usage_events (
                     job_id, client_id, job_type, engine_id, started_at, finished_at,
                     duration_seconds, attempt_count, estimated_cost_usd, status,
-                    provider, gpu_model, hourly_price_usd, gpu_seconds, actual_cost_usd
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider, gpu_model, hourly_price_usd, gpu_seconds, actual_cost_usd,
+                    credit_before, credit_after, credit_delta,
+                    calculated_runtime_cost, unexplained_cost_delta
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.job_id, event.client_id, event.job_type, event.engine_id,
@@ -49,6 +57,8 @@ class UsageStore:
                     event.attempt_count, event.estimated_cost_usd, event.status,
                     event.provider, event.gpu_model, event.hourly_price_usd,
                     event.gpu_seconds, event.actual_cost_usd,
+                    event.credit_before, event.credit_after, event.credit_delta,
+                    event.calculated_runtime_cost, event.unexplained_cost_delta,
                 ),
             )
             conn.commit()
@@ -82,7 +92,34 @@ class UsageStore:
             hourly_price_usd=row["hourly_price_usd"],
             gpu_seconds=row["gpu_seconds"],
             actual_cost_usd=row["actual_cost_usd"],
+            credit_before=row["credit_before"],
+            credit_after=row["credit_after"],
+            credit_delta=row["credit_delta"],
+            calculated_runtime_cost=row["calculated_runtime_cost"],
+            unexplained_cost_delta=row["unexplained_cost_delta"],
         )
+
+
+def cost_observation(
+    credit_before: Optional[str],
+    credit_after: Optional[str],
+    calculated_runtime_cost: str,
+) -> dict[str, Optional[str]]:
+    """Record the credit gap without changing the local runtime-cost formula."""
+    calculated = Decimal(calculated_runtime_cost)
+    if credit_before is None or credit_after is None:
+        delta = None
+        unexplained = None
+    else:
+        delta = Decimal(credit_before) - Decimal(credit_after)
+        unexplained = delta - calculated
+    return {
+        "credit_before": credit_before,
+        "credit_after": credit_after,
+        "credit_delta": None if delta is None else format(delta, "f"),
+        "calculated_runtime_cost": format(calculated, "f"),
+        "unexplained_cost_delta": None if unexplained is None else format(unexplained, "f"),
+    }
 
 
 def _ensure_usage_columns(db_path: str) -> None:
@@ -92,6 +129,11 @@ def _ensure_usage_columns(db_path: str) -> None:
         ("hourly_price_usd", "TEXT"),
         ("gpu_seconds", "REAL"),
         ("actual_cost_usd", "TEXT"),
+        ("credit_before", "TEXT"),
+        ("credit_after", "TEXT"),
+        ("credit_delta", "TEXT"),
+        ("calculated_runtime_cost", "TEXT"),
+        ("unexplained_cost_delta", "TEXT"),
     )
     conn = connect(db_path)
     try:

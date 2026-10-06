@@ -11,9 +11,14 @@ from pathlib import Path
 
 def main() -> int:
     job = json.loads(Path("/workspace/phase2d_job.json").read_text(encoding="utf-8"))
-    report: dict[str, object] = {"model_id": "Qwen/Qwen-Image", "strategy": "bf16-cpu-offload"}
-    cache = Path("/workspace/hf-cache")
-    cache.mkdir(parents=True, exist_ok=True)
+    report: dict[str, object] = {
+        "model_id": "Qwen/Qwen-Image",
+        "strategy": "bf16-cpu-offload",
+        "operation": "PHASE2D_GENERATE",
+    }
+    prepare_generation, cache_error, mount_path = _cache_api()
+    mount = Path(str(job.get("cache_mount") or mount_path))
+    cache = mount / "hf-cache"
     os.environ["HF_HOME"] = str(cache)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache)
     try:
@@ -32,29 +37,18 @@ def main() -> int:
     report["cuda"] = torch.version.cuda
     report["diffusers"] = diffusers.__version__
     report["transformers"] = transformers.__version__
-    usage = shutil.disk_usage("/workspace")
-    print(json.dumps({
-        "stage": "DISK_BEFORE_DOWNLOAD",
-        "filesystem": "/workspace",
-        "total_bytes": usage.total,
-        "free_bytes": usage.free,
-    }), flush=True)
-    download_started = time.perf_counter()
-    print(json.dumps({"started_at": time.time(), **download_progress_snapshot(cache)}), flush=True)
-    stop = threading.Event()
-    watcher = threading.Thread(target=_watch_download, args=(cache, stop), daemon=True)
-    watcher.start()
     try:
-        local = snapshot_download("Qwen/Qwen-Image", cache_dir=str(cache))
+        local = prepare_generation(mount, snapshot_download)
+    except cache_error as exc:
+        report["error"] = "MODEL_CACHE_NOT_READY"
+        report["detail"] = exc.state
+        Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
+        return 1
     except Exception as exc:
-        report["error"] = "DOWNLOAD_FAILED"
+        report["error"] = "MODEL_CACHE_NOT_READY"
         report["detail"] = type(exc).__name__
         Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
         return 1
-    finally:
-        stop.set()
-    report["download_seconds"] = round(time.perf_counter() - download_started, 3)
-    report["downloaded_bytes"] = _cache_bytes(cache)
     load_started = time.perf_counter()
     try:
         pipe = QwenImagePipeline.from_pretrained(
@@ -87,6 +81,24 @@ def main() -> int:
     report["output_bytes"] = out.stat().st_size
     Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
     return 0
+
+
+def _cache_api():
+    try:
+        from media_engine.engines.image.model_cache import (
+            MOUNT_PATH,
+            ModelCacheNotReady,
+            prepare_generation,
+        )
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("phase2d_model_cache", "/workspace/model_cache.py")
+        if spec is None or spec.loader is None:
+            raise
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.prepare_generation, module.ModelCacheNotReady, module.MOUNT_PATH
+    return prepare_generation, ModelCacheNotReady, MOUNT_PATH
 
 
 def download_progress_snapshot(cache: Path) -> dict[str, object]:
