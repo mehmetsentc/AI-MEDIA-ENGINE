@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -64,8 +65,8 @@ DISK_GB = 80
 HOURS_PER_STORAGE_MONTH = Decimal(720)
 RUNTYPE = "ssh"
 SSH_DIR = Path("runtime/phase2d-ssh")
-# Vast's SSH banner tells the client to retry publickey auth after a few seconds.
-PROPAGATION_PROBES = 3
+# Vast's SSH banner says publickey auth can lag a few seconds after attach.
+PROPAGATION_SECONDS = 45
 _PROPAGATION_HINT = "try again after a few seconds"
 
 
@@ -230,8 +231,6 @@ def run_phase2d(
     generate: Callable[[str, GpuOffer, float], tuple[bytes, dict]],
     now: Callable[[], float],
     stdout: Optional[TextIO] = None,
-    ssh_dir: Optional[Path] = None,
-    key_transport=None,
 ) -> int:
     """One discovery, one create, one image, then destroy. No second create."""
     out = sys.stdout if stdout is None else stdout
@@ -336,12 +335,6 @@ def run_phase2d(
     except Exception as exc:
         _say(out, getattr(exc, "code", "GENERATION_FAILED"))
     destroyed = _destroy_owned(lifecycle, instance_id, key)
-    key_removed = cleanup_account_ssh_key(
-        instance_id,
-        key,
-        key_transport or _account_ssh_transport,
-        SSH_DIR if ssh_dir is None else ssh_dir,
-    )
     if not destroyed:
         _say(out, "MANUAL_CLEANUP_REQUIRED")
         _say(out, "INSTANCE " + instance_id)
@@ -356,9 +349,6 @@ def run_phase2d(
     _record_usage(db_path, selected, instance_id, started, now(), final, elapsed, report)
     _say(out, final)
     _say(out, "INSTANCE " + instance_id)
-    if not key_removed:
-        _say(out, "SSH_KEY_CLEANUP_REQUIRED")
-        return 9
     if not generated:
         return 7
     return 0 if final == "TERMINATED" else 6
@@ -387,13 +377,15 @@ def ssh_generate(instance_id: str, offer: GpuOffer, deadline: float) -> tuple[by
             return row
         return None
 
+    preview = fetch()
+    if not isinstance(preview, dict):
+        raise Phase2DStop("SSH_NOT_READY")
     identity, public = _new_ephemeral_ssh_key(SSH_DIR / instance_id)
     fingerprint = public_key_fingerprint(public)
 
     def attach() -> None:
-        key_id = register_account_ssh_key(_account_ssh_transport, public, key)
-        (SSH_DIR / instance_id).mkdir(parents=True, exist_ok=True)
-        (SSH_DIR / instance_id / "vast_key_id").write_text(key_id + "\n", encoding="utf-8")
+        parsed = attach_ssh_key(_ssh_attach_transport, instance_id, public, key)
+        _write_attach_metadata(SSH_DIR / instance_id, instance_id, fingerprint, time.time(), parsed)
 
     return run_ssh_runtime(
         instance_id=instance_id,
@@ -410,6 +402,7 @@ def ssh_generate(instance_id: str, offer: GpuOffer, deadline: float) -> tuple[by
         sleep=time.sleep,
         diagnostic_dir=diagnostic_dir,
         key_fingerprint=fingerprint,
+        logs=lambda: _instance_logs_live(instance_id, key),
         script=Path(_REMOTE_FILE).read_bytes(),
         job=json.dumps({
             "prompt": FIRST_PROMPT,
@@ -554,6 +547,7 @@ def write_runtime_diagnostic(
     secrets: tuple[str, ...] = (),
     evidence: Optional[Mapping] = None,
     key_fingerprint: str = "",
+    instance_log: bytes = b"",
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -579,6 +573,8 @@ def write_runtime_diagnostic(
     if key_fingerprint:
         payload["public_key_fingerprint"] = key_fingerprint
         payload["attachment_stage"] = stage
+    if instance_log:
+        payload["instance_log_tail"] = sanitize_text(instance_log.decode("utf-8", "replace"), secrets)
     path = directory / f"phase2d-{instance_id}.diagnostic.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
@@ -649,6 +645,7 @@ def run_ssh_runtime(
     job: bytes,
     secrets: tuple[str, ...] = (),
     key_fingerprint: str = "",
+    logs=None,
 ) -> tuple[bytes, dict]:
     """Wait until SSH accepts a command, then run the remote generator once."""
     snapshots: list[dict] = []
@@ -657,7 +654,7 @@ def run_ssh_runtime(
         snapshots.append(snapshot)
         write_readiness_log(diagnostic_dir, instance_id, snapshots)
 
-    def record(stage: str, ssh_code: Optional[int], remote_code: Optional[int], stdout: bytes, stderr: bytes, exception: str) -> None:
+    def record(stage: str, ssh_code: Optional[int], remote_code: Optional[int], stdout: bytes, stderr: bytes, exception: str, instance_log: bytes = b"") -> None:
         write_runtime_diagnostic(
             diagnostic_dir,
             instance_id,
@@ -671,8 +668,17 @@ def run_ssh_runtime(
             secrets=secrets,
             evidence=startup_evidence(snapshots),
             key_fingerprint=key_fingerprint,
+            instance_log=instance_log,
         )
 
+    try:
+        attach()
+    except Phase2DStop as exc:
+        record(exc.code, None, None, b"", b"", "Phase2DStop")
+        raise
+    except Exception as exc:
+        record("SSH_INSTANCE_KEY_ATTACH_FAILED", None, None, b"", b"", type(exc).__name__)
+        raise Phase2DStop("SSH_INSTANCE_KEY_ATTACH_FAILED") from exc
     try:
         _row, host, port = wait_for_ssh_ready(
             fetch, deadline, now, sleep, on_snapshot=on_snapshot, secrets=secrets,
@@ -680,31 +686,24 @@ def run_ssh_runtime(
     except Phase2DStop as exc:
         record(exc.code, None, None, b"", b"", "Phase2DStop")
         raise
-    try:
-        attach()
-    except Phase2DStop as exc:
-        record(exc.code, None, None, b"", b"", "Phase2DStop")
-        raise
-    except Exception as exc:
-        record("SSH_KEY_ATTACH_FAILED", None, None, b"", b"", type(exc).__name__)
-        raise Phase2DStop("SSH_KEY_ATTACH_FAILED") from exc
-    auth_attempts = 0
+    first_denial = None
     while now() < deadline:
         code, out, err = ssh(host, port, "true", None, 20)
         if code == 0:
             break
         kind = classify_ssh_stderr(err)
         if kind == "SSH_AUTH_FAILED":
-            decision = auth_failure_code(err, auth_attempts)
-            auth_attempts += 1
+            if first_denial is None:
+                first_denial = now()
+            decision = auth_failure_code(err, now() - first_denial)
             if decision == "":
-                remaining = deadline - now()
+                remaining = min(deadline - now(), PROPAGATION_SECONDS - (now() - first_denial))
                 if remaining <= 0:
                     decision = "SSH_KEY_PROPAGATION_TIMEOUT"
                 else:
                     sleep(min(READY_POLL_SECONDS, remaining))
                     continue
-            record(decision, code, None, out, err, "Phase2DStop")
+            record(decision, code, None, out, err, "Phase2DStop", instance_log=_safe_logs(logs, secrets))
             raise Phase2DStop(decision)
         if kind != "SSH_NOT_READY":
             record("SSH_CONNECT_FAILED", code, None, out, err, "Phase2DStop")
@@ -767,18 +766,30 @@ def run_ssh_runtime(
     return png_path.read_bytes(), report
 
 
-def auth_failure_code(stderr: bytes, attempts: int) -> str:
+def auth_failure_code(stderr: bytes, elapsed: float) -> str:
     """Return a retry sentinel or the terminal auth code.
 
-    Vast's own SSH banner says to retry after a few seconds. A publickey
+    Vast's SSH banner says to retry after a few seconds. A publickey
     rejection without that hint is a deterministic authentication failure.
     """
     text = stderr.decode("utf-8", "replace").lower()
-    if _PROPAGATION_HINT in text and attempts + 1 < PROPAGATION_PROBES:
+    if _PROPAGATION_HINT in text and elapsed < PROPAGATION_SECONDS:
         return ""
     if _PROPAGATION_HINT in text:
         return "SSH_KEY_PROPAGATION_TIMEOUT"
     return "SSH_AUTH_FAILED"
+
+
+def _safe_logs(logs, secrets: tuple[str, ...]) -> bytes:
+    if logs is None:
+        return b""
+    try:
+        text = logs()
+    except Exception:
+        return b""
+    if not isinstance(text, str):
+        return b""
+    return sanitize_text(text, secrets).encode("utf-8")
 
 
 def public_key_fingerprint(public_key: str) -> str:
@@ -787,14 +798,18 @@ def public_key_fingerprint(public_key: str) -> str:
     return "SHA256:" + digest
 
 
+def ssh_argv(identity: str, host: str, port: str, command: str) -> list[str]:
+    return [
+        "ssh", "-i", identity, "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=20", "-p", port, "root@" + host, command,
+    ]
+
+
 def _ssh_live(identity: str, host: str, port: str, command: str, data: Optional[bytes], timeout: int) -> tuple[int, bytes, bytes]:
     try:
         proc = subprocess.run(
-            [
-                "ssh", "-i", identity, "-o", "IdentitiesOnly=yes",
-                "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=20", "-p", port, "root@" + host, command,
-            ],
+            ssh_argv(identity, host, port, command),
             input=data,
             capture_output=True,
             timeout=max(1, timeout),
@@ -827,7 +842,24 @@ def ssh_attach_allowed(method: str, url: str) -> bool:
     return method == "POST" and _SSH_ATTACH.fullmatch(url) is not None
 
 
-def attach_ssh_key(transport, instance_id: str, public_key: str, api_key: str) -> None:
+def parse_instance_attach_response(raw: bytes) -> dict:
+    """Confirm the documented instance attach response. It has no key id."""
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+        raise Phase2DStop("SSH_INSTANCE_KEY_ATTACH_FAILED") from exc
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        raise Phase2DStop("SSH_INSTANCE_KEY_ATTACH_FAILED")
+    msg = payload.get("msg")
+    message = msg.strip() if isinstance(msg, str) else ""
+    if message.lower().startswith("ssh-"):
+        message = ""
+    key_id = payload.get("id")
+    recorded = str(key_id) if isinstance(key_id, int) and not isinstance(key_id, bool) else None
+    return {"success": True, "msg": message, "key_id": recorded, "http_status": 200}
+
+
+def attach_ssh_key(transport, instance_id: str, public_key: str, api_key: str) -> dict:
     """Attach one public key to one owned instance. The private key never leaves this machine."""
     if not instance_id.isdigit():
         raise Phase2DStop("OWNERSHIP_UNKNOWN")
@@ -843,19 +875,40 @@ def attach_ssh_key(transport, instance_id: str, public_key: str, api_key: str) -
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    transport("POST", url, body, headers)
+    try:
+        raw = transport("POST", url, body, headers)
+    except Phase2DStop:
+        raise
+    except Exception as exc:
+        raise Phase2DStop("SSH_INSTANCE_KEY_ATTACH_FAILED") from exc
+    return parse_instance_attach_response(raw if isinstance(raw, bytes) else b"")
 
 
-def _attach_ssh_key(instance_id: str, public_key: str, api_key: str) -> None:
-    attach_ssh_key(_ssh_attach_transport, instance_id, public_key, api_key)
+def _write_attach_metadata(directory: Path, instance_id: str, fingerprint: str, now: float, parsed: Mapping) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "instance_id": instance_id,
+        "fingerprint": fingerprint,
+        "attached_at": _iso(now),
+        "http_status": parsed.get("http_status"),
+        "success": True,
+        "key_id": parsed.get("key_id"),
+    }
+    msg = parsed.get("msg") or ""
+    if isinstance(msg, str) and msg and "ssh-" not in msg.lower():
+        payload["msg"] = sanitize_text(msg)
+    (directory / "attach.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _ssh_attach_transport(method: str, url: str, body: bytes, headers: dict) -> bytes:
     if not ssh_attach_allowed(method, url):
         raise Phase2DStop("COMMAND_BLOCKED")
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise Phase2DStop("SSH_INSTANCE_KEY_ATTACH_FAILED") from exc
 
 
 def _new_ephemeral_ssh_key(directory: Path) -> tuple[str, str]:
@@ -876,92 +929,45 @@ def _new_ephemeral_ssh_key(directory: Path) -> tuple[str, str]:
     return str(private), text
 
 
-_ACCOUNT_SSH = "https://console.vast.ai/api/v0/ssh/"
-_ACCOUNT_SSH_ONE = re.compile(r"https://console\.vast\.ai/api/v0/ssh/([0-9]+)/")
+_INSTANCE_LOGS = re.compile(r"https://console\.vast\.ai/api/v0/instances/request_logs/([0-9]+)/")
 
 
-def account_ssh_allowed(method: str, url: str) -> bool:
-    if method == "POST" and url == _ACCOUNT_SSH:
-        return True
-    return method == "DELETE" and _ACCOUNT_SSH_ONE.fullmatch(url) is not None
-
-
-def parse_registered_key_id(raw: bytes) -> str:
-    """Confirm the documented create-ssh-key response and return its numeric id."""
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise Phase2DStop("SSH_KEY_NOT_REGISTERED") from exc
-    if not isinstance(payload, dict) or payload.get("success") is not True:
-        raise Phase2DStop("SSH_KEY_NOT_REGISTERED")
-    created = payload.get("key")
-    key_id = created.get("id") if isinstance(created, dict) else None
-    if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id < 1:
-        raise Phase2DStop("SSH_KEY_NOT_REGISTERED")
-    return str(key_id)
-
-
-def register_account_ssh_key(transport, public_key: str, api_key: str) -> str:
-    """POST the public key to the account. Returns the confirmed Vast key id."""
-    text = public_key.strip()
-    if not text.startswith("ssh-ed25519 ") or "PRIVATE" in text or "\n" in text:
-        raise Phase2DStop("SSH_KEY_ATTACH_FAILED")
-    if not account_ssh_allowed("POST", _ACCOUNT_SSH):
-        raise Phase2DStop("COMMAND_BLOCKED")
-    body = json.dumps({"ssh_key": text}, separators=(",", ":")).encode("utf-8")
+def _instance_logs_live(instance_id: str, api_key: str) -> str:
+    """Ask Vast for a short log tail. Failure leaves the SSH error intact."""
+    if not instance_id.isdigit():
+        return ""
+    url = f"https://console.vast.ai/api/v0/instances/request_logs/{instance_id}/"
+    if _INSTANCE_LOGS.fullmatch(url) is None:
+        return ""
+    body = json.dumps({"tail": "80"}).encode("utf-8")
     headers = {
         "Authorization": "Bearer " + api_key,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+    request = urllib.request.Request(url, data=body, headers=headers, method="PUT")
     try:
-        raw = transport("POST", _ACCOUNT_SSH, body, headers)
-    except Phase2DStop:
-        raise
-    except Exception as exc:
-        raise Phase2DStop("SSH_KEY_ATTACH_FAILED") from exc
-    return parse_registered_key_id(raw)
-
-
-def delete_account_ssh_key(transport, key_id: str, api_key: str) -> None:
-    if not key_id.isdigit():
-        raise Phase2DStop("SSH_KEY_CLEANUP_REQUIRED")
-    url = f"https://console.vast.ai/api/v0/ssh/{key_id}/"
-    if not account_ssh_allowed("DELETE", url):
-        raise Phase2DStop("SSH_KEY_CLEANUP_REQUIRED")
-    headers = {
-        "Authorization": "Bearer " + api_key,
-        "Accept": "application/json",
-    }
-    try:
-        transport("DELETE", url, b"", headers)
-    except Exception as exc:
-        raise Phase2DStop("SSH_KEY_CLEANUP_REQUIRED") from exc
-
-
-def cleanup_account_ssh_key(instance_id: str, api_key: str, transport, directory: Path) -> bool:
-    path = directory / instance_id / "vast_key_id"
-    if not path.exists():
-        return True
-    key_id = path.read_text(encoding="utf-8").strip()
-    try:
-        delete_account_ssh_key(transport, key_id, api_key)
-    except Phase2DStop:
-        return False
-    path.unlink()
-    return True
-
-
-def _account_ssh_transport(method: str, url: str, body: bytes, headers: dict) -> bytes:
-    if not account_ssh_allowed(method, url):
-        raise Phase2DStop("COMMAND_BLOCKED")
-    request = urllib.request.Request(url, data=body or None, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        code = "SSH_KEY_CLEANUP_REQUIRED" if method == "DELETE" else "SSH_KEY_ATTACH_FAILED"
-        raise Phase2DStop(code) from exc
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return ""
+    if isinstance(payload, dict) and isinstance(payload.get("msg"), str) and "result_url" not in payload:
+        return payload.get("msg") or ""
+    result_url = payload.get("result_url") if isinstance(payload, dict) else None
+    if not isinstance(result_url, str) or not result_url.startswith("https://"):
+        return ""
+    host = urllib.parse.urlparse(result_url).hostname or ""
+    if host != "vast.ai" and not host.endswith(".vast.ai"):
+        return ""
+    for _ in range(3):
+        time.sleep(0.3)
+        try:
+            with urllib.request.urlopen(result_url, timeout=10) as response:
+                if response.status == 200:
+                    return response.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+    return ""
 
 
 def _reject_over_price(row: dict) -> None:

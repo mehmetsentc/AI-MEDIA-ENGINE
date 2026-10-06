@@ -24,9 +24,8 @@ from media_engine.providers.phase2d import (
     _new_ephemeral_ssh_key,
     attach_ssh_key,
     budget_status,
-    cleanup_account_ssh_key,
     public_key_fingerprint,
-    register_account_ssh_key,
+    ssh_argv,
     fingerprint_for,
     format_policy,
     policy_fields,
@@ -154,7 +153,7 @@ class Phase2DTests(unittest.TestCase):
         self.assertGreater(deadline, self.clock.t)
         return _png(), {"strategy": "bf16-cpu-offload", "seed": FIRST_SEED}
 
-    def _run(self, transport, env=None, generate=None, ssh_dir=None) -> tuple[int, str]:
+    def _run(self, transport, env=None, generate=None) -> tuple[int, str]:
         stdout = io.StringIO()
         code = run_phase2d(
             _env() if env is None else env,
@@ -165,8 +164,6 @@ class Phase2DTests(unittest.TestCase):
             generate=self._generate if generate is None else generate,
             now=self.clock,
             stdout=stdout,
-            ssh_dir=None if ssh_dir is None else Path(ssh_dir),
-            key_transport=transport,
         )
         text = stdout.getvalue()
         self.assertNotIn("unit-test-vast-secret", text)
@@ -375,8 +372,11 @@ class Phase2DTests(unittest.TestCase):
             seen["url"] = url
             seen["body"] = body
             self.assertNotIn(b"unit-test-vast-secret", body)
+            return b'{"success": true, "msg": "SSH key attached successfully"}'
 
-        attach_ssh_key(transport, "555", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample phase2d", "unit-test-vast-secret")
+        parsed = attach_ssh_key(transport, "555", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample phase2d", "unit-test-vast-secret")
+        self.assertEqual(parsed["success"], True)
+        self.assertIsNone(parsed["key_id"])
         self.assertEqual(seen["method"], "POST")
         self.assertEqual(seen["url"], "https://console.vast.ai/api/v0/instances/555/ssh/")
         self.assertIn(b"ssh-ed25519", seen["body"])
@@ -753,7 +753,7 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual(len(readiness["transitions"]), 20)
         self.assertEqual(readiness["transition_count"], polls["n"])
 
-    def test_ephemeral_public_key_is_registered_and_private_key_stays_local(self) -> None:
+    def test_public_key_attaches_to_created_instance_without_account_api(self) -> None:
         directory = Path(self.tmp.name) / "ssh-new"
         identity, public = _new_ephemeral_ssh_key(directory)
         private = Path(identity).read_bytes()
@@ -766,13 +766,23 @@ class Phase2DTests(unittest.TestCase):
             self.assertNotIn(private, body)
             self.assertNotIn(b"PRIVATE", body)
             self.assertNotIn(b"unit-test-vast-secret", body)
-            return b'{"success": true, "key": {"id": 77}}'
+            return b'{"success": true, "msg": "SSH key attached successfully"}'
 
-        key_id = register_account_ssh_key(transport, public, "unit-test-vast-secret")
-        self.assertEqual((seen["method"], seen["url"], key_id), ("POST", "https://console.vast.ai/api/v0/ssh/", "77"))
+        parsed = attach_ssh_key(transport, "555", public, "unit-test-vast-secret")
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["url"], "https://console.vast.ai/api/v0/instances/555/ssh/")
+        self.assertNotIn("/api/v0/ssh/", seen["url"])
         self.assertIn(public.encode(), seen["body"])
-        self.assertTrue(str(public_key_fingerprint(public)).startswith("SHA256:"))
-        self.assertNotIn(public, json.dumps({"fingerprint": public_key_fingerprint(public)}))
+        self.assertEqual(parsed["success"], True)
+        self.assertIsNone(parsed["key_id"])
+        self.assertEqual(parsed["http_status"], 200)
+        fingerprint = public_key_fingerprint(public)
+        self.assertTrue(fingerprint.startswith("SHA256:"))
+        self.assertNotIn(public, json.dumps({"fingerprint": fingerprint}))
+        argv = ssh_argv(identity, "ssh.example", "22", "true")
+        self.assertEqual(argv[argv.index("-i") + 1], identity)
+        self.assertIn("IdentitiesOnly=yes", argv)
+        self.assertIn("root@ssh.example", argv)
 
     def test_ssh_probe_waits_for_confirmed_key_registration(self) -> None:
         order = []
@@ -814,7 +824,7 @@ class Phase2DTests(unittest.TestCase):
         probes = {"n": 0}
 
         def attach():
-            raise Phase2DStop("SSH_KEY_ATTACH_FAILED")
+            raise Phase2DStop("SSH_INSTANCE_KEY_ATTACH_FAILED")
 
         def ssh(host, port, command, data, timeout):
             probes["n"] += 1
@@ -835,14 +845,14 @@ class Phase2DTests(unittest.TestCase):
                 script=b"",
                 job=b"{}",
             )
-        self.assertEqual(caught.exception.code, "SSH_KEY_ATTACH_FAILED")
+        self.assertEqual(caught.exception.code, "SSH_INSTANCE_KEY_ATTACH_FAILED")
         self.assertEqual(probes["n"], 0)
         saved = json.loads((Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8"))
-        self.assertEqual(saved["stage"], "SSH_KEY_ATTACH_FAILED")
+        self.assertEqual(saved["stage"], "SSH_INSTANCE_KEY_ATTACH_FAILED")
 
-        with self.assertRaises(Phase2DStop) as unregistered:
-            register_account_ssh_key(lambda *args: b'{"success": false}', "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample phase2d", "k")
-        self.assertEqual(unregistered.exception.code, "SSH_KEY_NOT_REGISTERED")
+        with self.assertRaises(Phase2DStop) as rejected:
+            attach_ssh_key(lambda *args: b'{"success": false}', "555", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample phase2d", "k")
+        self.assertEqual(rejected.exception.code, "SSH_INSTANCE_KEY_ATTACH_FAILED")
 
     def test_propagation_hint_retries_then_accepts_true(self) -> None:
         clock = _StepClock()
@@ -887,7 +897,8 @@ class Phase2DTests(unittest.TestCase):
 
         exc, _probes = self._runtime(lambda: _ready_row(), ssh=ssh)
         self.assertEqual(exc.code, "SSH_KEY_PROPAGATION_TIMEOUT")
-        self.assertEqual(calls["n"], 3)
+        self.assertGreater(calls["n"], 3)
+        self.assertLess(calls["n"], 15)
 
     def test_plain_publickey_rejection_is_auth_failure(self) -> None:
         calls = {"n": 0}
@@ -900,43 +911,53 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual(exc.code, "SSH_AUTH_FAILED")
         self.assertEqual(calls["n"], 1)
 
-    def test_account_key_is_deleted_after_destroy(self) -> None:
-        ssh_dir = Path(self.tmp.name) / "keys"
-
-        def generate(instance_id, offer, deadline):
-            root = ssh_dir / instance_id
-            root.mkdir(parents=True)
-            (root / "vast_key_id").write_text("77\n", encoding="utf-8")
-            return _png(), {"strategy": "bf16-cpu-offload"}
-
-        code, text = self._run(self._machine(), generate=generate, ssh_dir=ssh_dir)
+    def test_create_never_calls_account_ssh_endpoints(self) -> None:
+        code, text = self._run(self._machine())
         self.assertEqual(code, 0)
-        self.assertIn("https://console.vast.ai/api/v0/ssh/77/", self.ssh_deletes)
-        self.assertFalse((ssh_dir / "555" / "vast_key_id").exists())
-        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
-
-    def test_failed_key_cleanup_is_reported_without_another_create(self) -> None:
-        ssh_dir = Path(self.tmp.name) / "keys-fail"
-
-        def generate(instance_id, offer, deadline):
-            root = ssh_dir / instance_id
-            root.mkdir(parents=True)
-            (root / "vast_key_id").write_text("77\n", encoding="utf-8")
-            raise Phase2DStop("SSH_AUTH_FAILED")
-
-        base = self._machine()
-
-        def transport(method, url, body, headers):
-            if method == "DELETE" and "/api/v0/ssh/" in url:
-                raise RuntimeError("cleanup failed")
-            return base(method, url, body, headers)
-
-        code, text = self._run(transport, generate=generate, ssh_dir=ssh_dir)
-        self.assertEqual(code, 9)
-        self.assertIn("SSH_KEY_CLEANUP_REQUIRED", text)
         self.assertIn("TERMINATED", text)
+        self.assertFalse(any("/api/v0/ssh/" in url for _method, url in self.calls))
+        self.assertEqual(self.ssh_deletes, [])
         self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
         self.assertEqual([method for method, _url in self.calls].count("DELETE"), 1)
+
+    def test_auth_failure_keeps_sanitized_instance_log_and_one_destroy(self) -> None:
+        secret = "unit-test-vast-secret"
+
+        def generate(*_args):
+            raise Phase2DStop("SSH_AUTH_FAILED")
+
+        code, text = self._run(self._machine(), generate=generate)
+        self.assertEqual(code, 7)
+        self.assertIn("SSH_AUTH_FAILED", text)
+        self.assertIn("TERMINATED", text)
+        self.assertNotIn("SSH_KEY_CLEANUP_REQUIRED", text)
+        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
+        self.assertEqual([method for method, _url in self.calls].count("DELETE"), 1)
+
+        def logs():
+            return "log " + secret + " " + ("ab" * 32)
+
+        clock = _StepClock()
+        with self.assertRaises(Phase2DStop):
+            run_ssh_runtime(
+                instance_id="555",
+                fetch=lambda: _ready_row(),
+                attach=lambda: None,
+                ssh=lambda *args: (255, b"", b"Permission denied (publickey).\n"),
+                scp=lambda *args: None,
+                deadline=clock.t + 30,
+                now=clock,
+                sleep=clock.sleep,
+                diagnostic_dir=Path(self.artifacts),
+                script=b"",
+                job=b"{}",
+                secrets=(secret,),
+                logs=logs,
+            )
+        saved_text = (Path(self.artifacts) / "phase2d-555.diagnostic.json").read_text(encoding="utf-8")
+        self.assertIn("instance_log_tail", saved_text)
+        self.assertNotIn(secret, saved_text)
+        self.assertNotIn("ab" * 32, saved_text)
 
     def test_ssh_endpoint_uses_published_port_only_when_running(self) -> None:
         self.assertIsNone(ssh_endpoint({
