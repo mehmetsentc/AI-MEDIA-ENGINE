@@ -39,6 +39,8 @@ prepare_generation = _cache.prepare_generation
 
 _REGION = "auto"
 _SERVICE = "s3"
+# R2 single PutObject stops at 5 GiB. Parts must be at least 5 MiB except the last.
+PART_SIZE = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -132,15 +134,32 @@ def sync_from_env(mount: Path, env: dict[str, str] | None = None) -> str:
 
 
 def upload_cache(store, mount: Path) -> None:
-    """Explicit cache fill. Not used by generation."""
+    """Explicit cache fill. The manifest is uploaded only after every other object."""
+    objects: list[tuple[str, Path]] = []
+    manifest: list[tuple[str, Path]] = []
     for path in sorted(mount.rglob("*")):
         if not path.is_file() and not path.is_symlink():
             continue
         key = path.relative_to(mount).as_posix()
-        if path.is_symlink():
-            store.put(key, b"", {"hf-symlink": os.readlink(path)})
+        if key == MANIFEST_NAME:
+            manifest.append((key, path))
         else:
-            store.put(key, path.read_bytes(), {})
+            objects.append((key, path))
+    for key, path in objects:
+        _upload_path(store, key, path)
+    for key, path in manifest:
+        _upload_path(store, key, path)
+
+
+def _upload_path(store, key: str, path: Path) -> None:
+    if path.is_symlink():
+        store.put(key, b"", {"hf-symlink": os.readlink(path)})
+        return
+    put_file = getattr(store, "put_file", None)
+    if put_file is not None:
+        put_file(key, path)
+        return
+    store.put(key, path.read_bytes(), {})
 
 
 def _write_object(mount: Path, key: str, body: bytes, metadata: dict[str, str]) -> None:
@@ -161,10 +180,13 @@ def _write_object(mount: Path, key: str, body: bytes, metadata: dict[str, str]) 
 class R2Client:
     """Small path-style S3 client for Cloudflare R2."""
 
-    def __init__(self, config: R2Config, opener=urlopen, now=None) -> None:
+    def __init__(self, config: R2Config, opener=urlopen, now=None, part_size: int = PART_SIZE) -> None:
         self.config = config
         self._opener = opener
         self._now = now or (lambda: datetime.now(timezone.utc))
+        if part_size < 1:
+            raise ValueError("part_size must be positive")
+        self.part_size = part_size
 
     def __repr__(self) -> str:
         return f"R2Client({self.config!r})"
@@ -178,12 +200,59 @@ class R2Client:
         return body, _symlink_meta(headers)
 
     def put(self, key: str, body: bytes, metadata: dict[str, str] | None = None) -> None:
-        extra = {}
-        if metadata and metadata.get("hf-symlink"):
-            extra["x-amz-meta-hf-symlink"] = metadata["hf-symlink"]
+        extra = _meta_headers(metadata)
         status, _headers, _body = self._request("PUT", key, body, extra)
         if status not in (200, 201):
             raise R2StorageError(status)
+
+    def put_file(self, key: str, path: Path, metadata: dict[str, str] | None = None) -> None:
+        """Upload a file without reading more than one part into memory."""
+        path = Path(path)
+        if path.stat().st_size <= self.part_size:
+            self.put(key, path.read_bytes(), metadata)
+            return
+        self._multipart(key, path, _meta_headers(metadata))
+
+    def _multipart(self, key: str, path: Path, extra: dict[str, str]) -> None:
+        status, _headers, body = self._request("POST", key, b"", extra, {"uploads": ""})
+        if status not in (200, 201):
+            raise R2StorageError(status)
+        upload_id = _xml_text(body, "UploadId")
+        parts: list[tuple[int, str]] = []
+        try:
+            number = 1
+            with path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(self.part_size)
+                    if not chunk:
+                        break
+                    parts.append((number, self._upload_part(key, upload_id, number, chunk)))
+                    number += 1
+            status, _headers, _body = self._request(
+                "POST", key, _complete_xml(parts), query={"uploadId": upload_id},
+            )
+            if status not in (200, 201):
+                raise R2StorageError(status)
+        except Exception:
+            self._abort(key, upload_id)
+            raise
+
+    def _upload_part(self, key: str, upload_id: str, number: int, chunk: bytes) -> str:
+        status, headers, _body = self._request(
+            "PUT", key, chunk, query={"partNumber": str(number), "uploadId": upload_id},
+        )
+        if status not in (200, 201):
+            raise R2StorageError(status)
+        etag = _header(headers, "etag")
+        if not etag:
+            raise R2StorageError(status)
+        return etag
+
+    def _abort(self, key: str, upload_id: str) -> None:
+        try:
+            self._request("DELETE", key, b"", query={"uploadId": upload_id})
+        except Exception:
+            return
 
     def list_keys(self, prefix: str) -> list[str]:
         keys: list[str] = []
@@ -221,7 +290,7 @@ class R2Client:
             method, path, query_text, headers, payload_hash, amzdate,
             self.config.access_key_id, self.config.secret_access_key,
         )
-        request = Request(url, data=body if method == "PUT" else None, method=method)
+        request = Request(url, data=body if method in {"PUT", "POST"} else None, method=method)
         for name, value in headers.items():
             if name == "host":
                 continue
@@ -276,6 +345,36 @@ def _encode_key(key: str) -> str:
 def _canonical_query(query: dict[str, str]) -> str:
     pairs = sorted((quote(key, safe=""), quote(value, safe="")) for key, value in query.items())
     return "&".join(f"{key}={value}" for key, value in pairs)
+
+
+def _meta_headers(metadata: dict[str, str] | None) -> dict[str, str]:
+    if metadata and metadata.get("hf-symlink"):
+        return {"x-amz-meta-hf-symlink": metadata["hf-symlink"]}
+    return {}
+
+
+def _complete_xml(parts: list[tuple[int, str]]) -> bytes:
+    chunks = ["<CompleteMultipartUpload>"]
+    for number, etag in parts:
+        quoted = etag if etag.startswith('"') else '"' + etag + '"'
+        chunks.append(f"<Part><PartNumber>{number}</PartNumber><ETag>{quoted}</ETag></Part>")
+    chunks.append("</CompleteMultipartUpload>")
+    return "".join(chunks).encode("utf-8")
+
+
+def _header(headers: dict, name: str) -> str:
+    for key, value in headers.items():
+        if key.lower() == name:
+            return value
+    return ""
+
+
+def _xml_text(body: bytes, tag: str) -> str:
+    root = ET.fromstring(body)
+    for node in root.iter():
+        if _local(node.tag) == tag and node.text:
+            return node.text
+    raise R2StorageError(0)
 
 
 def _symlink_meta(headers: dict) -> dict[str, str]:

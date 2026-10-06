@@ -26,8 +26,10 @@ from media_engine.engines.image.model_cache import (
 from media_engine.engines.image import qwen_remote
 from media_engine.engines.image import model_cache, r2_cache
 from media_engine.engines.image.r2_cache import (
+    PART_SIZE,
     MemoryObjectStore,
     R2Client,
+    R2StorageError,
     _authorization,
     config_from_env,
     load_from_r2,
@@ -171,3 +173,124 @@ class R2CacheTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(completed.stdout.strip(), "phase2d-cache.json")
+
+
+class _Response:
+    def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        self.status = status
+        self.headers = headers
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> bool:
+        return False
+
+
+def _client(opener, part_size: int = 4) -> R2Client:
+    return R2Client(config_from_env({
+        "MODEL_CACHE_PROVIDER": "r2",
+        "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
+        "R2_BUCKET": "models",
+        "R2_ACCESS_KEY_ID": "access",
+        "R2_SECRET_ACCESS_KEY": "secret",
+    }), opener=opener, part_size=part_size)
+
+
+class MultipartUploadTests(unittest.TestCase):
+    def test_small_file_stays_a_single_put(self) -> None:
+        seen = []
+
+        def opener(request, timeout):
+            seen.append((request.method, request.full_url, request.data))
+            return _Response(200, {}, b"")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.bin"
+            path.write_bytes(b"abc")
+            _client(opener).put_file("hf-cache/small.bin", path)
+        self.assertEqual(seen[0][0], "PUT")
+        self.assertNotIn("uploads", seen[0][1])
+        self.assertEqual(seen[0][2], b"abc")
+        self.assertEqual(len(seen), 1)
+
+    def test_large_file_streams_ordered_parts_and_completes(self) -> None:
+        seen = []
+
+        def opener(request, timeout):
+            body = request.data or b""
+            seen.append((request.method, request.full_url, body))
+            if request.method == "POST" and "uploads=" in request.full_url:
+                xml = b"<InitiateMultipartUploadResult><UploadId>up-1</UploadId></InitiateMultipartUploadResult>"
+                return _Response(200, {}, xml)
+            if request.method == "PUT":
+                number = request.full_url.split("partNumber=", 1)[1].split("&", 1)[0]
+                return _Response(200, {"ETag": f'"etag-{number}"'}, b"")
+            return _Response(200, {}, b"<CompleteMultipartUploadResult></CompleteMultipartUploadResult>")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weights.bin"
+            path.write_bytes(b"abcdefghij")
+            _client(opener, part_size=4).put_file("hf-cache/weights.bin", path)
+        put_bodies = [body for method, _url, body in seen if method == "PUT"]
+        self.assertLessEqual(max(len(body) for body in put_bodies), 4)
+        self.assertEqual(b"".join(put_bodies), b"abcdefghij")
+        parts = [url for method, url, _body in seen if method == "PUT"]
+        self.assertEqual(
+            [url.split("partNumber=", 1)[1].split("&", 1)[0] for url in parts],
+            ["1", "2", "3"],
+        )
+        complete = seen[-1][2]
+        self.assertIn(b"<PartNumber>1</PartNumber><ETag>\"etag-1\"</ETag>", complete)
+        self.assertLess(complete.find(b"<PartNumber>1</PartNumber>"), complete.find(b"<PartNumber>2</PartNumber>"))
+        self.assertLess(complete.find(b"<PartNumber>2</PartNumber>"), complete.find(b"<PartNumber>3</PartNumber>"))
+        self.assertEqual(PART_SIZE, 8 * 1024 * 1024)
+
+    def test_failed_part_aborts_and_does_not_complete(self) -> None:
+        seen = []
+
+        def opener(request, timeout):
+            seen.append((request.method, request.full_url))
+            if request.method == "POST" and "uploads=" in request.full_url:
+                return _Response(200, {}, b"<InitiateMultipartUploadResult><UploadId>up-1</UploadId></InitiateMultipartUploadResult>")
+            if request.method == "PUT" and "partNumber=2" in request.full_url:
+                raise TimeoutError("timed out")
+            if request.method == "PUT":
+                return _Response(200, {"ETag": '"etag-1"'}, b"")
+            return _Response(204, {}, b"")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weights.bin"
+            path.write_bytes(b"abcdefgh")
+            with self.assertRaises(R2StorageError):
+                _client(opener, part_size=4).put_file("hf-cache/weights.bin", path)
+        methods = [method for method, url in seen]
+        self.assertIn("DELETE", methods)
+        self.assertTrue(any(method == "DELETE" and "uploadId=up-1" in url for method, url in seen))
+        self.assertFalse(any(method == "POST" and "uploadId=" in url for method, url in seen))
+
+    def test_manifest_is_last_and_absent_when_a_model_object_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = Path(tmp) / "models"
+            _complete(mount)
+            store = MemoryObjectStore()
+
+            def fail_blob(key, body, metadata=None):
+                if key.endswith("/blob"):
+                    raise R2StorageError(0)
+                MemoryObjectStore.put(store, key, body, metadata)
+
+            store.put = fail_blob
+            with self.assertRaises(R2StorageError):
+                upload_cache(store, mount)
+            self.assertNotIn("phase2d-cache.json", store.objects)
+            self.assertFalse(any(payload.get("state") == COMPLETE for payload, _meta in [
+                (json.loads(body.decode()), meta) for body, meta in store.objects.values() if body.startswith(b"{")
+            ]))
+            ordered = MemoryObjectStore()
+            upload_cache(ordered, mount)
+            self.assertEqual(list(ordered.objects)[-1], "phase2d-cache.json")
