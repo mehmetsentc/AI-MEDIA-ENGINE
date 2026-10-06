@@ -1,0 +1,305 @@
+"""Phase 2D image proof. Fake transport and fake pixels. No live GPU."""
+from __future__ import annotations
+
+import io
+import json
+import struct
+import tempfile
+import unittest
+import urllib.request
+import zlib
+from decimal import Decimal
+from pathlib import Path
+
+from media_engine.engines.image.base import ImageEngineError
+from media_engine.engines.image.qwen import FIRST_PROMPT, FIRST_SEED, QwenImageEngine, validate_png
+from media_engine.providers.offers import GpuOffer
+from media_engine.providers.phase2d import (
+    Phase2DStop,
+    accept_offer,
+    attach_ssh_key,
+    fingerprint_for,
+    format_policy,
+    policy_fields,
+    policy_fingerprint,
+    run_phase2d,
+    ssh_attach_allowed,
+)
+from media_engine.resources.ledger import ResourceRecord, ResourceState
+from media_engine.usage import UsageStore
+
+
+def _png(width: int = 1024, height: int = 1024) -> bytes:
+    row = b"\x00" + bytes((12, 34, 56)) * width
+    raw = zlib.compress(row * height)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", raw) + chunk(b"IEND", b"")
+
+
+def _env(**overrides) -> dict:
+    env = {
+        "VAST_API_KEY": "unit-test-vast-secret",
+        "LIVE_EXTERNAL_PROVIDERS": "true",
+        "VAST_PROVISIONING": "1",
+        "VAST_HUMAN_POLICY_APPROVAL": "approve-policy:" + policy_fingerprint(),
+    }
+    env.update(overrides)
+    return env
+
+
+def _row(**overrides) -> dict:
+    row = {
+        "id": 200,
+        "gpu_name": "RTX 5090",
+        "num_gpus": 1,
+        "gpu_ram": 32607,
+        "dph_total": "0.20",
+        "reliability2": "0.99",
+        "dlperf": "80",
+        "rentable": True,
+    }
+    row.update(overrides)
+    return row
+
+
+def _gpu(**kwargs) -> GpuOffer:
+    values = dict(
+        provider="vast", offer_id="200", gpu_model="RTX 5090", gpu_count=1,
+        vram_gb=Decimal("32"), hourly_price_usd=Decimal("0.20"),
+        reliability=Decimal("0.99"), performance=Decimal("80"), availability="rentable",
+    )
+    values.update(kwargs)
+    return GpuOffer(**values)
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 1_700_000_000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class Phase2DTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = str(Path(self.tmp.name) / "meta.sqlite3")
+        self.artifacts = str(Path(self.tmp.name) / "artifacts")
+        self.clock = _Clock()
+        self.calls: list[tuple[str, str]] = []
+        self.generated = 0
+        self._urlopen = urllib.request.urlopen
+        urllib.request.urlopen = self._block
+
+    def tearDown(self) -> None:
+        urllib.request.urlopen = self._urlopen
+
+    def _block(self, *args, **kwargs):
+        raise AssertionError("network")
+
+    def _generate(self, instance_id, offer, deadline):
+        self.generated += 1
+        self.assertEqual(instance_id, "555")
+        self.assertEqual(offer.offer_id, "200")
+        self.assertGreater(deadline, self.clock.t)
+        return _png(), {"strategy": "bf16-cpu-offload", "seed": FIRST_SEED}
+
+    def _run(self, transport, env=None, generate=None) -> tuple[int, str]:
+        stdout = io.StringIO()
+        code = run_phase2d(
+            _env() if env is None else env,
+            db_path=self.db_path,
+            artifact_dir=self.artifacts,
+            search_transport=transport,
+            lifecycle_transport=transport,
+            generate=self._generate if generate is None else generate,
+            now=self.clock,
+            stdout=stdout,
+        )
+        text = stdout.getvalue()
+        self.assertNotIn("unit-test-vast-secret", text)
+        return code, text
+
+    def test_policy_fingerprint_is_deterministic_and_changes(self) -> None:
+        self.assertEqual(policy_fingerprint(), policy_fingerprint())
+        changed = dict(policy_fields())
+        changed["max_estimated_gpu_cost_usd"] = "0.21"
+        self.assertNotEqual(fingerprint_for(changed), policy_fingerprint())
+        text = format_policy()
+        self.assertIn("PHASE 2D POLICY", text)
+        self.assertIn("max_gpu_lifetime_seconds: 1800", text)
+        self.assertIn("max_estimated_gpu_cost_usd: 0.20", text)
+        self.assertIn("POLICY FINGERPRINT: " + policy_fingerprint(), text)
+
+    def test_missing_approval_does_not_touch_transport(self) -> None:
+        def transport(*args):
+            raise AssertionError("transport")
+
+        code, text = self._run(transport, _env(VAST_HUMAN_POLICY_APPROVAL=""))
+        self.assertEqual(code, 2)
+        self.assertIn("HUMAN_POLICY_APPROVAL_REQUIRED", text)
+
+    def test_price_and_reliability_stop_before_create(self) -> None:
+        with self.assertRaises(Phase2DStop) as caught:
+            accept_offer(_gpu(hourly_price_usd=Decimal("0.41")))
+        self.assertEqual(caught.exception.code, "PRICE_ABOVE_CEILING")
+        with self.assertRaises(Phase2DStop) as caught:
+            accept_offer(_gpu(reliability=Decimal("0.97")))
+        self.assertEqual(caught.exception.code, "OFFER_MISMATCH")
+        code, text = self._run(self._machine(offers=[_row(dph_total="0.41")]))
+        self.assertEqual(code, 3)
+        self.assertIn("OFFER_GONE", text)
+        self.assertNotIn("PUT", [method for method, _url in self.calls])
+
+    def test_one_create_one_png_one_destroy(self) -> None:
+        code, text = self._run(self._machine())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.generated, 1)
+        methods = [method for method, _url in self.calls]
+        self.assertEqual(methods.count("POST"), 1)
+        self.assertEqual(methods.count("PUT"), 1)
+        self.assertEqual(methods.count("DELETE"), 1)
+        put = [url for method, url in self.calls if method == "PUT"][0]
+        self.assertTrue(put.endswith("/asks/200/"))
+        path = Path(self.artifacts) / "phase2d-555.png"
+        self.assertTrue(path.exists())
+        self.assertGreater(path.stat().st_size, 0)
+        width, height = validate_png(path.read_bytes())
+        self.assertEqual((width, height), (1024, 1024))
+        meta = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["prompt"], FIRST_PROMPT)
+        self.assertEqual(meta["seed"], FIRST_SEED)
+        self.assertEqual(meta["instance_id"], "555")
+        self.assertEqual(meta["owner_label"], "media-engine:phase2d")
+        self.assertIn("SHA256 " + meta["sha256"], text)
+        self.assertIsNone(UsageStore(self.db_path).for_job("phase2d-555").actual_cost_usd)
+
+    def test_existing_png_is_not_overwritten(self) -> None:
+        root = Path(self.artifacts)
+        root.mkdir(parents=True)
+        original = root / "phase2d-555.png"
+        original.write_bytes(b"keep")
+        code, _text = self._run(self._machine())
+        self.assertEqual(code, 0)
+        self.assertEqual(original.read_bytes(), b"keep")
+        copies = list(root.glob("phase2d-555-*.png"))
+        self.assertEqual(len(copies), 1)
+
+    def test_generation_failure_still_destroys(self) -> None:
+        def fail(*_args):
+            raise Phase2DStop("GENERATION_FAILED")
+
+        code, text = self._run(self._machine(), generate=fail)
+        self.assertEqual(code, 7)
+        self.assertIn("GENERATION_FAILED", text)
+        self.assertIn("TERMINATED", text)
+        self.assertEqual([method for method, _url in self.calls].count("DELETE"), 1)
+        self.assertEqual(list(Path(self.artifacts).glob("*.png")), [])
+
+    def test_foreign_label_is_not_destroyed(self) -> None:
+        code, text = self._run(self._machine(label="media-engine:other-app"))
+        self.assertEqual(code, 5)
+        self.assertIn("FOREIGN", text)
+        self.assertEqual(self.generated, 0)
+        self.assertNotIn("DELETE", [method for method, _url in self.calls])
+
+    def test_deadline_destroys_without_a_second_create(self) -> None:
+        def transport(method, url, body, headers):
+            self.calls.append((method, url))
+            if method == "POST":
+                return json.dumps({"offers": [_row()]}).encode("utf-8")
+            if method == "PUT":
+                self.clock.t += 1801
+                return b'{"new_contract": 555}'
+            if method == "DELETE":
+                self.destroyed = True
+                return b"{}"
+            if getattr(self, "destroyed", False):
+                return b'{"instances": []}'
+            return b'{"instances": [{"id": 555, "label": "media-engine:phase2d"}]}'
+
+        code, text = self._run(transport)
+        self.assertEqual(code, 7)
+        self.assertIn("COST_ABOVE_CEILING", text)
+        self.assertEqual(self.generated, 0)
+        self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
+        self.assertIn("DELETE", [method for method, _url in self.calls])
+
+    def test_engine_requires_prompt_seed_and_png(self) -> None:
+        seen = {}
+
+        def pipeline(**kwargs):
+            seen.update(kwargs)
+            return _png(kwargs["width"], kwargs["height"])
+
+        engine = QwenImageEngine(pipeline)
+        png = engine.render(FIRST_PROMPT, width=1024, height=1024, seed=FIRST_SEED)
+        self.assertEqual(seen["seed"], FIRST_SEED)
+        self.assertEqual(validate_png(png), (1024, 1024))
+        with self.assertRaises(ImageEngineError):
+            engine.render("  ")
+        with self.assertRaises(ImageEngineError):
+            engine.render(FIRST_PROMPT, seed=-1)
+        with self.assertRaises(ImageEngineError):
+            QwenImageEngine(lambda **_kwargs: b"not-a-png").render(FIRST_PROMPT)
+
+    def test_ssh_attach_is_one_owned_instance_and_rejects_secrets(self) -> None:
+        seen = {}
+
+        def transport(method, url, body, headers):
+            seen["method"] = method
+            seen["url"] = url
+            seen["body"] = body
+            self.assertNotIn(b"unit-test-vast-secret", body)
+
+        attach_ssh_key(transport, "555", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample phase2d", "unit-test-vast-secret")
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["url"], "https://console.vast.ai/api/v0/instances/555/ssh/")
+        self.assertIn(b"ssh-ed25519", seen["body"])
+        self.assertFalse(ssh_attach_allowed("DELETE", seen["url"]))
+        self.assertFalse(ssh_attach_allowed("POST", "https://console.vast.ai/api/v0/asks/555/"))
+        with self.assertRaises(Phase2DStop):
+            attach_ssh_key(transport, "offer:555", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample", "k")
+        with self.assertRaises(Phase2DStop):
+            attach_ssh_key(transport, "555", "-----BEGIN OPENSSH PRIVATE KEY-----\n", "k")
+
+    def test_unresolved_ledger_blocks_create(self) -> None:
+        from media_engine.resources.ledger import ResourceLedger
+        ResourceLedger(self.db_path).upsert(ResourceRecord(
+            resource_id="9", provider="vast", owner_id="phase2d",
+            state=ResourceState.READY, create_attempted=True,
+            hourly_price_usd="0.20", created_at=1.0, updated_at=1.0, last_error=None,
+        ))
+        code, text = self._run(self._machine())
+        self.assertEqual(code, 2)
+        self.assertIn("UNRESOLVED_RESOURCE", text)
+        self.assertEqual(self.calls, [])
+
+    def _machine(self, *, label: str = "media-engine:phase2d", offers=None):
+        state = {"destroyed": False}
+
+        def transport(method, url, body, headers):
+            self.calls.append((method, url))
+            self.assertNotIn(b"unit-test-vast-secret", body)
+            if method == "POST":
+                return json.dumps({"offers": offers if offers is not None else [_row()]}).encode("utf-8")
+            if method == "PUT":
+                self.assertIn(b'"runtype":"ssh"', body)
+                self.assertIn(b'"disk":100', body)
+                self.assertIn(b"pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime", body)
+                self.assertIn(b"media-engine:phase2d", body)
+                return b'{"new_contract": 555}'
+            if method == "DELETE":
+                state["destroyed"] = True
+                return b"{}"
+            if state["destroyed"]:
+                return b'{"instances": []}'
+            return json.dumps({"instances": [{"id": 555, "label": label}]}).encode("utf-8")
+
+        return transport

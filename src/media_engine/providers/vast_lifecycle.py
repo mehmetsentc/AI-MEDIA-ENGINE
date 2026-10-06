@@ -144,6 +144,7 @@ class VastLifecycle:
         human_approval: str = "",
         image: str = "",
         disk_gb: int = 0,
+        runtype: str = "",
     ) -> CreateResult:
         self._require_common(provision=provision, api_key=api_key)
         if human_approval != approval_token(offer_id):
@@ -157,10 +158,10 @@ class VastLifecycle:
             raise ProvisionBlocked("PRICE_ABOVE_CEILING")
         self._require_capacity(owner)
         label = ownership_label(owner)
-        payload = json.dumps(
-            {"label": label, "image": image, "disk": disk_gb},
-            separators=(",", ":"),
-        ).encode("utf-8")
+        body = {"label": label, "image": image, "disk": disk_gb}
+        if runtype:
+            body["runtype"] = runtype
+        payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
         url = f"https://console.vast.ai/api/v0/asks/{offer_id}/"
         try:
             raw = self._transport("PUT", url, payload, self._headers(api_key))

@@ -124,7 +124,7 @@ class Phase2BTests(unittest.TestCase):
         blob = "\n".join(
             path.read_text(encoding="utf-8")
             for path in root.glob("*.py")
-            if path.name != "phase2c.py"
+            if path.name not in {"phase2c.py", "phase2d.py"}
         )
         for name in ("3090", "4090", "5090", "A6000", "L40S"):
             self.assertNotIn(name, blob)
