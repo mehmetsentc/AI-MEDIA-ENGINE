@@ -193,7 +193,19 @@ def _one(row: object) -> Optional[GpuOffer]:
         storage_price_per_gb_month=_decimal(row.get("storage_cost")),
         machine_id=machine_id,
         host_id=host_id,
+        driver=_driver(row.get("driver_vers")),
     )
+
+
+def _driver(value: object) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 1_000_000:
+        return str(value)
+    major = value // 1_000_000
+    minor = (value // 1000) % 1000
+    patch = value % 1000
+    return f"{major}.{minor}.{patch}"
 
 
 def _identity(value: object) -> Optional[str]:

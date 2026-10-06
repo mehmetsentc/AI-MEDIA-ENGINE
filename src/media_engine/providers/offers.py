@@ -38,6 +38,7 @@ class GpuOffer:
     storage_price_per_gb_month: Optional[Decimal] = None
     machine_id: Optional[str] = None
     host_id: Optional[str] = None
+    driver: Optional[str] = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -55,6 +56,7 @@ class GpuOffer:
             "availability": self.availability,
             "machine_id": self.machine_id,
             "host_id": self.host_id,
+            "driver": self.driver,
         }
 
 

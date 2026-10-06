@@ -73,9 +73,9 @@ def _env(**overrides) -> dict:
 def _row(**overrides) -> dict:
     row = {
         "id": 200,
-        "gpu_name": "RTX 5090",
+        "gpu_name": "L40",
         "num_gpus": 1,
-        "gpu_ram": 32607,
+        "gpu_ram": 49140,
         "dph_base": "0.20",
         "dph_total": "0.20222222222222222",
         "storage_cost": "0.10",
@@ -90,8 +90,8 @@ def _row(**overrides) -> dict:
 
 def _gpu(**kwargs) -> GpuOffer:
     values = dict(
-        provider="vast", offer_id="200", gpu_model="RTX 5090", gpu_count=1,
-        vram_gb=Decimal("32"), hourly_price_usd=Decimal("0.20222222222222222"),
+        provider="vast", offer_id="200", gpu_model="L40", gpu_count=1,
+        vram_gb=Decimal("47.99"), hourly_price_usd=Decimal("0.20222222222222222"),
         gpu_hourly_price_usd=Decimal("0.20"),
         storage_price_per_gb_month=Decimal("0.10"),
         disk_gb=Decimal("500"),
@@ -183,7 +183,45 @@ class Phase2DTests(unittest.TestCase):
         self.assertIn("max_gpu_lifetime_seconds: 1800", text)
         self.assertIn("max_estimated_gpu_cost_usd: 0.20", text)
         self.assertIn("disk_gb: 80", text)
+        self.assertIn("gpu_model: L40", text)
+        self.assertIn("min_vram_gb: 44", text)
         self.assertIn("POLICY FINGERPRINT: " + policy_fingerprint(), text)
+
+    def test_l40_memory_price_and_quarantine_gates(self) -> None:
+        accepted = accept_offer(_gpu(vram_gb=Decimal("44")))
+        self.assertEqual(accepted.gpu_model, "L40")
+        for model, vram in (("RTX 5090", "31.84"), ("RTX 3090", "24"), ("L40", "43.99")):
+            with self.assertRaises(Phase2DStop) as caught:
+                accept_offer(_gpu(gpu_model=model, vram_gb=Decimal(vram)))
+            self.assertEqual(caught.exception.code, "OFFER_MISMATCH")
+        with self.assertRaises(Phase2DStop) as priced:
+            accept_offer(_gpu(
+                gpu_hourly_price_usd=Decimal("0.41"),
+                hourly_price_usd=Decimal("0.43"),
+                storage_price_per_gb_month=Decimal("0.18"),
+            ))
+        self.assertEqual(priced.exception.code, "PRICE_ABOVE_CEILING")
+        self.assertEqual(budget_status(Decimal("0.41")), "PRICE_ABOVE_CEILING")
+        self.assertGreater(projected_max_cost(Decimal("0.41")), MAX_ESTIMATED_COST_USD)
+        self.assertIsNone(budget_status(Decimal("0.40")))
+        record_host_quarantine(
+            self.db_path,
+            offer=_gpu(offer_id="53395400", machine_id="58482"),
+            failure_class="CONTAINER_START_FAILED",
+            reason="oci",
+            now=self.clock.t,
+        )
+        machines, offers = active_quarantine(self.db_path, self.clock.t)
+        selected = select_one(
+            [
+                _gpu(offer_id="53395400", machine_id="58482"),
+                _gpu(offer_id="9", machine_id="111"),
+            ],
+            excluded_machine_ids=machines,
+            excluded_offer_ids=offers,
+        )
+        self.assertEqual(selected.offer_id, "9")
+        self.assertEqual(selected.machine_id, "111")
 
     def test_missing_approval_does_not_touch_transport(self) -> None:
         def transport(*args):
@@ -1161,7 +1199,9 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual([method for method, _url in self.calls].count("PUT"), 1)
 
     def test_policy_ceilings_stay_fixed(self) -> None:
-        self.assertEqual(policy_fingerprint(), "f50c24338d52d889ae7d5aa5c2742b15483632096669bf024e21b1093702cbc4")
+        self.assertEqual(policy_fields()["gpu_model"], "L40")
+        self.assertEqual(policy_fields()["min_vram_gb"], "44")
+        self.assertEqual(policy_fingerprint(), "b716f03932af9c6621a47aff552765061b0fc64aafe8a2b47f37a792f7ab390d")
         self.assertEqual(MAX_HOURLY_USD, Decimal("0.40"))
         self.assertEqual(MAX_ESTIMATED_COST_USD, Decimal("0.20"))
         self.assertEqual(DISK_GB, 80)

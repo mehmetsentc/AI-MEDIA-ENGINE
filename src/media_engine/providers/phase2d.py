@@ -48,8 +48,9 @@ from media_engine.resources.ledger import ResourceLedger, ResourceState
 from media_engine.safety.limits import SafetyLimits
 from media_engine.usage import UsageEvent, UsageStore
 
-APPROVED_GPU_MODEL = "RTX 5090"
-MIN_VRAM_GB = Decimal("24")
+# L40 is the only family whose reported VRAM can hold the 38 GB BF16 transformer.
+APPROVED_GPU_MODEL = "L40"
+MIN_VRAM_GB = Decimal("44")
 MIN_RELIABILITY = Decimal("0.98")
 MAX_HOURLY_USD = Decimal("0.40")
 MAX_ESTIMATED_COST_USD = Decimal("0.20")
@@ -90,7 +91,7 @@ def policy_fields() -> dict[str, str]:
     return {
         "provider": "vast",
         "gpu_model": APPROVED_GPU_MODEL,
-        "min_vram_gb": "24",
+        "min_vram_gb": str(MIN_VRAM_GB),
         "gpu_count": "1",
         "min_reliability": "0.98",
         "max_hourly_price_usd": "0.40",
@@ -325,10 +326,22 @@ def backfill_quarantine_machine_id(db_path: str, *, offer_id: str, machine_id: s
 def persist_selected_identity(directory: Path, offer: GpuOffer, now: float) -> None:
     """Save the chosen offer identity before any create. host_id is diagnostic only."""
     directory.mkdir(parents=True, exist_ok=True)
+    quote = quote_all_in(offer, DISK_GB)
+    total = offer.hourly_price_usd if quote is None else quote[2]
     payload = {
         "offer_id": offer.offer_id,
         "machine_id": offer.machine_id,
         "host_id": offer.host_id,
+        "gpu_name": offer.gpu_model,
+        "vram_gb": str(offer.vram_gb),
+        "reliability": None if offer.reliability is None else str(offer.reliability),
+        "driver": offer.driver,
+        "cuda": offer.cuda,
+        "location": offer.location,
+        "gpu_hourly_price_usd": None if quote is None else str(quote[0]),
+        "storage_hourly_price_usd": None if quote is None else str(quote[1]),
+        "total_hourly_price_usd": str(total),
+        "projected_1800_second_cost_usd": str(projected_max_cost(total)),
         "selected_at": _iso(now),
     }
     (directory / "selection-before-create.json").write_text(
