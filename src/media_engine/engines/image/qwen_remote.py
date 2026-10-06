@@ -38,6 +38,8 @@ def main() -> int:
     report["diffusers"] = diffusers.__version__
     report["transformers"] = transformers.__version__
     try:
+        if os.environ.get("MODEL_CACHE_PROVIDER") == "r2":
+            _sync_r2(mount)
         local = prepare_generation(mount, snapshot_download)
     except cache_error as exc:
         report["error"] = "MODEL_CACHE_NOT_READY"
@@ -99,6 +101,20 @@ def _cache_api():
         spec.loader.exec_module(module)
         return module.prepare_generation, module.ModelCacheNotReady, module.MOUNT_PATH
     return prepare_generation, ModelCacheNotReady, MOUNT_PATH
+
+
+def _sync_r2(mount: Path) -> None:
+    try:
+        from media_engine.engines.image.r2_cache import sync_from_env
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("phase2d_r2_cache", "/workspace/r2_cache.py")
+        if spec is None or spec.loader is None:
+            raise
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sync_from_env = module.sync_from_env
+    sync_from_env(mount)
 
 
 def download_progress_snapshot(cache: Path) -> dict[str, object]:

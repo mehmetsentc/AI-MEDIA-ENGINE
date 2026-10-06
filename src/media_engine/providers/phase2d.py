@@ -33,6 +33,7 @@ from media_engine.engines.image.qwen import (
     sha256_hex,
 )
 from media_engine.engines.image.model_cache import GENERATE, MOUNT_PATH, __file__ as _CACHE_FILE
+from media_engine.engines.image.r2_cache import __file__ as _R2_FILE
 from media_engine.engines.image.qwen_remote import __file__ as _REMOTE_FILE
 from media_engine.providers.base import OBSERVE_FOREIGN, OBSERVE_GONE, OBSERVE_PRESENT, OBSERVE_UNKNOWN
 from media_engine.providers.offers import GpuOffer, model_key
@@ -1039,6 +1040,7 @@ def run_ssh_runtime(
         raise Phase2DStop("SSH_NOT_READY")
     for command, data, timeout in (
         ("mkdir -p /workspace && cat > /workspace/model_cache.py", Path(_CACHE_FILE).read_bytes(), 60),
+        ("cat > /workspace/r2_cache.py", Path(_R2_FILE).read_bytes(), 60),
         ("cat > /workspace/phase2d_gen.py", script, 60),
         ("cat > /workspace/phase2d_job.json", job, 30),
     ):
