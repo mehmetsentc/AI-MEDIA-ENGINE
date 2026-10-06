@@ -16,6 +16,8 @@ class GpuRequirements:
     gpu_count: Optional[int] = None
     gpu_model: Optional[str] = None
     offer_id: Optional[str] = None
+    allocated_storage_gb: Optional[int] = None
+    sort_by_hourly: bool = False
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,8 @@ class GpuOffer:
     disk_gb: Optional[Decimal] = None
     location: Optional[str] = None
     availability: Optional[str] = None
+    gpu_hourly_price_usd: Optional[Decimal] = None
+    storage_price_per_gb_month: Optional[Decimal] = None
 
     def as_dict(self) -> dict[str, object]:
         return {

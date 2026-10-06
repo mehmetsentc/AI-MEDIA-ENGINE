@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -52,7 +53,10 @@ MAX_LIFETIME_SECONDS = 1800
 MAX_CREATE_ATTEMPTS = 1
 OWNER = "phase2d"
 INSTANCE_IMAGE = "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime"
-DISK_GB = 100
+# 54 GB weights, 10 GB image and Python packages, 16 GB cache and unpack headroom.
+DISK_GB = 80
+# Vast storage_cost is $/GB/month. Live search.diskHour equals storage_cost * GB / 720.
+HOURS_PER_STORAGE_MONTH = Decimal(720)
 RUNTYPE = "ssh"
 
 
@@ -74,6 +78,7 @@ def policy_fields() -> dict[str, str]:
         "max_create_attempts": str(MAX_CREATE_ATTEMPTS),
         "max_gpu_workers": "1",
         "max_estimated_gpu_cost_usd": "0.20",
+        "disk_gb": str(DISK_GB),
     }
 
 
@@ -92,7 +97,7 @@ def format_policy() -> str:
     for key in (
         "provider", "gpu_model", "min_vram_gb", "gpu_count", "min_reliability",
         "max_hourly_price_usd", "max_gpu_lifetime_seconds", "max_create_attempts",
-        "max_gpu_workers", "max_estimated_gpu_cost_usd",
+        "max_gpu_workers", "max_estimated_gpu_cost_usd", "disk_gb",
     ):
         lines.append(f"{key}: {fields[key]}")
     lines.append("POLICY FINGERPRINT: " + policy_fingerprint())
@@ -129,7 +134,41 @@ def preconditions(env: Mapping[str, str]) -> str:
     return key
 
 
-def accept_offer(offer: GpuOffer) -> None:
+def storage_hourly_usd(storage_per_gb_month: Decimal, disk_gb: int) -> Decimal:
+    return storage_per_gb_month * Decimal(disk_gb) / HOURS_PER_STORAGE_MONTH
+
+
+def quote_all_in(offer: GpuOffer, disk_gb: int = DISK_GB) -> Optional[tuple[Decimal, Decimal, Decimal]]:
+    """Return GPU hourly, storage hourly, and total hourly for this disk allocation.
+
+    storage_cost of zero or missing cannot prove a total, so the quote is refused.
+    """
+    gpu = offer.gpu_hourly_price_usd
+    monthly = offer.storage_price_per_gb_month
+    if gpu is None or monthly is None or monthly <= 0 or gpu < 0:
+        return None
+    if offer.disk_gb is None or offer.disk_gb < disk_gb:
+        return None
+    storage = storage_hourly_usd(monthly, disk_gb)
+    total = gpu + storage
+    if offer.hourly_price_usd > total:
+        total = offer.hourly_price_usd
+    return gpu, storage, total
+
+
+def projected_max_cost(total_hourly: Decimal, seconds: int = MAX_LIFETIME_SECONDS) -> Decimal:
+    return max_estimated_gpu_cost(total_hourly, seconds)
+
+
+def budget_status(total_hourly: Decimal, *, seconds: int = MAX_LIFETIME_SECONDS) -> Optional[str]:
+    if total_hourly > MAX_HOURLY_USD:
+        return "PRICE_ABOVE_CEILING"
+    if projected_max_cost(total_hourly, seconds) > MAX_ESTIMATED_COST_USD:
+        return "COST_ABOVE_CEILING"
+    return None
+
+
+def accept_offer(offer: GpuOffer) -> GpuOffer:
     if offer.provider != "vast":
         raise Phase2DStop("OFFER_MISMATCH")
     if model_key(offer.gpu_model) != model_key(APPROVED_GPU_MODEL):
@@ -140,18 +179,35 @@ def accept_offer(offer: GpuOffer) -> None:
         raise Phase2DStop("OFFER_MISMATCH")
     if offer.availability not in (None, "rentable"):
         raise Phase2DStop("OFFER_GONE")
-    cost = max_estimated_gpu_cost(offer.hourly_price_usd, MAX_LIFETIME_SECONDS)
-    if offer.hourly_price_usd > MAX_HOURLY_USD:
-        raise Phase2DStop("PRICE_ABOVE_CEILING")
-    if cost > MAX_ESTIMATED_COST_USD:
-        raise Phase2DStop("COST_ABOVE_CEILING")
+    quote = quote_all_in(offer, DISK_GB)
+    if quote is None:
+        raise Phase2DStop("PRICE_UNPROVEN")
+    _gpu, _storage, total = quote
+    status = budget_status(total)
+    if status is not None:
+        raise Phase2DStop(status)
+    return replace(offer, hourly_price_usd=total)
 
 
 def select_one(offers: list[GpuOffer]) -> GpuOffer:
-    selected = plan(offers, policy_requirements()).selected
+    eligible: list[GpuOffer] = []
+    failures: list[str] = []
+    for offer in offers:
+        try:
+            eligible.append(accept_offer(offer))
+        except Phase2DStop as exc:
+            failures.append(exc.code)
+    if not eligible:
+        if failures and all(code == "PRICE_UNPROVEN" for code in failures):
+            raise Phase2DStop("PRICE_UNPROVEN")
+        if failures and all(code == "PRICE_ABOVE_CEILING" for code in failures):
+            raise Phase2DStop("PRICE_ABOVE_CEILING")
+        if failures and all(code == "COST_ABOVE_CEILING" for code in failures):
+            raise Phase2DStop("COST_ABOVE_CEILING")
+        raise Phase2DStop("OFFER_GONE")
+    selected = plan(eligible, policy_requirements()).selected
     if selected is None:
         raise Phase2DStop("OFFER_GONE")
-    accept_offer(selected)
     return selected
 
 
@@ -180,7 +236,11 @@ def run_phase2d(
     requirements = policy_requirements()
     try:
         offers = VastDiscovery(transport=search_transport).search(
-            requirements.to_search(gpu_model=APPROVED_GPU_MODEL),
+            replace(
+                requirements.to_search(gpu_model=APPROVED_GPU_MODEL),
+                allocated_storage_gb=DISK_GB,
+                sort_by_hourly=True,
+            ),
             api_key=key,
             read_only=True,
             limit=64,

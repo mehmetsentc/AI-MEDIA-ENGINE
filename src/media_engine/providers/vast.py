@@ -125,6 +125,10 @@ def _query(requirements: GpuRequirements, limit: int) -> dict:
         if not requirements.offer_id.isdigit():
             raise VastDiscoveryError("offer id must be numeric")
         query["id"] = {"eq": int(requirements.offer_id)}
+    if requirements.allocated_storage_gb is not None:
+        query["allocated_storage"] = requirements.allocated_storage_gb
+    if requirements.sort_by_hourly:
+        query["order"] = [["dph_total", "asc"]]
     return query
 
 
@@ -183,6 +187,8 @@ def _one(row: object) -> Optional[GpuOffer]:
         disk_gb=_decimal(row.get("disk_space")),
         location=row.get("geolocation") if isinstance(row.get("geolocation"), str) else None,
         availability="rentable" if rentable is True else "unavailable",
+        gpu_hourly_price_usd=_decimal(row.get("dph_base")),
+        storage_price_per_gb_month=_decimal(row.get("storage_cost")),
     )
 
 

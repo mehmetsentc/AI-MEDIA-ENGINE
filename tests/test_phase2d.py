@@ -15,15 +15,24 @@ from media_engine.engines.image.base import ImageEngineError
 from media_engine.engines.image.qwen import FIRST_PROMPT, FIRST_SEED, QwenImageEngine, validate_png
 from media_engine.providers.offers import GpuOffer
 from media_engine.providers.phase2d import (
+    DISK_GB,
+    HOURS_PER_STORAGE_MONTH,
+    MAX_ESTIMATED_COST_USD,
+    MAX_HOURLY_USD,
     Phase2DStop,
     accept_offer,
     attach_ssh_key,
+    budget_status,
     fingerprint_for,
     format_policy,
     policy_fields,
     policy_fingerprint,
+    projected_max_cost,
+    quote_all_in,
     run_phase2d,
+    select_one,
     ssh_attach_allowed,
+    storage_hourly_usd,
 )
 from media_engine.resources.ledger import ResourceRecord, ResourceState
 from media_engine.usage import UsageStore
@@ -58,7 +67,10 @@ def _row(**overrides) -> dict:
         "gpu_name": "RTX 5090",
         "num_gpus": 1,
         "gpu_ram": 32607,
-        "dph_total": "0.20",
+        "dph_base": "0.20",
+        "dph_total": "0.20222222222222222",
+        "storage_cost": "0.10",
+        "disk_space": "500",
         "reliability2": "0.99",
         "dlperf": "80",
         "rentable": True,
@@ -70,7 +82,10 @@ def _row(**overrides) -> dict:
 def _gpu(**kwargs) -> GpuOffer:
     values = dict(
         provider="vast", offer_id="200", gpu_model="RTX 5090", gpu_count=1,
-        vram_gb=Decimal("32"), hourly_price_usd=Decimal("0.20"),
+        vram_gb=Decimal("32"), hourly_price_usd=Decimal("0.20222222222222222"),
+        gpu_hourly_price_usd=Decimal("0.20"),
+        storage_price_per_gb_month=Decimal("0.10"),
+        disk_gb=Decimal("500"),
         reliability=Decimal("0.99"), performance=Decimal("80"), availability="rentable",
     )
     values.update(kwargs)
@@ -135,6 +150,7 @@ class Phase2DTests(unittest.TestCase):
         self.assertIn("PHASE 2D POLICY", text)
         self.assertIn("max_gpu_lifetime_seconds: 1800", text)
         self.assertIn("max_estimated_gpu_cost_usd: 0.20", text)
+        self.assertIn("disk_gb: 80", text)
         self.assertIn("POLICY FINGERPRINT: " + policy_fingerprint(), text)
 
     def test_missing_approval_does_not_touch_transport(self) -> None:
@@ -147,7 +163,7 @@ class Phase2DTests(unittest.TestCase):
 
     def test_price_and_reliability_stop_before_create(self) -> None:
         with self.assertRaises(Phase2DStop) as caught:
-            accept_offer(_gpu(hourly_price_usd=Decimal("0.41")))
+            accept_offer(_gpu(hourly_price_usd=Decimal("0.41"), gpu_hourly_price_usd=Decimal("0.41")))
         self.assertEqual(caught.exception.code, "PRICE_ABOVE_CEILING")
         with self.assertRaises(Phase2DStop) as caught:
             accept_offer(_gpu(reliability=Decimal("0.97")))
@@ -156,6 +172,77 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("OFFER_GONE", text)
         self.assertNotIn("PUT", [method for method, _url in self.calls])
+
+    def test_gpu_plus_disk_above_ceiling_is_rejected_before_create(self) -> None:
+        monthly = Decimal("0.20")
+        gpu = Decimal("0.39")
+        bundled = gpu + storage_hourly_usd(monthly, 8)
+        self.assertLess(gpu, MAX_HOURLY_USD)
+        self.assertLess(bundled, MAX_HOURLY_USD)
+        quote = quote_all_in(_gpu(
+            hourly_price_usd=bundled,
+            gpu_hourly_price_usd=gpu,
+            storage_price_per_gb_month=monthly,
+        ))
+        self.assertIsNotNone(quote)
+        _gpu_price, storage, total = quote
+        self.assertEqual(storage, storage_hourly_usd(monthly, DISK_GB))
+        self.assertGreater(total, MAX_HOURLY_USD)
+        self.assertGreater(projected_max_cost(total), MAX_ESTIMATED_COST_USD)
+        row = _row(
+            dph_base=str(gpu),
+            dph_total=str(bundled),
+            storage_cost=str(monthly),
+        )
+        code, text = self._run(self._machine(offers=[row]))
+        self.assertEqual(code, 3)
+        self.assertIn("PRICE_ABOVE_CEILING", text)
+        self.assertNotIn("PUT", [method for method, _url in self.calls])
+
+    def test_gpu_plus_disk_within_ceiling_is_eligible(self) -> None:
+        accepted = accept_offer(_gpu())
+        quote = quote_all_in(_gpu())
+        self.assertEqual(accepted.hourly_price_usd, quote[2])
+        self.assertIsNone(budget_status(accepted.hourly_price_usd))
+        self.assertLess(accepted.hourly_price_usd, MAX_HOURLY_USD)
+
+    def test_lifetime_cost_gate_is_independent_of_the_hourly_ceiling(self) -> None:
+        self.assertEqual(
+            budget_status(Decimal("0.30"), seconds=3600),
+            "COST_ABOVE_CEILING",
+        )
+        self.assertIsNone(budget_status(Decimal("0.30"), seconds=1800))
+        self.assertGreater(projected_max_cost(Decimal("0.41")), MAX_ESTIMATED_COST_USD)
+
+    def test_missing_or_zero_storage_price_is_unproven(self) -> None:
+        self.assertIsNone(quote_all_in(_gpu(storage_price_per_gb_month=None)))
+        self.assertIsNone(quote_all_in(_gpu(storage_price_per_gb_month=Decimal("0"))))
+        with self.assertRaises(Phase2DStop) as caught:
+            accept_offer(_gpu(storage_price_per_gb_month=None))
+        self.assertEqual(caught.exception.code, "PRICE_UNPROVEN")
+        code, text = self._run(self._machine(offers=[_row(storage_cost="0")]))
+        self.assertEqual(code, 3)
+        self.assertIn("PRICE_UNPROVEN", text)
+        self.assertNotIn("PUT", [method for method, _url in self.calls])
+
+    def test_ranking_uses_total_hourly_not_gpu_price_alone(self) -> None:
+        cheap_gpu = _gpu(
+            offer_id="1",
+            hourly_price_usd=Decimal("0.11"),
+            gpu_hourly_price_usd=Decimal("0.10"),
+            storage_price_per_gb_month=Decimal("0.50"),
+            performance=Decimal("10"),
+        )
+        costly_gpu = _gpu(
+            offer_id="2",
+            hourly_price_usd=Decimal("0.21"),
+            gpu_hourly_price_usd=Decimal("0.20"),
+            storage_price_per_gb_month=Decimal("0.10"),
+            performance=Decimal("20"),
+        )
+        selected = select_one([cheap_gpu, costly_gpu])
+        self.assertEqual(selected.offer_id, "2")
+        self.assertEqual(selected.hourly_price_usd, quote_all_in(costly_gpu)[2])
 
     def test_one_create_one_png_one_destroy(self) -> None:
         code, text = self._run(self._machine())
@@ -288,10 +375,12 @@ class Phase2DTests(unittest.TestCase):
             self.calls.append((method, url))
             self.assertNotIn(b"unit-test-vast-secret", body)
             if method == "POST":
+                self.assertIn(b'"allocated_storage":80', body)
+                self.assertIn(b'"order":[["dph_total","asc"]]', body)
                 return json.dumps({"offers": offers if offers is not None else [_row()]}).encode("utf-8")
             if method == "PUT":
                 self.assertIn(b'"runtype":"ssh"', body)
-                self.assertIn(b'"disk":100', body)
+                self.assertIn(b'"disk":80', body)
                 self.assertIn(b"pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime", body)
                 self.assertIn(b"media-engine:phase2d", body)
                 return b'{"new_contract": 555}'
