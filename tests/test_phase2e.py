@@ -28,6 +28,7 @@ from media_engine.providers.vast_image import (
     _RUNTIME_INSTALL,
     _generate_command,
     choose_offer,
+    cold_stage_allowed,
     VastImageProvider,
 )
 from media_engine.safety.limits import SafetyLimits, limits_from_env
@@ -421,20 +422,20 @@ class Phase2ETests(unittest.TestCase):
         self.assertEqual(choice.disk_gb, 40)
 
     def test_cold_stage_when_warm_machine_is_not_rentable(self) -> None:
+        os.environ["MEDIA_ENGINE_ALLOW_COLD_STAGE"] = "true"
         os.environ["R2_ENDPOINT"] = "https://example.invalid"
         os.environ["R2_BUCKET"] = "cache"
         os.environ["R2_ACCESS_KEY_ID"] = "fixture"
         os.environ["R2_SECRET_ACCESS_KEY"] = "fixture"
         self.addCleanup(lambda: [os.environ.pop(name, None) for name in (
+            "MEDIA_ENGINE_ALLOW_COLD_STAGE",
             "R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
         )])
         cold = _offer(21, "A40", 151326, inet_down=2000, disk_space=400, dph_base="0.40")
         responses = [
             (200, json.dumps({"volumes": [{"id": VOLUME_ID, "machine_id": MACHINE_ID}]}).encode()),
-            (200, json.dumps({"offers": [
-                _offer(1, "RTX A6000", MACHINE_ID, rentable=False),
-                cold,
-            ]}).encode()),
+            (200, json.dumps({"offers": [_offer(1, "RTX A6000", MACHINE_ID, rentable=False)]}).encode()),
+            (200, json.dumps({"offers": [cold]}).encode()),
             (200, json.dumps({"success": True, "new_contract": 91}).encode()),
         ]
         calls: list[tuple[str, str, bytes]] = []
@@ -449,7 +450,7 @@ class Phase2ETests(unittest.TestCase):
         self.assertEqual(provider.machine_id, "151326")
         self.assertLessEqual(provider.projected_cost_usd, Decimal("1.00"))
         provider.create("nahaber")
-        sent = json.loads(calls[2][2].decode("utf-8"))
+        sent = json.loads(calls[3][2].decode("utf-8"))
         self.assertNotIn("volume_info", sent)
         self.assertEqual(sent["disk"], COLD_DISK_GB)
         self.assertIn("qwen_remote.py cache-sync", _R2_SYNC)
@@ -463,6 +464,64 @@ class Phase2ETests(unittest.TestCase):
     def test_slow_link_is_rejected_when_the_copy_would_exceed_the_budget(self) -> None:
         choice = choose_offer(
             [_offer(3, "RTX A6000", 139301, inet_down=20, disk_space=400, dph_base="0.32")],
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=Decimal("0.60"),
+            operation_budget=Decimal("1.00"),
+            allow_cold_stage=True,
+        )
+        self.assertIsNone(choice)
+
+    def test_default_request_never_cold_stages(self) -> None:
+        os.environ.pop("MEDIA_ENGINE_ALLOW_COLD_STAGE", None)
+        self.assertFalse(cold_stage_allowed())
+        choice = choose_offer(
+            [
+                _offer(1, "RTX A6000", MACHINE_ID, rentable=False),
+                _offer(21, "A40", 151326, inet_down=8000, disk_space=400, dph_base="0.20"),
+            ],
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=Decimal("0.60"),
+            operation_budget=Decimal("1.00"),
+        )
+        self.assertIsNone(choice)
+        responses = [
+            (200, json.dumps({"volumes": [{"id": VOLUME_ID, "machine_id": MACHINE_ID}]}).encode()),
+            (200, json.dumps({"offers": [_offer(1, "A40", MACHINE_ID, rentable=False)]}).encode()),
+        ]
+        calls: list[str] = []
+
+        def transport(method, url, body, headers):
+            calls.append(method)
+            return responses.pop(0)
+
+        provider = VastImageProvider(api_key="fixture-key", transport=transport, now=self.clock.now, sleep=lambda _s: None)
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.quote("nahaber")
+        self.assertEqual(caught.exception.code, "PROVIDER_CAPACITY_UNAVAILABLE")
+        self.assertNotIn("PUT", calls)
+
+    def test_any_compatible_gpu_on_the_warm_machine_is_attached(self) -> None:
+        choice = choose_offer(
+            [
+                _offer(9, "A40", 999, inet_down=8000, disk_space=400, dph_base="0.15"),
+                _offer(8, "A40", MACHINE_ID, dph_base="0.45"),
+            ],
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=Decimal("0.60"),
+            operation_budget=Decimal("1.00"),
+        )
+        self.assertIsNotNone(choice)
+        assert choice is not None
+        self.assertEqual(choice.source, "warm_cache")
+        self.assertEqual(choice.machine_id, MACHINE_ID)
+        self.assertEqual(choice.offer_id, "8")
+
+    def test_warm_gpu_above_the_hourly_ceiling_is_not_rented(self) -> None:
+        choice = choose_offer(
+            [_offer(8, "A40", MACHINE_ID, dph_base="0.70")],
             volume_machine=MACHINE_ID,
             volume_ready=True,
             max_hourly=Decimal("0.60"),

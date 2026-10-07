@@ -14,7 +14,7 @@ from pathlib import Path
 from media_engine.api.app import LocalAPIServer
 from media_engine.engines.image.qwen import validate_png
 from media_engine.orchestrator.controller import MediaController, WallClock
-from media_engine.providers.vast_image import MACHINE_ID, VOLUME_ID, VastImageProvider
+from media_engine.providers.vast_image import MACHINE_ID, VOLUME_ID, VastImageProvider, cold_stage_allowed
 from media_engine.safety.limits import SafetyLimits, limits_from_env
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -23,7 +23,7 @@ PROMPT = (
     "palm trees, warm ambient lighting, sea in the background, premium travel photography, "
     "photorealistic, high detail, natural colors, no logos, no readable text"
 )
-CAP = Decimal("1.00")
+CAP = Decimal("0.30")
 
 
 def _api_key() -> str:
@@ -91,7 +91,8 @@ def _load_r2() -> None:
 def main() -> int:
     if os.environ.get("PHASE2E_ACCEPTANCE") != "1":
         return 2
-    _load_r2()
+    if cold_stage_allowed():
+        _load_r2()
     vast_key = _api_key()
     token = os.environ.get("AI_MEDIA_ENGINE_API_KEY", "").strip() or hashlib.sha256(os.urandom(32)).hexdigest()
     limits = limits_from_env(SafetyLimits(live_external_providers=True, max_gpu_workers=1, max_job_attempts=1))
@@ -124,7 +125,7 @@ def main() -> int:
             return 3
         _health_status, health = _local(server, "GET", "/health", token)
         report["health"] = health if isinstance(health, dict) else {}
-        deadline = time.time() + 7000
+        deadline = time.time() + 1800
         done = {}
         while time.time() < deadline:
             _status, done = _local(server, "GET", "/v1/jobs/" + report["job_id"], token)
@@ -142,7 +143,10 @@ def main() -> int:
             return 5
         report["job"] = {key: done.get(key) for key in ("job_id", "status", "error_code", "artifact_id", "width", "height", "seed", "sha256", "progress")}
         if done.get("status") != "completed":
-            report["state"] = str(done.get("error_code") or "FAILED")
+            code = str(done.get("error_code") or "FAILED")
+            if code == "PROVIDER_CAPACITY_UNAVAILABLE" and not cold_stage_allowed():
+                code = "WARM_CACHE_CAPACITY_UNAVAILABLE"
+            report["state"] = code
             return 6
         status, png = _local(server, "GET", "/v1/artifacts/" + done["artifact_id"], token)
         if status != 200 or not isinstance(png, (bytes, bytearray)):
@@ -160,7 +164,8 @@ def main() -> int:
         report["state"] = "IMAGE_API_MVP_COMPLETE"
         return 0
     finally:
-        report["instance_id"] = provider._resource_id
+        report["instance_id"] = provider.last_instance_id or provider._resource_id
+        report["cold_stage_default"] = not cold_stage_allowed()
         report["gpu"] = provider.gpu_model
         report["hourly"] = str(provider.hourly_amount)
         report["cache_source"] = provider.cache_source

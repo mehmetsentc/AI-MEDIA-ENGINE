@@ -113,6 +113,7 @@ class VastImageProvider(GPUProvider):
         self.projected_cost_usd = Decimal("0")
         self.transfer_seconds = None
         self.transfer_mb_per_sec = None
+        self.last_instance_id = ""
         self._put_done = False
         self._owner = ""
         self._label = ""
@@ -175,6 +176,7 @@ class VastImageProvider(GPUProvider):
                 outcome, instance_id = "created", found[0]
         if outcome == "created" and instance_id:
             self._resource_id = instance_id
+            self.last_instance_id = instance_id
             self._owner = owner
             self._label = label
             self._started_at[instance_id] = self._now()
@@ -338,30 +340,52 @@ class VastImageProvider(GPUProvider):
         return int(row.get("machine_id") or 0) == int(self.machine_id)
 
     def _select_offer(self) -> Optional["ImageChoice"]:
-        status, raw = self._request("POST", BUNDLES, {
-            "limit": 64,
-            "type": "on-demand",
-            "rentable": {"eq": True},
-            "num_gpus": {"eq": 1},
-            "gpu_ram": {"gte": MIN_VRAM_MIB},
-            "order": [["dph_total", "asc"]],
-        })
-        if status != 200:
-            return None
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            return None
-        offers = payload.get("offers") if isinstance(payload, dict) else None
-        if not isinstance(offers, list):
-            return None
-        return choose_offer(
-            offers,
+        # 1. An already-running worker is reused by the controller.
+        # 2. A rentable GPU on the warm-cache machine.
+        # 3. Another provider can be added later.
+        # 4. R2 cold stage only when MEDIA_ENGINE_ALLOW_COLD_STAGE is set.
+        warm = choose_offer(
+            self._bundle_offers({
+                "limit": 16,
+                "type": "on-demand",
+                "num_gpus": {"eq": 1},
+                "machine_id": {"eq": MACHINE_ID},
+                "gpu_ram": {"gte": MIN_VRAM_MIB},
+            }),
             volume_machine=MACHINE_ID,
             volume_ready=True,
             max_hourly=self.limits.max_hourly_price_usd,
             operation_budget=OPERATION_BUDGET_USD,
+            allow_cold_stage=False,
         )
+        if warm is not None or not cold_stage_allowed():
+            return warm
+        return choose_offer(
+            self._bundle_offers({
+                "limit": 64,
+                "type": "on-demand",
+                "rentable": {"eq": True},
+                "num_gpus": {"eq": 1},
+                "gpu_ram": {"gte": MIN_VRAM_MIB},
+                "order": [["dph_total", "asc"]],
+            }),
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=self.limits.max_hourly_price_usd,
+            operation_budget=OPERATION_BUDGET_USD,
+            allow_cold_stage=True,
+        )
+
+    def _bundle_offers(self, query: dict) -> list:
+        status, raw = self._request("POST", BUNDLES, query)
+        if status != 200:
+            return []
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return []
+        offers = payload.get("offers") if isinstance(payload, dict) else None
+        return offers if isinstance(offers, list) else []
 
     def _stage_r2(self) -> None:
         from media_engine.engines.image import model_cache, qwen_remote, r2_cache
@@ -509,6 +533,12 @@ def supports_bf16(name: str) -> bool:
     return any(token in compact for token in allowed)
 
 
+def cold_stage_allowed() -> bool:
+    """Cold copy is off unless an operator sets MEDIA_ENGINE_ALLOW_COLD_STAGE."""
+    value = os.environ.get("MEDIA_ENGINE_ALLOW_COLD_STAGE", "").strip().casefold()
+    return value in {"1", "true", "yes"}
+
+
 def _r2_configured() -> bool:
     return all(os.environ.get(name) for name in (
         "R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
@@ -531,8 +561,9 @@ def choose_offer(
     volume_ready: bool,
     max_hourly: Decimal,
     operation_budget: Decimal,
+    allow_cold_stage: bool = False,
 ) -> Optional[ImageChoice]:
-    """Prefer the warm-cache machine. Otherwise the cheapest cold copy that fits."""
+    """Use the warm-cache machine. A cold copy is only considered when policy allows it."""
     warm: list[ImageChoice] = []
     cold: list[ImageChoice] = []
     for row in offers:
@@ -584,13 +615,17 @@ def choose_offer(
             reliability=reliability,
         )
         (warm if on_warm else cold).append(choice)
-    pool = warm or cold
+    affordable = [item for item in warm if item.hourly <= max_hourly]
+    if affordable:
+        affordable.sort(key=lambda item: (item.hourly, -item.reliability))
+        return affordable[0]
+    if not allow_cold_stage:
+        return None
+    pool = [item for item in cold if item.hourly <= max_hourly] or cold
     if not pool:
         return None
-    under = [item for item in pool if item.hourly <= max_hourly]
-    ranked = under or pool
-    ranked.sort(key=lambda item: (item.projected_cost, -item.reliability))
-    return ranked[0]
+    pool.sort(key=lambda item: (item.projected_cost, -item.reliability))
+    return pool[0]
 
 
 def _hourly(row: dict, disk_gb: int) -> Decimal:

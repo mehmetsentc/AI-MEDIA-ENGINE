@@ -110,12 +110,10 @@ Poll `GET /v1/jobs/{job_id}` until `completed` or `failed`. A completed job
 includes `artifact_id`, dimensions, `seed`, and `sha256`. Fetch the PNG from
 `GET /v1/artifacts/{artifact_id}`.
 
-The image worker keeps one Vast GPU. When machine 47281 is rentable it
-attaches the warm cache volume 54653022 at `/models`. Otherwise it rents
-another compatible GPU and copies the completed cache from R2 onto local
-disk before loading the model. An idle worker is destroyed after 300
-seconds. The hard lifetime defaults to 1800 seconds.
-`MEDIA_ENGINE_MAX_GPU_HOURLY_USD` defaults to 0.60. A higher hourly rate is
-used only when the projected copy, load, and one image stay within the
-operation budget.
+The image worker keeps one Vast GPU. It reuses a healthy worker, then rents
+any compatible GPU on machine 47281 and attaches cache volume 54653022 at
+`/models`. Copying the cache from R2 is off unless
+`MEDIA_ENGINE_ALLOW_COLD_STAGE` is set. An idle worker is destroyed after
+300 seconds. The hard lifetime defaults to 1800 seconds.
+`MEDIA_ENGINE_MAX_GPU_HOURLY_USD` defaults to 0.60.
 `negative_prompt` is rejected because the Qwen path does not apply it.
