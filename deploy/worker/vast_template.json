@@ -1,0 +1,49 @@
+{
+  "name": "ai-media-engine-image-worker",
+  "description": "Runtime-only Vast template. Model weights are not in the image.",
+  "image": "ai-media-engine-image-worker:runtime",
+  "image_env": "MEDIA_ENGINE_WORKER_IMAGE",
+  "runtype": "ssh",
+  "ssh": true,
+  "jupyter": false,
+  "disk_gb": {
+    "warm_cache": 40,
+    "r2_cold_stage": 140
+  },
+  "env": {
+    "HF_HOME": "/models/hf-cache",
+    "HUGGINGFACE_HUB_CACHE": "/models/hf-cache",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1"
+  },
+  "onstart": "",
+  "python": "3.12",
+  "preinstalled": [
+    "torch==2.11.0+cu128",
+    "diffusers==0.41.0",
+    "transformers==5.19.0",
+    "accelerate==1.15.0",
+    "safetensors==0.8.0",
+    "pillow"
+  ],
+  "worker_code": [
+    "/workspace/qwen_remote.py",
+    "/workspace/model_cache.py",
+    "/workspace/r2_cache.py"
+  ],
+  "runtime_marker": "/opt/ai-media-engine/runtime-ready",
+  "model_weights_baked": false,
+  "model_mount": "/models",
+  "warm_volume": {
+    "id": 54653022,
+    "machine_id": 47281,
+    "attach": "only when the selected offer is on machine 47281"
+  },
+  "create_fields": {
+    "image": "${MEDIA_ENGINE_WORKER_IMAGE}",
+    "disk": "40 on the warm machine, else 140",
+    "runtype": "ssh",
+    "label": "media-engine:{owner}"
+  }
+}

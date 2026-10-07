@@ -244,6 +244,8 @@ class Phase2ETests(unittest.TestCase):
             "runtime": "RUNTIME_PREPARE_FAILED",
             "cache": "MODEL_CACHE_INVALID",
             "load": "MODEL_LOAD_FAILED",
+            "connect": "CONNECT_TIMEOUT",
+            "cache_stall": "CACHE_STALL",
         }
         for stage, code in cases.items():
             provider = FakeGPUProvider(self.clock.now)

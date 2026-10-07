@@ -34,6 +34,7 @@ from media_engine.providers.base import (
     WorkerStageError,
 )
 from media_engine.providers.phase2d import INSTANCE_IMAGE
+from media_engine.providers.phase_clock import PHASE_LIMITS, PhaseWatch, note_transfer_text
 from media_engine.providers.vast_lifecycle import classify_create_response, instances_list_url, ownership_label
 from media_engine.safety.limits import SafetyLimits
 
@@ -46,6 +47,7 @@ COLD_DISK_GB = 140
 MIN_VRAM_MIB = 44 * 1024
 OPERATION_BUDGET_USD = Decimal("1.00")
 OVERHEAD_SECONDS = 600
+GENERATE_ALLOWANCE_SECONDS = 180
 # Planning rate is a quarter of the advertised download, between the slow
 # and fast transfers already measured on Vast.
 LINE_FRACTION = 0.25
@@ -113,6 +115,8 @@ class VastImageProvider(GPUProvider):
         self.projected_cost_usd = Decimal("0")
         self.transfer_seconds = None
         self.transfer_mb_per_sec = None
+        self.runtime_ready = False
+        self.cost_before_generation_usd = Decimal("0")
         self.last_instance_id = ""
         self._put_done = False
         self._owner = ""
@@ -142,6 +146,7 @@ class VastImageProvider(GPUProvider):
         self.cache_source = chosen.source
         self.disk_gb = chosen.disk_gb
         self.projected_cost_usd = chosen.projected_cost
+        self.cost_before_generation_usd = chosen.cost_before_generation
         self.fits_operation_budget = chosen.projected_cost <= OPERATION_BUDGET_USD
         if chosen.source == "r2_cold_stage" and not _r2_configured():
             raise WorkerStageError("MODEL_CACHE_INVALID")
@@ -156,7 +161,7 @@ class VastImageProvider(GPUProvider):
         label = ownership_label(owner)
         body = {
             "label": label,
-            "image": INSTANCE_IMAGE,
+            "image": worker_image(),
             "disk": self.disk_gb,
             "runtype": "ssh",
             "cancel_unavail": True,
@@ -258,7 +263,12 @@ class VastImageProvider(GPUProvider):
         worker = getattr(self, "_worker_ssh", None)
         if worker is not None and self._host and self._port:
             worker.stage(self._host, self._port)
-        code, _out, _err = self._remote(_RUNTIME_INSTALL, 900)
+        code, out, _err = self._remote(_RUNTIME_READY, 60, "RUNTIME_TIMEOUT")
+        if code == 0 and "RUNTIME_READY" in out:
+            self.runtime_ready = True
+            return
+        limit = int(PHASE_LIMITS["runtime_preparing"][0])
+        code, _out, _err = self._remote(_RUNTIME_INSTALL, limit, "RUNTIME_TIMEOUT")
         if code != 0:
             raise WorkerStageError("RUNTIME_PREPARE_FAILED")
 
@@ -268,7 +278,8 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("MODEL_LOAD_FAILED")
 
     def generate(self, *, prompt: str, width: int, height: int, seed: int) -> bytes:
-        command = _generate_command(prompt, width, height, seed)
+        python = "python3" if getattr(self, "runtime_ready", False) else PYTHON
+        command = _generate_command(prompt, width, height, seed, python=python)
         self.commands.append(command)
         code, out, _err = self._remote(command, 900)
         if code != 0 or "PNG_READY" not in out:
@@ -277,13 +288,18 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("GENERATION_FAILED")
         return self._fetch_png()
 
-    def _remote(self, command: str, timeout: int) -> tuple[int, str, str]:
+    def _remote(
+        self,
+        command: str,
+        timeout: int,
+        timeout_code: str = "WORKER_TIMEOUT",
+    ) -> tuple[int, str, str]:
         if self._ssh_run is None:
             raise WorkerStageError("WORKER_BOOT_FAILED")
         try:
             return self._ssh_run(self._host or "worker", self._port or "22", command, timeout)
         except TimeoutError as exc:
-            raise WorkerStageError("WORKER_TIMEOUT") from exc
+            raise WorkerStageError(timeout_code) from exc
 
     def _fetch_png(self) -> bytes:
         code, out, _err = self._remote("base64 /workspace/phase2d_output.png", 120)
@@ -407,19 +423,8 @@ class VastImageProvider(GPUProvider):
             worker._copy(self._host, self._port, path, "/workspace/" + path.name)
         worker._copy(self._host, self._port, env_path, "/workspace/phase2d-r2.env")
         started = time.perf_counter()
-        code, out, _err = self._remote(_R2_SYNC, 5400)
+        self._watch_cache_sync()
         self.transfer_seconds = round(time.perf_counter() - started, 3)
-        for line in out.splitlines():
-            if not line.startswith("{"):
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "MB_per_sec" in record:
-                self.transfer_mb_per_sec = record.get("MB_per_sec")
-        if code != 0:
-            raise WorkerStageError("MODEL_CACHE_INVALID")
 
     def _instances(self) -> list[dict]:
         status, raw = self._request("GET", instances_list_url(), None)
@@ -460,14 +465,21 @@ class VastImageProvider(GPUProvider):
 
     def _attach_and_wait(self, resource_id: str) -> None:
         from media_engine.providers.vast_ssh import WorkerSSH
-        worker = WorkerSSH(self.runtime)
-        deadline = self._now() + 900
+        worker = getattr(self, "_connect_worker", None) or WorkerSSH(self.runtime)
+        watch = PhaseWatch.start("connecting", self._now())
         attached = False
-        while self._now() < deadline:
+        seen_status = ""
+        while True:
+            if watch.expired(self._now()):
+                raise WorkerStageError("CONNECT_TIMEOUT")
             row = self._instance_row(resource_id)
             if row is None:
                 raise WorkerStageError("WORKER_BOOT_FAILED")
-            if str(row.get("actual_status") or "") == "running" and not attached:
+            status_name = str(row.get("actual_status") or "")
+            if status_name != seen_status:
+                seen_status = status_name
+                watch.mark(self._now())
+            if status_name == "running" and not attached:
                 status, raw = self._request(
                     "POST", f"https://console.vast.ai/api/v0/instances/{resource_id}/ssh/",
                     {"ssh_key": worker.public_key()},
@@ -481,10 +493,16 @@ class VastImageProvider(GPUProvider):
                 if not isinstance(payload, dict) or payload.get("success") is not True:
                     raise WorkerStageError("WORKER_BOOT_FAILED")
                 attached = True
+                watch.mark(self._now())
             host = str(row.get("ssh_host") or "")
             port = "" if row.get("ssh_port") is None else str(row.get("ssh_port"))
             if attached and host and port.isdigit() and self._same_machine(row):
-                code, out, _err = worker.run(host, port, "echo ready", 40)
+                try:
+                    code, out, _err = worker.run(host, port, "echo ready", 15)
+                except WorkerStageError as exc:
+                    if exc.code != "WORKER_TIMEOUT":
+                        raise
+                    code, out = 1, ""
                 if code == 0 and "ready" in out:
                     self._host = host
                     self._port = port
@@ -492,7 +510,44 @@ class VastImageProvider(GPUProvider):
                     self._worker_ssh = worker
                     return
             self._sleep(5)
-        raise WorkerStageError("WORKER_TIMEOUT")
+
+    def _watch_cache_sync(self) -> None:
+        """Start the R2 copy, then keep it only while bytes keep moving."""
+        watch = PhaseWatch.start("cache_staging", self._now())
+        code, out, _err = self._remote(_R2_SYNC, 60, "CACHE_TIMEOUT")
+        if code != 0 or "STARTED" not in out:
+            raise WorkerStageError("MODEL_CACHE_INVALID")
+        while True:
+            _code, progress, _err = self._remote(_CACHE_PROGRESS, 30, "CACHE_TIMEOUT")
+            note_transfer_text(watch, progress, self._now())
+            if "MB_per_sec" in progress:
+                for line in progress.splitlines():
+                    if not line.strip().startswith("{"):
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict) and "MB_per_sec" in record:
+                        self.transfer_mb_per_sec = record.get("MB_per_sec")
+            _code, exit_out, _err = self._remote(_CACHE_EXIT, 30, "CACHE_TIMEOUT")
+            status = ""
+            for line in reversed(exit_out.splitlines()):
+                if line.strip():
+                    status = line.strip()
+                    break
+            if status.isdigit():
+                if status != "0":
+                    raise WorkerStageError("MODEL_CACHE_INVALID")
+                return
+            reason = watch.expired(self._now())
+            if reason == "PHASE_STALL":
+                self._remote(_CACHE_KILL, 20, "CACHE_STALL")
+                raise WorkerStageError("CACHE_STALL")
+            if reason == "PHASE_TIMEOUT":
+                self._remote(_CACHE_KILL, 20, "CACHE_TIMEOUT")
+                raise WorkerStageError("CACHE_TIMEOUT")
+            self._sleep(10)
 
 
 @dataclass(frozen=True)
@@ -506,6 +561,8 @@ class ImageChoice:
     projected_cost: Decimal
     inet_down: float
     reliability: float
+    transfer_seconds: float = 0.0
+    cost_before_generation: Decimal = Decimal("0")
 
 
 def supports_bf16(name: str) -> bool:
@@ -545,13 +602,44 @@ def _r2_configured() -> bool:
     ))
 
 
-def projected_transfer_seconds(inet_down: float) -> Optional[float]:
+def expected_transfer_seconds(inet_down: float) -> Optional[float]:
+    """Seconds to move the Qwen cache at a quarter of the advertised link."""
     if inet_down <= 0:
         return None
     mb_per_sec = (inet_down / 8.0) * LINE_FRACTION
     if mb_per_sec <= 0:
         return None
-    return (QWEN_CACHE_MIN_BYTES / (mb_per_sec * 1_000_000)) + OVERHEAD_SECONDS
+    return QWEN_CACHE_MIN_BYTES / (mb_per_sec * 1_000_000)
+
+
+def projected_transfer_seconds(inet_down: float) -> Optional[float]:
+    raw = expected_transfer_seconds(inet_down)
+    if raw is None:
+        return None
+    return raw + OVERHEAD_SECONDS
+
+
+def plan_cold_stage(hourly: Decimal, inet_down: float) -> Optional[dict[str, Decimal | float]]:
+    """Hourly rate, transfer time, pre-generation GPU cost, and total."""
+    transfer = expected_transfer_seconds(inet_down)
+    if transfer is None or hourly <= 0:
+        return None
+    before_seconds = transfer + OVERHEAD_SECONDS
+    total_seconds = before_seconds + GENERATE_ALLOWANCE_SECONDS
+    before = (hourly * Decimal(str(before_seconds)) / Decimal(3600)).quantize(Decimal("0.000001"))
+    total = (hourly * Decimal(str(total_seconds)) / Decimal(3600)).quantize(Decimal("0.000001"))
+    return {
+        "hourly": hourly,
+        "transfer_seconds": transfer,
+        "cost_before_generation": before,
+        "projected_cost": total,
+    }
+
+
+def worker_image() -> str:
+    """Published runtime image, or the stock CUDA image until one is set."""
+    configured = os.environ.get("MEDIA_ENGINE_WORKER_IMAGE", "").strip()
+    return configured or INSTANCE_IMAGE
 
 
 def choose_offer(
@@ -581,6 +669,8 @@ def choose_offer(
         on_warm = volume_ready and machine == volume_machine
         disk = WARM_DISK_GB if on_warm else COLD_DISK_GB
         inet = 0.0
+        transfer = 0.0
+        before = Decimal("0")
         if on_warm:
             seconds = float(OVERHEAD_SECONDS)
         else:
@@ -591,16 +681,23 @@ def choose_offer(
                 continue
             if free < COLD_DISK_GB:
                 continue
-            estimated = projected_transfer_seconds(inet)
-            if estimated is None:
-                continue
-            seconds = estimated
         try:
             hourly = _hourly(row, disk)
             reliability = float(row.get("reliability2") or 0)
         except (WorkerStageError, TypeError, ValueError):
             continue
-        projected = (hourly * Decimal(str(seconds)) / Decimal(3600)).quantize(Decimal("0.000001"))
+        if on_warm:
+            projected = (hourly * Decimal(str(seconds)) / Decimal(3600)).quantize(Decimal("0.000001"))
+            before = projected
+        else:
+            planned = plan_cold_stage(hourly, inet)
+            if planned is None:
+                continue
+            transfer = float(planned["transfer_seconds"])
+            before = planned["cost_before_generation"]
+            projected = planned["projected_cost"]
+            if not isinstance(before, Decimal) or not isinstance(projected, Decimal):
+                continue
         if projected > operation_budget:
             continue
         choice = ImageChoice(
@@ -613,6 +710,8 @@ def choose_offer(
             projected_cost=projected,
             inet_down=inet,
             reliability=reliability,
+            transfer_seconds=transfer,
+            cost_before_generation=before,
         )
         (warm if on_warm else cold).append(choice)
     affordable = [item for item in warm if item.hourly <= max_hourly]
@@ -697,8 +796,23 @@ set -a
 . /workspace/phase2d-r2.env
 set +a
 printf '%s\n' '{"cache_mount":"/models"}' > /workspace/phase2d_job.json
-PHASE2D_CACHE_SYNC_SECONDS=5000 python3 /workspace/qwen_remote.py cache-sync
+rm -f /workspace/cache-sync.exit /workspace/r2-sync-progress.json
+nohup sh -c 'PHASE2D_CACHE_SYNC_SECONDS=5000 python3 /workspace/qwen_remote.py cache-sync > /workspace/cache-sync.log 2>&1; echo $? > /workspace/cache-sync.exit' >/dev/null 2>&1 &
+echo $! > /workspace/cache-sync.pid
+echo STARTED
 """
+
+_CACHE_PROGRESS = "cat /workspace/r2-sync-progress.json 2>/dev/null || true"
+_CACHE_EXIT = "if [ -f /workspace/cache-sync.exit ]; then cat /workspace/cache-sync.exit; else echo RUNNING; fi"
+_CACHE_KILL = "if [ -f /workspace/cache-sync.pid ]; then kill $(cat /workspace/cache-sync.pid) >/dev/null 2>&1 || true; fi"
+
+_RUNTIME_READY = (
+    "python3 -c \""
+    "import pathlib; "
+    "p=pathlib.Path('/opt/ai-media-engine/runtime-ready'); "
+    "import torch,diffusers,transformers,accelerate,safetensors; "
+    "print('RUNTIME_READY' if p.is_file() else 'MISSING')\""
+)
 
 _RUNTIME_INSTALL = f"""
 set -eu
@@ -727,7 +841,7 @@ _IMPORT_CHECK = (
 )
 
 
-def _generate_command(prompt: str, width: int, height: int, seed: int) -> str:
+def _generate_command(prompt: str, width: int, height: int, seed: int, python: str = PYTHON) -> str:
     if width != FIRST_WIDTH or height != FIRST_HEIGHT:
         raise WorkerStageError("GENERATION_FAILED")
     job = json.dumps({
@@ -746,7 +860,7 @@ def _generate_command(prompt: str, width: int, height: int, seed: int) -> str:
         "HF_HOME=/models/hf-cache HUGGINGFACE_HUB_CACHE=/models/hf-cache "
         "PHASE2D_MODEL_LOAD_SECONDS=1200 PHASE2D_GENERATION_SECONDS=600 && "
         f"if [ ! -f /workspace/qwen_remote.py ]; then echo MISSING_REMOTE; exit 3; fi && "
-        f"{PYTHON} -u /workspace/qwen_remote.py generate && "
+        f"{python} -u /workspace/qwen_remote.py generate && "
         "python3 -c 'import struct; d=open(\"/workspace/phase2d_output.png\",\"rb\").read(); "
         "assert d[:8]==b\"\\x89PNG\\r\\n\\x1a\\n\" and len(d)>0; "
         "w,h=struct.unpack(\">II\", d[16:24]); assert (w,h)==(1024,1024); print(\"PNG_READY\", len(d))'"
