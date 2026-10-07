@@ -11,7 +11,23 @@ import time
 from pathlib import Path
 
 
+def _phase_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _write_report(report: dict) -> None:
+    Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+
 def main() -> int:
+    phase = sys.argv[1] if len(sys.argv) > 1 else "all"
     job = json.loads(Path("/workspace/phase2d_job.json").read_text(encoding="utf-8"))
     report: dict[str, object] = {
         "model_id": "Qwen/Qwen-Image",
@@ -23,6 +39,31 @@ def main() -> int:
     cache = mount / "hf-cache"
     os.environ["HF_HOME"] = str(cache)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache)
+    if phase == "cache-sync":
+        report["stage"] = "CACHE_SYNC"
+        try:
+            if os.environ.get("MODEL_CACHE_PROVIDER") == "r2":
+                _sync_r2(mount, deadline_seconds=_phase_seconds("PHASE2D_CACHE_SYNC_SECONDS", 1200))
+            else:
+                raise cache_error("INVALID")
+        except TimeoutError:
+            report["error"] = "MODEL_DOWNLOAD_FAILED"
+            report["detail"] = "CACHE_SYNC_DEADLINE"
+            _write_report(report)
+            return 1
+        except cache_error as exc:
+            report["error"] = "MODEL_CACHE_NOT_READY"
+            report["detail"] = exc.state
+            _write_report(report)
+            return 1
+        except Exception as exc:
+            report["error"] = "MODEL_CACHE_NOT_READY"
+            report["detail"] = type(exc).__name__
+            _write_report(report)
+            return 1
+        report["state"] = "COMPLETE"
+        _write_report(report)
+        return 0
     try:
         import resource
         import torch
@@ -33,57 +74,92 @@ def main() -> int:
     except Exception as exc:
         report["error"] = "IMPORT_FAILED"
         report["detail"] = type(exc).__name__
-        Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
+        _write_report(report)
         return 1
     report["torch"] = torch.__version__
     report["cuda"] = torch.version.cuda
     report["diffusers"] = diffusers.__version__
     report["transformers"] = transformers.__version__
     try:
-        if os.environ.get("MODEL_CACHE_PROVIDER") == "r2":
-            _sync_r2(mount)
+        if phase != "generate" and os.environ.get("MODEL_CACHE_PROVIDER") == "r2":
+            _sync_r2(mount, deadline_seconds=_phase_seconds("PHASE2D_CACHE_SYNC_SECONDS", 1200))
         local = prepare_generation(mount, snapshot_download)
+    except TimeoutError:
+        report["error"] = "MODEL_DOWNLOAD_FAILED"
+        report["detail"] = "CACHE_SYNC_DEADLINE"
+        _write_report(report)
+        return 1
     except cache_error as exc:
         report["error"] = "MODEL_CACHE_NOT_READY"
         report["detail"] = exc.state
-        Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
+        _write_report(report)
         return 1
     except Exception as exc:
         report["error"] = "MODEL_CACHE_NOT_READY"
         report["detail"] = type(exc).__name__
-        Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
+        _write_report(report)
         return 1
+    load_limit = _phase_seconds("PHASE2D_MODEL_LOAD_SECONDS", 300)
     load_started = time.perf_counter()
     try:
         pipe = QwenImagePipeline.from_pretrained(
             local, torch_dtype=torch.bfloat16, local_files_only=True,
         )
         pipe.enable_model_cpu_offload()
+        if time.perf_counter() - load_started > load_limit:
+            report["error"] = "LOAD_FAILED"
+            report["detail"] = "MODEL_LOAD_DEADLINE"
+            _write_report(report)
+            return 1
     except Exception as exc:
         report["error"] = "LOAD_FAILED"
         report["detail"] = type(exc).__name__
-        Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
+        _write_report(report)
         return 1
     report["load_seconds"] = round(time.perf_counter() - load_started, 3)
     report["peak_rss_kb"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+    gen_limit = _phase_seconds("PHASE2D_GENERATION_SECONDS", 300)
     started = time.perf_counter()
-    generator = torch.Generator(device="cpu").manual_seed(int(job["seed"]))
-    image = pipe(
-        prompt=job["prompt"],
-        width=int(job["width"]),
-        height=int(job["height"]),
-        num_inference_steps=int(job["steps"]),
-        generator=generator,
-    ).images[0]
+    box: dict[str, object] = {}
+
+    def _run_pipe() -> None:
+        try:
+            generator = torch.Generator(device="cpu").manual_seed(int(job["seed"]))
+            box["image"] = pipe(
+                prompt=job["prompt"],
+                width=int(job["width"]),
+                height=int(job["height"]),
+                num_inference_steps=int(job["steps"]),
+                generator=generator,
+            ).images[0]
+        except Exception as exc:
+            box["error"] = exc
+
+    worker = threading.Thread(target=_run_pipe, daemon=True)
+    worker.start()
+    worker.join(gen_limit)
+    if worker.is_alive():
+        report["error"] = "GENERATION_DEADLINE"
+        report["detail"] = "GENERATION_DEADLINE"
+        report["inference_seconds"] = round(time.perf_counter() - started, 3)
+        _write_report(report)
+        os._exit(1)
+    if "error" in box:
+        report["error"] = type(box["error"]).__name__
+        report["detail"] = type(box["error"]).__name__
+        _write_report(report)
+        return 1
+    image = box["image"]
     report["inference_seconds"] = round(time.perf_counter() - started, 3)
     if torch.cuda.is_available():
         report["peak_vram_bytes"] = int(torch.cuda.max_memory_allocated())
     out = Path("/workspace/phase2d_output.png")
     image.save(out, format="PNG")
     report["output_bytes"] = out.stat().st_size
-    Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
+    report["generation_seconds"] = report["inference_seconds"]
+    _write_report(report)
     return 0
 
 
@@ -115,13 +191,25 @@ def _cache_api():
     return prepare_generation, ModelCacheNotReady, MOUNT_PATH
 
 
-def _sync_r2(mount: Path) -> None:
+def _sync_r2(mount: Path, deadline_seconds: float | None = None) -> None:
+    progress_path = Path("/workspace/r2-sync-progress.json")
+    if not progress_path.parent.exists():
+        progress_path = None
+
+    def on_progress(record: dict) -> None:
+        print(json.dumps(record), flush=True)
+
     try:
         from media_engine.engines.image.r2_cache import sync_from_env
     except ImportError:
         module = _load_workspace_module("phase2d_r2_cache", "/workspace/r2_cache.py")
         sync_from_env = module.sync_from_env
-    sync_from_env(mount)
+    sync_from_env(
+        mount,
+        on_progress=on_progress,
+        progress_path=progress_path,
+        deadline_seconds=deadline_seconds,
+    )
 
 
 def download_progress_snapshot(cache: Path) -> dict[str, object]:

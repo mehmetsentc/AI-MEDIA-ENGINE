@@ -19,9 +19,12 @@ from media_engine.providers.offers import GpuOffer
 from media_engine.providers.phase2d import (
     DISK_GB,
     HOURS_PER_STORAGE_MONTH,
+    CACHE_SYNC_SECONDS,
+    GENERATION_SECONDS,
     MAX_CREATE_ATTEMPTS,
     MAX_ESTIMATED_COST_USD,
     MAX_HOURLY_USD,
+    MODEL_LOAD_SECONDS,
     PHASE2D_PYTHON,
     PHASE2D_VENV,
     QUARANTINE_SECONDS,
@@ -47,6 +50,8 @@ from media_engine.providers.phase2d import (
     r2_worker_env,
     run_phase2d,
     run_ssh_runtime,
+    seconds_until_cost_limit,
+    stage_budget_seconds,
     select_one,
     ssh_attach_allowed,
     ssh_endpoint,
@@ -484,7 +489,7 @@ class Phase2DTests(unittest.TestCase):
             script=b"print('ok')\n",
             job=b"{}",
         )
-        self.assertEqual(installs["n"], 1)
+        self.assertEqual(installs["n"], 2)
         self.assertEqual(probes["n"], 2)
         self.assertGreaterEqual(polls["n"], 2)
         self.assertGreater(clock.t, 1_000.0)
@@ -598,6 +603,7 @@ class Phase2DTests(unittest.TestCase):
                 "PYTHON_ENV_INSTALL",
                 "PYTHON_ENV_VERIFY",
                 "DISK_BEFORE_DOWNLOAD",
+                "CACHE_SYNC",
                 "PYTHON_RUNTIME",
             ],
         )
@@ -611,12 +617,25 @@ class Phase2DTests(unittest.TestCase):
         self.assertIn("torch,diffusers,transformers,accelerate", stages["PYTHON_ENV_VERIFY"])
         self.assertIn("DISK_BEFORE_DOWNLOAD", stages["DISK_BEFORE_DOWNLOAD"])
         self.assertIn("apt_fallback", stages["PYTHON_ENV_BOOTSTRAP"])
+        limits = (
+            f"PHASE2D_CACHE_SYNC_SECONDS={CACHE_SYNC_SECONDS} "
+            f"PHASE2D_MODEL_LOAD_SECONDS={MODEL_LOAD_SECONDS} "
+            f"PHASE2D_GENERATION_SECONDS={GENERATION_SECONDS}"
+        )
+        prefix = "if [ -f /workspace/phase2d-r2.env ]; then set -a; . /workspace/phase2d-r2.env; set +a; fi; "
+        self.assertEqual(
+            stages["CACHE_SYNC"],
+            prefix + f"export {limits}; exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py cache-sync",
+        )
         self.assertEqual(
             stages["PYTHON_RUNTIME"],
-            "if [ -f /workspace/phase2d-r2.env ]; then set -a; . /workspace/phase2d-r2.env; set +a; fi; "
-            f"exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py",
+            prefix + f"export {limits}; exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py generate",
         )
+        self.assertNotIn("R2_", stages["CACHE_SYNC"])
         self.assertNotIn("R2_", stages["PYTHON_RUNTIME"])
+        self.assertNotEqual(stage_budget_seconds("CACHE_SYNC"), stage_budget_seconds("PYTHON_RUNTIME"))
+        self.assertEqual(stage_budget_seconds("CACHE_SYNC"), CACHE_SYNC_SECONDS)
+        self.assertEqual(stage_budget_seconds("PYTHON_RUNTIME"), MODEL_LOAD_SECONDS + GENERATION_SECONDS)
         self.assertIn("python3 -m venv --system-site-packages /workspace/phase2d-venv", stages["PYTHON_ENV_BOOTSTRAP"])
         self.assertIsNone(r2_worker_env({"MODEL_CACHE_PROVIDER": "r2", "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com"}))
         secret = "s'ecret value"
@@ -635,6 +654,46 @@ class Phase2DTests(unittest.TestCase):
         self.assertEqual(policy_fingerprint(), "b716f03932af9c6621a47aff552765061b0fc64aafe8a2b47f37a792f7ab390d")
         argv = ssh_argv("/tmp/id", "ssh.example", "22", "true")
         self.assertIn("IdentitiesOnly=yes", argv)
+
+    def test_stage_deadlines_are_separate_and_cost_stays_authoritative(self) -> None:
+        clock = _StepClock()
+        seen: list[tuple[str, int]] = []
+
+        def ssh(host, port, command, data, timeout):
+            if data is None and command != "true":
+                seen.append((command, timeout))
+            return 0, b"", b""
+
+        def scp(host, port, remote, local, timeout):
+            if str(remote).endswith("phase2d_report.json"):
+                local.write_text('{"strategy": "bf16-cpu-offload"}\n', encoding="utf-8")
+            else:
+                local.write_bytes(_png())
+
+        run_ssh_runtime(
+            instance_id="555",
+            fetch=lambda: _ready_row(),
+            attach=lambda: None,
+            ssh=ssh,
+            scp=scp,
+            deadline=clock.t + 10000,
+            now=clock,
+            sleep=clock.sleep,
+            diagnostic_dir=Path(self.artifacts),
+            script=b"x",
+            job=b"{}",
+        )
+        sync_timeouts = [timeout for command, timeout in seen if "cache-sync" in command]
+        generate_timeouts = [timeout for command, timeout in seen if command.endswith("generate")]
+        self.assertEqual(sync_timeouts, [CACHE_SYNC_SECONDS])
+        self.assertEqual(generate_timeouts, [MODEL_LOAD_SECONDS + GENERATION_SECONDS])
+        self.assertNotEqual(sync_timeouts, generate_timeouts)
+        hourly = Decimal("0.40")
+        elapsed = 1060
+        remaining = seconds_until_cost_limit(hourly, elapsed)
+        spent = hourly * Decimal(elapsed + remaining + 1) / Decimal(3600)
+        self.assertLessEqual(spent, MAX_ESTIMATED_COST_USD)
+        self.assertGreater(hourly * Decimal(elapsed + remaining + 2) / Decimal(3600), MAX_ESTIMATED_COST_USD)
 
     def test_r2_env_file_is_uploaded_without_entering_the_command(self) -> None:
         clock = _StepClock()

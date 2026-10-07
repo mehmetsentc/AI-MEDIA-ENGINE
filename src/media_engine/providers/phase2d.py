@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Callable, Mapping, Optional, TextIO
 
@@ -58,7 +58,12 @@ MIN_RELIABILITY = Decimal("0.98")
 MAX_HOURLY_USD = Decimal("0.40")
 MAX_ESTIMATED_COST_USD = Decimal("0.20")
 MAX_LIFETIME_SECONDS = 1800
+# Cache sync, model load, and generation each have a deadline.
+# SOFT_RUNTIME_SECONDS is the cache-sync budget, not a cap on the whole job.
 SOFT_RUNTIME_SECONDS = 1200
+CACHE_SYNC_SECONDS = SOFT_RUNTIME_SECONDS
+MODEL_LOAD_SECONDS = 300
+GENERATION_SECONDS = 300
 HARD_CLEANUP_SECONDS = 1500
 READY_POLL_SECONDS = 5
 MAX_CREATE_ATTEMPTS = 1
@@ -495,7 +500,10 @@ def run_phase2d(
         if now() >= deadline or _over_budget(selected, now() - started):
             raise Phase2DStop("COST_ABOVE_CEILING")
         cleanup_deadline = min(deadline, started + HARD_CLEANUP_SECONDS)
-        runtime_deadline = min(cleanup_deadline, started + SOFT_RUNTIME_SECONDS)
+        runtime_deadline = min(
+            cleanup_deadline,
+            now() + seconds_until_cost_limit(selected.hourly_price_usd, now() - started),
+        )
         if now() >= runtime_deadline:
             raise Phase2DStop("SSH_NOT_READY")
         png, report = generate(instance_id, selected, runtime_deadline)
@@ -870,15 +878,20 @@ def remote_python_stages() -> list[tuple[str, str]]:
         "\"total_bytes\":usage.total,\"free_bytes\":usage.free}))'"
     )
     # Credentials stay in a mode-600 file. The command never contains them.
-    run = (
-        "if [ -f /workspace/phase2d-r2.env ]; then set -a; . /workspace/phase2d-r2.env; set +a; fi; "
-        f"exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py"
+    limits = (
+        f"PHASE2D_CACHE_SYNC_SECONDS={CACHE_SYNC_SECONDS} "
+        f"PHASE2D_MODEL_LOAD_SECONDS={MODEL_LOAD_SECONDS} "
+        f"PHASE2D_GENERATION_SECONDS={GENERATION_SECONDS}"
     )
+    source_env = "if [ -f /workspace/phase2d-r2.env ]; then set -a; . /workspace/phase2d-r2.env; set +a; fi; "
+    sync = source_env + f"export {limits}; exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py cache-sync"
+    run = source_env + f"export {limits}; exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py generate"
     return [
         ("PYTHON_ENV_BOOTSTRAP", bootstrap),
         ("PYTHON_ENV_INSTALL", install),
         ("PYTHON_ENV_VERIFY", verify),
         ("DISK_BEFORE_DOWNLOAD", disk),
+        ("CACHE_SYNC", sync),
         ("PYTHON_RUNTIME", run),
     ]
 
@@ -898,7 +911,9 @@ def classify_runtime_failure(exit_code: int, stdout: bytes, stderr: bytes, repor
     text = (stdout + b"\n" + stderr).decode("utf-8", "replace").lower()
     if "no space left on device" in text:
         return "DISK_INSUFFICIENT"
-    if exit_code == 255 and "fetching" in text and "files" in text:
+    if exit_code == 255 and ("r2_sync" in text or ("fetching" in text and "files" in text)):
+        return "MODEL_DOWNLOAD_TIMEOUT"
+    if "cache_sync_deadline" in text:
         return "MODEL_DOWNLOAD_TIMEOUT"
     return "REMOTE_COMMAND_FAILED"
 
@@ -1090,11 +1105,16 @@ def run_ssh_runtime(
             record("REMOTE_COMMAND_FAILED", code, code, out, err, "Phase2DStop")
             raise Phase2DStop("REMOTE_COMMAND_FAILED")
     code, out, err = 0, b"", b""
+    runtime_stages = {"CACHE_SYNC", "PYTHON_RUNTIME"}
     for stage_name, command in remote_python_stages():
-        remaining = max(1, int(deadline - now()))
-        code, out, err = ssh(host, port, command, None, remaining)
+        remaining = int(deadline - now())
+        if remaining <= 0:
+            record("COST_ABOVE_CEILING", None, None, b"", b"", "Phase2DStop")
+            raise Phase2DStop("COST_ABOVE_CEILING")
+        timeout = max(1, min(stage_budget_seconds(stage_name), remaining))
+        code, out, err = ssh(host, port, command, None, timeout)
         append_stage_records(diagnostic_dir, instance_id, progress_records(out, err), now(), secrets)
-        if code != 0 and stage_name != "PYTHON_RUNTIME":
+        if code != 0 and stage_name not in runtime_stages:
             failure = classify_python_env_failure(err)
             record(failure, None, code, out, err, "Phase2DStop")
             raise Phase2DStop(failure)
@@ -1341,6 +1361,29 @@ def _reject_over_price(row: dict) -> None:
         raise Phase2DStop("PRICE_ABOVE_CEILING")
     if max_estimated_gpu_cost(hourly, MAX_LIFETIME_SECONDS) > MAX_ESTIMATED_COST_USD:
         raise Phase2DStop("COST_ABOVE_CEILING")
+
+
+def stage_budget_seconds(stage_name: str) -> int:
+    """Per-stage shell deadline. The $0.20 clock can only make this shorter."""
+    return {
+        "PYTHON_ENV_BOOTSTRAP": 180,
+        "PYTHON_ENV_INSTALL": 420,
+        "PYTHON_ENV_VERIFY": 120,
+        "DISK_BEFORE_DOWNLOAD": 60,
+        "CACHE_SYNC": CACHE_SYNC_SECONDS,
+        "PYTHON_RUNTIME": MODEL_LOAD_SECONDS + GENERATION_SECONDS,
+    }.get(stage_name, 60)
+
+
+def seconds_until_cost_limit(hourly_price_usd: Decimal, elapsed_seconds: float) -> int:
+    """Seconds still allowed before spend can exceed $0.20 or the lifetime cap."""
+    if hourly_price_usd <= 0:
+        return 0
+    allowed = int(
+        (MAX_ESTIMATED_COST_USD * Decimal(3600) / hourly_price_usd).to_integral_value(rounding=ROUND_DOWN)
+    )
+    capped = min(allowed, MAX_LIFETIME_SECONDS)
+    return max(0, capped - int(elapsed_seconds) - 1)
 
 
 def _over_budget(offer: GpuOffer, elapsed: float) -> bool:

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -177,14 +178,36 @@ class R2CacheTests(unittest.TestCase):
         self.assertEqual(completed.stdout.strip(), "phase2d-cache.json")
 
 
+class _StreamResponse:
+    def __init__(self, body) -> None:
+        self.status = 200
+        self.headers: dict[str, str] = {}
+        self._body = body
+
+    def read(self, n: int = -1) -> bytes:
+        return self._body.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> bool:
+        return False
+
+
 class _Response:
     def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
         self.status = status
         self.headers = headers
         self._body = body
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0 or n >= len(self._body):
+            data = self._body
+            self._body = b""
+            return data
+        data = self._body[:n]
+        self._body = self._body[n:]
+        return data
 
     def __enter__(self):
         return self
@@ -426,3 +449,170 @@ class MultipartUploadTests(unittest.TestCase):
             ordered = MemoryObjectStore()
             upload_cache(ordered, mount)
             self.assertEqual(list(ordered.objects)[-1], "phase2d-cache.json")
+
+
+class ParallelDownloadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mount = Path(self.tmp.name) / "models"
+        self.previous_chunk = r2_cache.STREAM_CHUNK
+        r2_cache.STREAM_CHUNK = 3
+        self.addCleanup(self._restore_chunk)
+
+    def _restore_chunk(self) -> None:
+        r2_cache.STREAM_CHUNK = self.previous_chunk
+
+    def _manifest(self) -> bytes:
+        return json.dumps({
+            "state": COMPLETE,
+            "repo_id": "Qwen/Qwen-Image",
+            "revision": "rev1",
+            "expected_file_count": 1,
+            "expected_total_bytes": 8,
+            "completed_at": "2026-10-06T00:00:00Z",
+            "validation_status": COMPLETE,
+            "files": [{"path": "weights.safetensors", "bytes": 8}],
+        }).encode()
+
+    def _list_xml(self) -> bytes:
+        rows = []
+        for name in ("b0", "b1", "b2", "b3", "b4"):
+            key = f"hf-cache/models--Qwen--Qwen-Image/blobs/{name}"
+            rows.append(f"<Contents><Key>{key}</Key><Size>8</Size></Contents>")
+        link = "hf-cache/models--Qwen--Qwen-Image/snapshots/rev1/weights.safetensors"
+        rows.append(f"<Contents><Key>{link}</Key><Size>0</Size></Contents>")
+        body = "".join(rows)
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            "<IsTruncated>false</IsTruncated>"
+            f"{body}</ListBucketResult>"
+        ).encode()
+
+    def test_bounded_parallel_streams_rename_skip_and_restore_symlinks(self) -> None:
+        self.assertEqual(r2_cache.DOWNLOAD_CONCURRENCY, 4)
+        payload = b"abcdefgh"
+        active = {"n": 0, "max": 0}
+        lock = threading.Lock()
+        release = threading.Event()
+        calls: list[str] = []
+        progress: list[dict] = []
+        blob_root = self.mount / "hf-cache/models--Qwen--Qwen-Image/blobs"
+        link = self.mount / "hf-cache/models--Qwen--Qwen-Image/snapshots/rev1/weights.safetensors"
+
+        class _Chunk:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.offset = 0
+                self.reads = 0
+
+            def read(self, n: int = -1) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    with lock:
+                        active["n"] += 1
+                        active["max"] = max(active["max"], active["n"])
+                        if active["n"] >= 4:
+                            release.set()
+                    self.assert_wait()
+                    with lock:
+                        active["n"] -= 1
+                if self.reads == 2:
+                    final = blob_root / self.name
+                    partial = final.with_name(final.name + ".partial")
+                    if final.exists():
+                        raise AssertionError("final file appeared before the last chunk")
+                    if not partial.exists():
+                        raise AssertionError("partial file missing during stream")
+                if self.offset >= len(payload):
+                    return b""
+                take = len(payload) if n is None or n < 0 else n
+                data = payload[self.offset:self.offset + take]
+                self.offset += len(data)
+                return data
+
+            def assert_wait(self) -> None:
+                if not release.wait(3):
+                    raise AssertionError("downloads were not concurrent")
+
+        def opener(request, timeout):
+            self.assertEqual(timeout, 60)
+            url = request.full_url
+            calls.append(url)
+            if "list-type=" in url:
+                return _Response(200, {}, self._list_xml())
+            if url.endswith("phase2d-cache.json"):
+                return _Response(200, {}, self._manifest())
+            if "/blobs/" in url:
+                return _StreamResponse(_Chunk(url.rsplit("/", 1)[-1]))
+            if url.endswith("weights.safetensors"):
+                if not (blob_root / "b0").is_file():
+                    raise AssertionError("symlink fetched before blob file existed")
+                return _Response(200, {"x-amz-meta-hf-symlink": "../../blobs/b0"}, b"")
+            return _Response(404, {}, b"")
+
+        progress_path = Path(self.tmp.name) / "r2-sync-progress.json"
+        sync_complete_cache(
+            _client(opener),
+            self.mount,
+            min_bytes=8,
+            on_progress=progress.append,
+            progress_path=progress_path,
+        )
+        self.assertEqual(active["max"], 4)
+        self.assertEqual((blob_root / "b0").read_bytes(), payload)
+        self.assertFalse((blob_root / "b0").is_symlink())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(link), "../../blobs/b0")
+        self.assertEqual(link.read_bytes(), payload)
+        self.assertFalse(any(path.name.endswith(".partial") for path in self.mount.rglob("*")))
+        self.assertEqual(assess_cache(self.mount, min_bytes=8), COMPLETE)
+        self.assertEqual(max(item["objects_done"] for item in progress), 6)
+        self.assertTrue(any(item["bytes_done"] == 40 and item["bytes_total"] == 40 for item in progress))
+        self.assertTrue(all("MB_per_sec" in item for item in progress))
+        saved = json.loads(progress_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["objects_done"], 6)
+        self.assertEqual(saved["bytes_done"], 40)
+        self.assertEqual(saved["bytes_total"], 40)
+        self.assertEqual(saved["current"], [])
+        self.assertIn("MB_per_sec", saved)
+        calls.clear()
+        sync_complete_cache(_client(opener), self.mount, min_bytes=8)
+        self.assertFalse(any("/blobs/" in url for url in calls))
+        self.assertTrue(link.is_symlink())
+
+    def test_failed_stream_removes_the_partial_file(self) -> None:
+        class _Boom:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read(self, n: int = -1) -> bytes:
+                self.reads += 1
+                if self.reads > 1:
+                    raise RuntimeError("stream broke")
+                return b"abc"
+
+        def opener(request, timeout):
+            url = request.full_url
+            if "list-type=" in url:
+                key = "hf-cache/models--Qwen--Qwen-Image/blobs/b0"
+                xml = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<ListBucketResult><IsTruncated>false</IsTruncated>'
+                    f"<Contents><Key>{key}</Key><Size>8</Size></Contents>"
+                    "</ListBucketResult>"
+                ).encode()
+                return _Response(200, {}, xml)
+            if url.endswith("phase2d-cache.json"):
+                return _Response(200, {}, self._manifest())
+            if url.endswith("/b0"):
+                return _StreamResponse(_Boom())
+            return _Response(404, {}, b"")
+
+        with self.assertRaises(R2StorageError):
+            sync_complete_cache(_client(opener), self.mount, min_bytes=8)
+        blob = self.mount / "hf-cache/models--Qwen--Qwen-Image/blobs/b0"
+        self.assertFalse(blob.exists())
+        self.assertFalse(blob.with_name("b0.partial").exists())
+        self.assertNotEqual(assess_cache(self.mount, min_bytes=8), COMPLETE)
