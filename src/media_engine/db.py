@@ -77,6 +77,36 @@ CREATE TABLE IF NOT EXISTS artifacts (
     sha256 TEXT NOT NULL,
     path TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scenes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS studio_assets (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    scene_id TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    engine TEXT,
+    model TEXT,
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL,
+    artifact_id TEXT,
+    job_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    history_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS host_quarantine (
     provider TEXT NOT NULL,
     offer_id TEXT NOT NULL,

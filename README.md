@@ -117,3 +117,18 @@ any compatible GPU on machine 47281 and attaches cache volume 54653022 at
 300 seconds. The hard lifetime defaults to 1800 seconds.
 `MEDIA_ENGINE_MAX_GPU_HOURLY_USD` defaults to 0.60.
 `negative_prompt` is rejected because the Qwen path does not apply it.
+
+## Studio
+
+The local studio is the same API with a project, scenes, and assets.
+It does not rent a GPU. Image generation from the page calls
+`POST /v1/images/generations`, then polls `GET /v1/jobs/{job_id}` and
+loads `GET /v1/artifacts/{artifact_id}`.
+
+```bash
+PYTHONPATH=src python3 -m media_engine.studio
+```
+
+Open the printed `http://127.0.0.1:8765/` address. The page keeps its
+session cookie on the server. Text, voice, music, and video are visible
+and marked as coming next.

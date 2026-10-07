@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI-MEDIA-ENGINE Studio</title>
+  <link rel="stylesheet" href="/studio.css">
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <p class="word">AI-MEDIA-ENGINE</p>
+          <p class="mode" id="mode">Local preview</p>
+        </div>
+      </div>
+      <label class="project-name">
+        <span class="sr">Project name</span>
+        <input id="project-name" type="text" value="Untitled project" maxlength="120">
+      </label>
+      <p class="save" id="save-state">Saved</p>
+      <p class="cost" id="cost">Usage</p>
+      <button class="generate" id="generate" type="button">Generate</button>
+      <button class="theme" id="theme" type="button" aria-pressed="false">Light</button>
+    </header>
+
+    <nav class="nav" aria-label="Studio">
+      <button type="button" data-view="home">Home</button>
+      <button type="button" data-view="projects">Projects</button>
+      <button type="button" data-view="studio" class="is-current">AI Studio</button>
+      <button type="button" data-view="text">Text</button>
+      <button type="button" data-view="voice">Voice</button>
+      <button type="button" data-view="music">Music</button>
+      <button type="button" data-view="image">Images</button>
+      <button type="button" data-view="video">Video</button>
+      <button type="button" data-view="assets">Assets</button>
+      <button type="button" data-view="history">History</button>
+      <button type="button" data-view="settings">Settings</button>
+    </nav>
+
+    <main class="stage" id="stage">
+      <section class="quick" id="quick">
+        <p class="eyebrow">Quick Create</p>
+        <h1>What do you want to make?</h1>
+        <label class="brief">
+          <span class="sr">Campaign brief</span>
+          <textarea id="brief" rows="3" maxlength="4000">Create a luxury Mediterranean hotel campaign</textarea>
+        </label>
+        <div class="quick-actions">
+          <button type="button" id="create-image">Create Image</button>
+          <button type="button" class="quiet" disabled>Create campaign <span>Soon</span></button>
+        </div>
+      </section>
+      <section class="preview" id="preview" hidden>
+        <p class="status" id="status" data-tone="idle">Ready</p>
+        <div class="frame" id="frame">
+          <p class="empty" id="empty">Your image will appear here.</p>
+          <img id="result" alt="" hidden>
+        </div>
+        <p class="caption" id="caption"></p>
+      </section>
+      <section class="panel-copy" id="panel-copy" hidden></section>
+    </main>
+
+    <aside class="properties" aria-label="Properties">
+      <h2 id="prop-title">Image</h2>
+      <p class="upcoming" id="upcoming" hidden>Coming next. This part of the project is ready for its engine.</p>
+      <form id="image-form">
+        <label>Prompt
+          <textarea id="prompt" rows="6" maxlength="4000"></textarea>
+        </label>
+        <div class="pair">
+          <label>Width
+            <input id="width" type="number" value="1024" min="1024" max="1024" readonly>
+          </label>
+          <label>Height
+            <input id="height" type="number" value="1024" min="1024" max="1024" readonly>
+          </label>
+        </div>
+        <label>Seed
+          <input id="seed" type="number" min="0" placeholder="Automatic">
+        </label>
+        <div class="row">
+          <button type="submit" id="form-generate">Generate</button>
+          <button type="button" id="regenerate" disabled>Regenerate</button>
+        </div>
+        <div class="row">
+          <button type="button" id="cancel" class="quiet" hidden>Cancel</button>
+          <a id="download" class="quiet link" hidden download="image.png">Download</a>
+        </div>
+        <p class="progress" id="progress" hidden><span id="bar"></span></p>
+        <dl class="costs" id="costs" hidden>
+          <div><dt>Estimated cost</dt><dd id="estimated">—</dd></div>
+          <div><dt>Actual cost</dt><dd id="actual">—</dd></div>
+        </dl>
+      </form>
+    </aside>
+
+    <section class="timeline" aria-label="Timeline">
+      <div class="scenes" id="scenes"></div>
+      <div class="tracks" id="tracks"></div>
+    </section>
+  </div>
+  <script src="/studio.js"></script>
+</body>
+</html>

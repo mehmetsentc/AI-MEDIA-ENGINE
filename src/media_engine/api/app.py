@@ -4,13 +4,23 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Optional
 
 from media_engine.auth.clients import UnknownClient
 from media_engine.jobs.model import IllegalTransition, JobError, JobNotFound, UnsupportedJobType
 from media_engine.orchestrator.controller import MediaController
+from media_engine.studio.api import try_studio
+
+_STATIC = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/studio.css": ("studio.css", "text/css; charset=utf-8"),
+    "/studio.js": ("studio.js", "text/javascript; charset=utf-8"),
+}
+_STATIC_ROOT = Path(__file__).resolve().parents[1] / "studio" / "static"
 
 _JOB = re.compile(r"^/v1/jobs/([A-Za-z0-9_-]+)$")
 _CANCEL = re.compile(r"^/v1/jobs/([A-Za-z0-9_-]+)/cancel$")
@@ -18,21 +28,39 @@ _ARTIFACT = re.compile(r"^/v1/artifacts/([A-Za-z0-9_-]+)$")
 _MAX_BODY = 65536
 
 
-def authorize(path: str, headers: Optional[dict], api_key: str) -> Optional[tuple[int, dict]]:
-    """Health stays open. Every other route fails closed without the bearer."""
-    if path.split("?", 1)[0] == "/health":
+def authorize(path: str, headers: Optional[dict], api_key: str,
+              studio_session: str = "") -> Optional[tuple[int, dict]]:
+    """Health and the studio shell stay open. API routes need a bearer or the studio cookie."""
+    bare = path.split("?", 1)[0]
+    if bare == "/health" or bare in _STATIC:
         return None
     presented = ""
     if headers:
         presented = str(headers.get("Authorization") or headers.get("authorization") or "")
+        if studio_session and _cookie(headers, "studio_session") == studio_session:
+            return None
     if not api_key or presented != "Bearer " + api_key:
         return 401, {"error": "UNAUTHORIZED"}
     return None
 
 
+def _cookie(headers: dict, name: str) -> str:
+    raw = str(headers.get("Cookie") or headers.get("cookie") or "")
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.strip().split("=", 1)
+        if key == name:
+            return value
+    return ""
+
+
 def dispatch(controller: MediaController, method: str, path: str,
              body: Optional[bytes]) -> tuple[int, dict]:
     path = path.split("?", 1)[0]
+    studio = try_studio(controller, method, path, body)
+    if studio is not None:
+        return studio
     try:
         if method == "GET" and path == "/health":
             return 200, controller.health()
@@ -129,7 +157,8 @@ class LocalAPIServer:
             raise ValueError("local API binds to 127.0.0.1 only")
         self.controller = controller
         self.api_key = os.environ.get("AI_MEDIA_ENGINE_API_KEY", "") if api_key is None else api_key
-        self._httpd = _LoopbackServer((host, port), _handler(controller, self.api_key))
+        self.studio_session = secrets.token_urlsafe(24)
+        self._httpd = _LoopbackServer((host, port), _handler(controller, self.api_key, self.studio_session))
         self._thread: Optional[threading.Thread] = None
 
     @property
@@ -157,7 +186,7 @@ class LocalAPIServer:
         self.controller.stop()
 
 
-def _handler(controller: MediaController, api_key: str) -> type[BaseHTTPRequestHandler]:
+def _handler(controller: MediaController, api_key: str, studio_session: str) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -170,9 +199,20 @@ def _handler(controller: MediaController, api_key: str) -> type[BaseHTTPRequestH
         def do_POST(self) -> None:
             self._respond()
 
+        def do_PATCH(self) -> None:
+            self._respond()
+
+        def do_DELETE(self) -> None:
+            self._respond()
+
         def _respond(self) -> None:
             path = self.path.split("?", 1)[0]
-            denied = authorize(path, {key: value for key, value in self.headers.items()}, api_key)
+            if self.command == "GET" and path in _STATIC:
+                self._static(path)
+                return
+            denied = authorize(
+                path, {key: value for key, value in self.headers.items()}, api_key, studio_session,
+            )
             if denied is not None:
                 self._json(*denied)
                 return
@@ -196,6 +236,20 @@ def _handler(controller: MediaController, api_key: str) -> type[BaseHTTPRequestH
                 return
             status, payload = dispatch(controller, self.command, self.path, body)
             self._json(status, payload)
+
+        def _static(self, path: str) -> None:
+            name, content_type = _STATIC[path]
+            raw = (_STATIC_ROOT / name).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            if path == "/":
+                self.send_header(
+                    "Set-Cookie",
+                    f"studio_session={studio_session}; HttpOnly; SameSite=Strict; Path=/",
+                )
+            self.end_headers()
+            self.wfile.write(raw)
 
         def _json(self, status: int, payload: dict) -> None:
             raw = json.dumps(payload).encode("utf-8")
