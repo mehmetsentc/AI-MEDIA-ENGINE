@@ -31,6 +31,7 @@ class MemoryMedia:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.fail_next = False
+        self.bucket = "ai-media-engine-media"
 
     def put(self, key: str, data: bytes) -> None:
         if self.fail_next:
@@ -43,6 +44,11 @@ class MemoryMedia:
             raise KeyError(key)
         return self.objects[key]
 
+    def head(self, key: str) -> int:
+        if key not in self.objects:
+            raise PlatformBlocked("ARTIFACT_VERIFY_FAILED")
+        return len(self.objects[key])
+
 
 class Platform:
     def __init__(self, db_path: str, *, media: Optional[MemoryMedia] = None,
@@ -50,7 +56,7 @@ class Platform:
         self.repo = SqliteRepository(db_path)
         self.media = media or MemoryMedia()
         self._now = now or (lambda: datetime.now(timezone.utc))
-        self.bucket = media_bucket()
+        self.bucket = str(getattr(self.media, "bucket", "") or media_bucket())
 
     def now_iso(self) -> str:
         return self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -155,6 +161,8 @@ class Platform:
 
     def settle(self, user_id: str, job_id: str, actual: int) -> None:
         """Return the hold, then record the actual consumption once."""
+        if self.repo.settlement_exists(job_id):
+            return
         remaining = max(actual, 0)
         for pool, reserved in self.repo.reserved_by_pool(job_id):
             charge = min(remaining, reserved)
@@ -171,6 +179,8 @@ class Platform:
 
     def settle_failure(self, user_id: str, job_id: str, legitimate_cost: int = 0) -> None:
         """Return the hold, then keep only the legitimate failure cost."""
+        if self.repo.settlement_exists(job_id):
+            return
         remaining = max(legitimate_cost, 0)
         for pool, reserved in self.repo.reserved_by_pool(job_id):
             charge = min(remaining, reserved)
@@ -232,6 +242,9 @@ class Platform:
             self.media.put(key, data)
         except PlatformBlocked:
             raise
+        head = getattr(self.media, "head", None)
+        if head is not None and int(head(key)) != len(data):
+            raise PlatformBlocked("ARTIFACT_VERIFY_FAILED")
         stored = self.media.get(key)
         if hashlib.sha256(stored).hexdigest() != digest:
             raise PlatformBlocked("ARTIFACT_VERIFY_FAILED")
@@ -249,6 +262,12 @@ class Platform:
         if local_path is not None:
             local_path.unlink(missing_ok=True)
         return ArtifactMeta(artifact_id, key, digest, len(data), "completed")
+
+    def read_media(self, artifact_id: str) -> Optional[bytes]:
+        row = self.repo.media_row(artifact_id)
+        if row is None:
+            return None
+        return self.media.get(str(row["object_key"]))
 
     def reconcile(self, key: str) -> str:
         return self.repo.reconcile_orphan(key, self.now_iso())

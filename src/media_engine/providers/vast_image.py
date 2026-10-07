@@ -46,6 +46,22 @@ WARM_DISK_GB = 40
 COLD_DISK_GB = 140
 MIN_VRAM_MIB = 44 * 1024
 OPERATION_BUDGET_USD = Decimal("1.00")
+
+
+def active_operation_budget() -> Decimal:
+    """The approved image test can tighten the planner with STUDIO_GPU_BUDGET_USD."""
+    raw = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
+    if not raw:
+        return OPERATION_BUDGET_USD
+    try:
+        amount = Decimal(raw)
+    except Exception:
+        return OPERATION_BUDGET_USD
+    if amount <= 0:
+        return OPERATION_BUDGET_USD
+    return min(amount, OPERATION_BUDGET_USD)
+
+
 OVERHEAD_SECONDS = 600
 GENERATE_ALLOWANCE_SECONDS = 180
 # Planning rate is a quarter of the advertised download, between the slow
@@ -312,11 +328,21 @@ class VastImageProvider(GPUProvider):
         timeout_code: str = "WORKER_TIMEOUT",
     ) -> tuple[int, str, str]:
         if self._ssh_run is None:
+            self._ensure_ssh()
+        if self._ssh_run is None:
             raise WorkerStageError("WORKER_BOOT_FAILED")
         try:
             return self._ssh_run(self._host or "worker", self._port or "22", command, timeout)
         except TimeoutError as exc:
             raise WorkerStageError(timeout_code) from exc
+
+    def _ensure_ssh(self) -> None:
+        """Attach the existing SSH session the first time cache or generate needs it."""
+        if self._ssh_run is not None:
+            return
+        if not self._resource_id:
+            raise WorkerStageError("WORKER_BOOT_FAILED")
+        self._attach_and_wait(self._resource_id)
 
     def _fetch_png(self) -> bytes:
         code, out, _err = self._remote("base64 /workspace/phase2d_output.png", 120)
@@ -388,7 +414,7 @@ class VastImageProvider(GPUProvider):
             volume_machine=MACHINE_ID,
             volume_ready=True,
             max_hourly=self.limits.max_hourly_price_usd,
-            operation_budget=OPERATION_BUDGET_USD,
+            operation_budget=active_operation_budget(),
             allow_cold_stage=False,
         )
         if warm is not None or not cold_stage_allowed():
@@ -405,7 +431,7 @@ class VastImageProvider(GPUProvider):
             volume_machine=MACHINE_ID,
             volume_ready=True,
             max_hourly=self.limits.max_hourly_price_usd,
-            operation_budget=OPERATION_BUDGET_USD,
+            operation_budget=active_operation_budget(),
             allow_cold_stage=True,
         )
 

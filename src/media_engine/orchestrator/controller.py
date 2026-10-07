@@ -46,6 +46,7 @@ from media_engine.providers.base import (
     WorkerStageError,
 )
 from media_engine.providers.fake import FakeGPUProvider
+from media_engine.platform.repository import PlatformBlocked
 from media_engine.resources.ledger import ResourceLedger, ResourceRecord, ResourceState
 from media_engine.safety.limits import SafetyLimits
 from media_engine.storage.artifacts import Artifact, ArtifactStore
@@ -266,6 +267,13 @@ class MediaController:
         record = self.artifacts.get(artifact_id)
         if record is None:
             raise JobNotFound(artifact_id)
+        if str(record.path).startswith("r2://"):
+            if self.platform is None:
+                raise JobNotFound(artifact_id)
+            data = self.platform.read_media(artifact_id)
+            if data is None:
+                raise JobNotFound(artifact_id)
+            return data
         path = Path(record.path)
         if not path.is_file():
             raise JobNotFound(artifact_id)
@@ -545,17 +553,50 @@ class MediaController:
             return
         self._set_public(job, "saving")
         try:
-            uri = self.storage.put(
-                client_id=job.client_id, job_id=job.id, name="image.png", data=data,
-            )
-            path = Path(unquote(urlparse(uri).path))
-            digest = sha256_hex(data)
-            artifact_id = "art_" + uuid.uuid4().hex
-            self.artifacts.insert(Artifact(
-                artifact_id=artifact_id, job_id=job.id, engine="image", model="qwen-image",
-                prompt=job.prompt, seed=job.seed, width=width, height=height,
-                created_at=self.clock.iso(), byte_count=len(data), sha256=digest, path=str(path),
-            ))
+            if self.platform is None:
+                uri = self.storage.put(
+                    client_id=job.client_id, job_id=job.id, name="image.png", data=data,
+                )
+                path = Path(unquote(urlparse(uri).path))
+                digest = sha256_hex(data)
+                artifact_id = "art_" + uuid.uuid4().hex
+                self.artifacts.insert(Artifact(
+                    artifact_id=artifact_id, job_id=job.id, engine="image", model="qwen-image",
+                    prompt=job.prompt, seed=job.seed, width=width, height=height,
+                    created_at=self.clock.iso(), byte_count=len(data), sha256=digest, path=str(path),
+                ))
+            else:
+                artifact_id = "art_" + uuid.uuid4().hex
+                placement = self._image_placement(job.id)
+                temporary = Path(self.storage.root) / "_tmp" / (artifact_id + ".png")
+                temporary.parent.mkdir(parents=True, exist_ok=True)
+                temporary.write_bytes(data)
+                try:
+                    meta = self.platform.persist_media(
+                        user_id=job.client_id, project_id=placement["project_id"],
+                        scene_id=placement["scene_id"], job_id=job.id, artifact_id=artifact_id,
+                        kind="images", ext="png", data=data, mime_type="image/png",
+                        settings={"seed": job.seed, "prompt": job.prompt}, local_path=temporary,
+                        asset_id=placement.get("asset_id") or "", width=width, height=height,
+                    )
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    raise
+                digest = meta.sha256
+                self.artifacts.insert(Artifact(
+                    artifact_id=artifact_id, job_id=job.id, engine="image", model="qwen-image",
+                    prompt=job.prompt, seed=job.seed, width=width, height=height,
+                    created_at=self.clock.iso(), byte_count=meta.byte_count, sha256=digest,
+                    path="r2://" + self.platform.bucket + "/" + meta.object_key,
+                ))
+                self._link_studio_artifact(placement, artifact_id)
+                uri = "r2://" + self.platform.bucket + "/" + meta.object_key
+            self._settle_job(job, success=True)
+        except PlatformBlocked as exc:
+            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), exc.code)
+            self._mark_idle(resource_id)
+            self._fail(job, exc.code)
+            return
         except Exception:
             self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "ARTIFACT_TRANSFER_FAILED")
             self._mark_idle(resource_id)
@@ -690,6 +731,7 @@ class MediaController:
         self.trace.append(f"{job.id}:{target}")
 
     def _fail(self, job: Job, code: str) -> None:
+        self._settle_job(job, success=False)
         job.error_code = code
         if job.public_status is not None and job.public_status != "failed":
             job.public_status = "failed"
@@ -700,6 +742,33 @@ class MediaController:
         self.jobs.save(job)
         self.trace.append(f"{job.id}:FAILED:{code}")
         self._record_usage(job, JobStatus.FAILED)
+
+    def _settle_job(self, job: Job, *, success: bool) -> None:
+        if self.platform is None:
+            return
+        if success:
+            self.platform.settle(job.client_id, job.id, self.platform.repo.reserved_amount(job.id))
+            return
+        self.platform.settle_failure(job.client_id, job.id, legitimate_cost=0)
+
+    def _image_placement(self, job_id: str) -> dict:
+        try:
+            from media_engine.studio.store import StudioStore
+            found = StudioStore(self.jobs.db_path).find_asset_by_job(job_id)
+        except Exception:
+            found = None
+        if found:
+            return found
+        return {"project_id": "direct", "scene_id": "image", "asset_id": ""}
+
+    def _link_studio_artifact(self, placement: dict, artifact_id: str) -> None:
+        asset_id = placement.get("asset_id") or ""
+        if not asset_id:
+            return
+        from media_engine.studio.store import StudioStore
+        StudioStore(self.jobs.db_path).update_asset(
+            asset_id, self.clock.iso(), artifact_id=artifact_id, status="completed",
+        )
 
     def _record_usage(self, job: Job, status: str) -> None:
         opened = self._usage_opened.get(job.id)

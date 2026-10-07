@@ -10,7 +10,12 @@ from pathlib import Path
 
 from media_engine.orchestrator.controller import ManualClock, MediaController
 from media_engine.platform.keys import object_key
-from media_engine.platform.pool import ConnectionPool, PoolExhausted, open_production_pool
+from media_engine.platform.pool import (
+    ConnectionPool,
+    PoolExhausted,
+    open_production_pool,
+    production_database_status,
+)
 from media_engine.platform.schema import (
     LONG_VIDEO_KEYS,
     METER_TYPES,
@@ -79,15 +84,17 @@ class PlatformFoundationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as dsn:
             open_production_pool("sqlite:///dev.db")
         self.assertEqual(str(dsn.exception), "POSTGRES_DSN_REQUIRED")
-        with self.assertRaises(RuntimeError) as driver:
-            open_production_pool("postgres://localhost/media")
-        self.assertEqual(str(driver.exception), "POSTGRES_DRIVER_REQUIRED")
-        pool = ConnectionPool(lambda: object(), max_size=1)
-        first = pool.checkout()
-        pool.checkin(first)
-        self.assertIs(pool.checkout(), first)
+        self.assertEqual(production_database_status(None), "POSTGRES_CONFIGURATION_REQUIRED")
+        with self.assertRaises(RuntimeError):
+            production_database_status("sqlite:///dev.db")
+        pool = open_production_pool("postgres://example.invalid/media")
+        self.assertEqual(pool.created, 0)
+        reused = ConnectionPool(lambda: object(), max_size=1)
+        first = reused.checkout()
+        reused.checkin(first)
+        self.assertIs(reused.checkout(), first)
         with self.assertRaises(PoolExhausted):
-            pool.checkout()
+            reused.checkout()
 
     def test_object_keys_are_isolated_and_delivery_expires(self) -> None:
         key = object_key(

@@ -67,7 +67,12 @@ def build_controller(root: Path, mode: Optional[str] = None,
         provider=provider,
         image_engine=RealProviderRequired(),
     )
-    controller.platform = Platform(str(root / "platform.sqlite3"))
+    from media_engine.storage.r2_media import UnavailableMedia, open_media_store
+    try:
+        media = open_media_store()
+    except Exception:
+        media = UnavailableMedia()
+    controller.platform = Platform(str(root / "platform.sqlite3"), media=media)
     return controller
 
 

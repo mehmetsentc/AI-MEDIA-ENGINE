@@ -20,3 +20,7 @@ MIGRATION_PLAN = (
     "Call those routes after GET /health reports worker_ready.",
     "Keep SSH as a diagnostic channel only.",
 )
+
+# HTTP /health still decides worker_ready. The first cache, model, generate,
+# or PNG call attaches the existing SSH session. That is enough for one test.
+POST_READINESS_SSH = "SAFE_FOR_ONE_FINAL_TEST"

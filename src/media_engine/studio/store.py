@@ -67,6 +67,19 @@ class StudioStore:
             self.create_asset(scene_id, asset_type, "", now, placeholder=True)
         return self.get_scene(scene_id)
 
+    def find_asset_by_job(self, job_id: str) -> Optional[dict]:
+        row = self._one(
+            "SELECT id, project_id, scene_id FROM studio_assets WHERE job_id = ?",
+            (job_id,),
+        )
+        if row is None:
+            return None
+        return {
+            "asset_id": str(row["id"]),
+            "project_id": str(row["project_id"]),
+            "scene_id": str(row["scene_id"]),
+        }
+
     def list_scenes(self, project_id: str) -> list[dict]:
         rows = self._query(
             "SELECT * FROM scenes WHERE project_id = ? ORDER BY position, created_at",

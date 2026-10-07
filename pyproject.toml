@@ -5,6 +5,8 @@ description = "API-first media engine. Phase 1 proves a zero-cost local job life
 requires-python = ">=3.11"
 readme = "README.md"
 
+dependencies = ["psycopg[binary]>=3.2,<4"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

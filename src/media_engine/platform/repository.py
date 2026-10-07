@@ -427,6 +427,43 @@ class SqliteRepository:
         finally:
             conn.close()
 
+    def media_row(self, artifact_id: str) -> Optional[dict]:
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                """
+                SELECT object_key, bucket, sha256, byte_count
+                FROM media_artifacts
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (artifact_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "object_key": str(row["object_key"]),
+                "bucket": str(row["bucket"]),
+                "sha256": str(row["sha256"]),
+                "byte_count": int(row["byte_count"]),
+            }
+        finally:
+            conn.close()
+
+    def settlement_exists(self, job_id: str) -> bool:
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                """
+                SELECT id FROM credit_ledger
+                WHERE job_id = ? AND entry_type IN ('consume', 'release', 'refund')
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return row is not None
+
     def record_orphan(self, key: str, bucket: str, digest: str, reason: str, now: str) -> None:
         conn = self._conn()
         try:

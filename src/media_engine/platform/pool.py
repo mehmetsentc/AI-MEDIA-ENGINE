@@ -32,10 +32,24 @@ class ConnectionPool(Generic[T]):
 
 
 def open_production_pool(dsn: str) -> ConnectionPool:
-    if not dsn.startswith("postgres"):
+    if not str(dsn).startswith("postgres"):
         raise RuntimeError("POSTGRES_DSN_REQUIRED")
     try:
-        import psycopg  # noqa: F401
+        import psycopg
     except ImportError as exc:
         raise RuntimeError("POSTGRES_DRIVER_REQUIRED") from exc
-    return ConnectionPool(lambda: object())
+
+    def connect() -> object:
+        return psycopg.connect(dsn, connect_timeout=5)
+
+    return ConnectionPool(connect)
+
+
+def production_database_status(dsn: str | None) -> str:
+    """A missing or non-Postgres DSN never opens SQLite."""
+    if not dsn:
+        return "POSTGRES_CONFIGURATION_REQUIRED"
+    if not str(dsn).startswith("postgres"):
+        raise RuntimeError("POSTGRES_CONFIGURATION_REQUIRED")
+    open_production_pool(dsn)
+    return "DRIVER_READY"
