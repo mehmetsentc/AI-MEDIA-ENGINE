@@ -120,7 +120,8 @@ class StudioTests(unittest.TestCase):
         self.assertIn("Waiting for available GPU capacity", page)
         self.assertIn("PROVIDER_CAPACITY_UNAVAILABLE", page)
         self.assertIn('waiting_capacity: ["Waiting for available GPU capacity", "waiting"]', page)
-        self.assertIn("Create Image", html)
+        self.assertIn("Generate Image", html)
+        self.assertIn("What do you want to create?", html)
         self.assertNotIn("machine_id", page)
         self.assertNotIn("volume", page.lower())
 
@@ -136,7 +137,8 @@ class StudioTests(unittest.TestCase):
             html = response.read().decode("utf-8")
             cookie = response.headers.get("Set-Cookie", "")
         self.assertIn("AI-MEDIA-ENGINE", html)
-        self.assertIn("Quick Create", html)
+        self.assertIn("What do you want to create?", html)
+        self.assertIn("Create Project", html)
         token = cookie.split(";", 1)[0]
         self.assertTrue(token.startswith("studio_session="))
         status, body = _http(server, "GET", "/studio.js")
