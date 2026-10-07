@@ -466,6 +466,7 @@ function renderInspector() {
   });
   if (!imageTool) {
     imageForm.hidden = true;
+    document.getElementById("costs").hidden = true;
     const editable = asset && TRACKS.indexOf(asset.type) >= 0 && asset.type !== "image" && state.view === asset.type;
     other.hidden = !editable;
     upcoming.hidden = false;

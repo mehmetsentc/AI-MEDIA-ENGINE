@@ -181,7 +181,9 @@ def _costs(controller, job_id: Optional[str]) -> tuple[Optional[str], Optional[s
     event = controller.usage.for_job(job_id)
     if event is None:
         return None, None
-    return event.estimated_cost_usd, event.actual_cost_usd
+    # A development provider's ledger is not a production bill.
+    actual = event.actual_cost_usd if event.provider == "vast" else None
+    return event.estimated_cost_usd, actual
 
 
 def _object(body: Optional[bytes]) -> dict:

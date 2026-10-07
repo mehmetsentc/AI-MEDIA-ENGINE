@@ -86,6 +86,7 @@ class StudioTests(unittest.TestCase):
         self.assertEqual(image_now["artifact_id"], done["artifact_id"])
         self.assertEqual(image_now["phase"], "completed")
         self.assertEqual(image_now["title"], "Complete")
+        self.assertIsNone(image_now["actual_cost"])
         self.assertEqual(text_now["job_id"], None)
         self.assertEqual(text_now["status"], "draft")
         self.assertEqual(text_now["prompt"], "")
