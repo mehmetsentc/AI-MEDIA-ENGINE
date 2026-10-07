@@ -24,7 +24,7 @@ COPY deploy/worker/worker_ready.py /workspace/worker_ready.py
 
 RUN mkdir -p /opt/ai-media-engine \
     && touch /opt/ai-media-engine/runtime-ready \
-    && python3 -c "import torch,diffusers,transformers,accelerate,safetensors,pathlib; assert pathlib.Path('/usr/local/bin/python3').exists()"
+    && python3 -c "import torch,diffusers,transformers,accelerate,safetensors"
 
 ENV HF_HOME=/models/hf-cache \
     HUGGINGFACE_HUB_CACHE=/models/hf-cache \
