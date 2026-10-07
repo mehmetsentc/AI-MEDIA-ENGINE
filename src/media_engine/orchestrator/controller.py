@@ -120,6 +120,7 @@ class MediaController:
         self.usage = UsageStore(db_path)
         self.storage = LocalStorage(storage_root)
         self.artifacts = ArtifactStore(db_path)
+        self.platform = None
         self.trace: list[str] = []
         self.last_shutdown_reason: Optional[str] = None
         self.phase_log: list[str] = []
@@ -622,6 +623,14 @@ class MediaController:
         provisional = "res_" + uuid.uuid4().hex
         now = self.clock.now()
         self._ledger(provisional, job.client_id, ResourceState.REQUESTED, quote, now, None)
+        if self.platform is not None:
+            try:
+                self.platform.authorize_paid(job.client_id, job.id)
+            except Exception as exc:
+                code = getattr(exc, "code", "BILLING_UNAVAILABLE")
+                self._ledger(provisional, job.client_id, ResourceState.FAILED, quote, now, code)
+                self._fail(job, code)
+                return None
         try:
             result: CreateResult = self.provider.create(job.client_id)
         except ProviderCapacityError:

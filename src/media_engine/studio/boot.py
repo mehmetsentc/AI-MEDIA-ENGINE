@@ -9,6 +9,7 @@ from typing import Optional
 
 from media_engine.engines.image.base import ImageEngine, ImageEngineError
 from media_engine.orchestrator.controller import MediaController, WallClock
+from media_engine.platform.service import Platform
 from media_engine.providers.fake import FakeGPUProvider
 from media_engine.safety.limits import SafetyLimits, limits_from_env
 from media_engine.studio.dev_engine import DevImageEngine
@@ -58,7 +59,7 @@ def build_controller(root: Path, mode: Optional[str] = None,
         live_external_providers=True, max_gpu_workers=1, max_job_attempts=1,
     ))
     provider = VastImageProvider(api_key=key, limits=limits, now=clock.now, runtime=root)
-    return MediaController(
+    controller = MediaController(
         str(root / "studio.sqlite3"),
         str(root / "artifacts"),
         clock=clock,
@@ -66,6 +67,8 @@ def build_controller(root: Path, mode: Optional[str] = None,
         provider=provider,
         image_engine=RealProviderRequired(),
     )
+    controller.platform = Platform(str(root / "platform.sqlite3"))
+    return controller
 
 
 def budget_usd(environ: Optional[dict] = None) -> Optional[Decimal]:
