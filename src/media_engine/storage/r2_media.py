@@ -8,7 +8,7 @@ from media_engine.engines.image.r2_cache import R2Client, R2Config
 from media_engine.platform.repository import PlatformBlocked
 
 MODEL_BUCKET = "ai-media-engine-models"
-MEDIA_BUCKET = "ai-media-engine-media"
+MEDIA_BUCKET = "daidoi-media"
 
 
 class MediaStorageError(RuntimeError):

@@ -8,7 +8,7 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$")
 _EXT = re.compile(r"^[a-z0-9]{1,8}$")
 _KINDS = frozenset({"images", "voice", "music", "audio", "video"})
 
-MEDIA_BUCKET = "ai-media-engine-media"
+MEDIA_BUCKET = "daidoi-media"
 
 
 def media_bucket() -> str:

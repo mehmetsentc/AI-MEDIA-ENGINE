@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from media_engine.platform.keys import media_bucket, object_key, storage_limit
+from media_engine.platform.keys import MEDIA_BUCKET, media_bucket, object_key, storage_limit
 from media_engine.platform.repository import PlatformBlocked, SqliteRepository
 from media_engine.platform.schema import LEDGER_TYPES, METER_TYPES, PLAN_CATEGORIES
 
@@ -31,7 +31,7 @@ class MemoryMedia:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.fail_next = False
-        self.bucket = "ai-media-engine-media"
+        self.bucket = MEDIA_BUCKET
 
     def put(self, key: str, data: bytes) -> None:
         if self.fail_next:
