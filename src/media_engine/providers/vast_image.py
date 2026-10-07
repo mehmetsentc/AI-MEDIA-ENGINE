@@ -1,7 +1,7 @@
-"""Vast image worker for the persistent Qwen cache on one machine.
+"""Vast image worker. Prefer the warm cache, otherwise stage it from R2.
 
-This provider creates at most one GPU at a time, attaches the existing
-volume, and never starts a model download.
+One GPU at a time. The warm volume is attached only when the chosen
+machine is the machine that already holds it.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import shlex
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Optional
@@ -40,8 +41,14 @@ MACHINE_ID = 47281
 VOLUME_ID = 54653022
 MOUNT_PATH = "/models"
 REVISION = "75e0b4be04f60ec59a75f475837eced720f823b6"
-DISK_GB = 40
+WARM_DISK_GB = 40
+COLD_DISK_GB = 140
 MIN_VRAM_MIB = 44 * 1024
+OPERATION_BUDGET_USD = Decimal("1.00")
+OVERHEAD_SECONDS = 600
+# Planning rate is a quarter of the advertised download, between the slow
+# and fast transfers already measured on Vast.
+LINE_FRACTION = 0.25
 BUNDLES = "https://console.vast.ai/api/v0/bundles/"
 VOLUMES = "https://console.vast.ai/api/v0/volumes/?owner=me"
 VENV = "/workspace/phase2d-venv"
@@ -97,9 +104,15 @@ class VastImageProvider(GPUProvider):
         self._sleep = sleep or time.sleep
         self.runtime = runtime or Path(os.environ.get("MEDIA_ENGINE_RUNTIME", "runtime"))
         self.gpu_model = ""
-        self.machine_id = str(MACHINE_ID)
+        self.machine_id = ""
         self.hourly_amount = Decimal("0")
         self.offer_id = ""
+        self.cache_source = ""
+        self.disk_gb = WARM_DISK_GB
+        self.fits_operation_budget = False
+        self.projected_cost_usd = Decimal("0")
+        self.transfer_seconds = None
+        self.transfer_mb_per_sec = None
         self._put_done = False
         self._owner = ""
         self._label = ""
@@ -121,9 +134,16 @@ class VastImageProvider(GPUProvider):
         chosen = self._select_offer()
         if chosen is None:
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
-        self.offer_id = str(chosen["id"])
-        self.gpu_model = str(chosen.get("gpu_name") or "")
-        self.hourly_amount = _hourly(chosen)
+        self.offer_id = chosen.offer_id
+        self.gpu_model = chosen.gpu_model
+        self.machine_id = str(chosen.machine_id)
+        self.hourly_amount = chosen.hourly
+        self.cache_source = chosen.source
+        self.disk_gb = chosen.disk_gb
+        self.projected_cost_usd = chosen.projected_cost
+        self.fits_operation_budget = chosen.projected_cost <= OPERATION_BUDGET_USD
+        if chosen.source == "r2_cold_stage" and not _r2_configured():
+            raise WorkerStageError("MODEL_CACHE_INVALID")
         return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
 
     def create(self, owner: str) -> CreateResult:
@@ -136,11 +156,14 @@ class VastImageProvider(GPUProvider):
         body = {
             "label": label,
             "image": INSTANCE_IMAGE,
-            "disk": DISK_GB,
+            "disk": self.disk_gb,
             "runtype": "ssh",
             "cancel_unavail": True,
-            "volume_info": {"mount_path": MOUNT_PATH, "create_new": False, "volume_id": VOLUME_ID},
         }
+        if self.cache_source == "warm_cache":
+            body["volume_info"] = {
+                "mount_path": MOUNT_PATH, "create_new": False, "volume_id": VOLUME_ID,
+            }
         status, raw = self._request("PUT", f"https://console.vast.ai/api/v0/asks/{self.offer_id}/", body)
         if status <= 0:
             outcome, instance_id = "ambiguous", None
@@ -180,7 +203,7 @@ class VastImageProvider(GPUProvider):
         if row is None:
             return OBSERVE_GONE if resource_id not in self._gone else OBSERVE_GONE
         label = str(row.get("label") or "")
-        if label != ownership_label(owner) or int(row.get("machine_id") or 0) != MACHINE_ID:
+        if label != ownership_label(owner) or not self._same_machine(row):
             return OBSERVE_FOREIGN
         return OBSERVE_PRESENT
 
@@ -191,7 +214,7 @@ class VastImageProvider(GPUProvider):
             self._put_done = False
             return
         label = str(row.get("label") or "")
-        if not label.startswith("media-engine:") or int(row.get("machine_id") or 0) != MACHINE_ID:
+        if not label.startswith("media-engine:") or not self._same_machine(row):
             raise WorkerStageError("OWNERSHIP_MISMATCH")
         if str(row.get("id")) != str(resource_id):
             raise WorkerStageError("OWNERSHIP_MISMATCH")
@@ -223,8 +246,10 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("WORKER_BOOT_FAILED")
 
     def confirm_cache(self, resource_id: str) -> None:
-        code, out, _err = self._remote(_CACHE_CHECK, 60)
-        if code != 0 or not _cache_ok(out):
+        if self.cache_source == "r2_cold_stage":
+            self._stage_r2()
+        code, out, _err = self._remote(_CACHE_CHECK, 120)
+        if code != 0 or not _cache_ok(out, require_mount=self.cache_source != "r2_cold_stage"):
             raise WorkerStageError("MODEL_CACHE_INVALID")
 
     def prepare_runtime(self, resource_id: str) -> None:
@@ -307,13 +332,19 @@ class VastImageProvider(GPUProvider):
                 return True
         return False
 
-    def _select_offer(self) -> Optional[dict]:
+    def _same_machine(self, row: dict) -> bool:
+        if not self.machine_id:
+            return True
+        return int(row.get("machine_id") or 0) == int(self.machine_id)
+
+    def _select_offer(self) -> Optional["ImageChoice"]:
         status, raw = self._request("POST", BUNDLES, {
-            "limit": 16,
+            "limit": 64,
             "type": "on-demand",
             "rentable": {"eq": True},
             "num_gpus": {"eq": 1},
-            "machine_id": {"eq": MACHINE_ID},
+            "gpu_ram": {"gte": MIN_VRAM_MIB},
+            "order": [["dph_total", "asc"]],
         })
         if status != 200:
             return None
@@ -324,26 +355,47 @@ class VastImageProvider(GPUProvider):
         offers = payload.get("offers") if isinstance(payload, dict) else None
         if not isinstance(offers, list):
             return None
-        ranked = []
-        for row in offers:
-            if not isinstance(row, dict) or row.get("rentable") is not True:
-                continue
-            if int(row.get("machine_id") or MACHINE_ID) != MACHINE_ID:
-                continue
-            ram = float(row.get("gpu_ram") or 0)
-            if ram < MIN_VRAM_MIB:
+        return choose_offer(
+            offers,
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=self.limits.max_hourly_price_usd,
+            operation_budget=OPERATION_BUDGET_USD,
+        )
+
+    def _stage_r2(self) -> None:
+        from media_engine.engines.image import model_cache, qwen_remote, r2_cache
+        from media_engine.providers.phase2d import r2_worker_env
+        from media_engine.providers.vast_ssh import WorkerSSH
+        env = dict(os.environ)
+        env["MODEL_CACHE_PROVIDER"] = "r2"
+        payload = r2_worker_env(env)
+        if payload is None or not self._host or not self._port:
+            raise WorkerStageError("MODEL_CACHE_INVALID")
+        worker = getattr(self, "_worker_ssh", None) or WorkerSSH(self.runtime)
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        env_path = self.runtime / "phase2e-r2.env"
+        env_path.write_bytes(payload)
+        os.chmod(env_path, 0o600)
+        worker.run(self._host, self._port, "mkdir -p /workspace /models", 30)
+        for module in (model_cache, r2_cache, qwen_remote):
+            path = Path(module.__file__)
+            worker._copy(self._host, self._port, path, "/workspace/" + path.name)
+        worker._copy(self._host, self._port, env_path, "/workspace/phase2d-r2.env")
+        started = time.perf_counter()
+        code, out, _err = self._remote(_R2_SYNC, 5400)
+        self.transfer_seconds = round(time.perf_counter() - started, 3)
+        for line in out.splitlines():
+            if not line.startswith("{"):
                 continue
             try:
-                price = _hourly(row)
-            except WorkerStageError:
+                record = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            preferred = "RTX A" + "6000"
-            prefer = 0 if str(row.get("gpu_name") or "") == preferred else 1
-            ranked.append((prefer, price, row))
-        if not ranked:
-            return None
-        ranked.sort(key=lambda item: (item[0], item[1]))
-        return ranked[0][2]
+            if "MB_per_sec" in record:
+                self.transfer_mb_per_sec = record.get("MB_per_sec")
+        if code != 0:
+            raise WorkerStageError("MODEL_CACHE_INVALID")
 
     def _instances(self) -> list[dict]:
         status, raw = self._request("GET", instances_list_url(), None)
@@ -379,7 +431,7 @@ class VastImageProvider(GPUProvider):
         return [
             str(row.get("id"))
             for row in self._instances()
-            if str(row.get("label") or "") == label and int(row.get("machine_id") or 0) == MACHINE_ID
+            if str(row.get("label") or "") == label and self._same_machine(row)
         ]
 
     def _attach_and_wait(self, resource_id: str) -> None:
@@ -407,7 +459,7 @@ class VastImageProvider(GPUProvider):
                 attached = True
             host = str(row.get("ssh_host") or "")
             port = "" if row.get("ssh_port") is None else str(row.get("ssh_port"))
-            if attached and host and port.isdigit() and int(row.get("machine_id") or 0) == MACHINE_ID:
+            if attached and host and port.isdigit() and self._same_machine(row):
                 code, out, _err = worker.run(host, port, "echo ready", 40)
                 if code == 0 and "ready" in out:
                     self._host = host
@@ -419,14 +471,136 @@ class VastImageProvider(GPUProvider):
         raise WorkerStageError("WORKER_TIMEOUT")
 
 
-def _hourly(row: dict) -> Decimal:
+@dataclass(frozen=True)
+class ImageChoice:
+    offer_id: str
+    machine_id: int
+    gpu_model: str
+    hourly: Decimal
+    disk_gb: int
+    source: str
+    projected_cost: Decimal
+    inet_down: float
+    reliability: float
+
+
+def supports_bf16(name: str) -> bool:
+    """True for GPU families that can run the proven BF16 pipeline."""
+    folded = " ".join(str(name).casefold().replace("_", " ").split())
+    if "rtx 8000" in folded or folded.startswith("cmp") or " cmp" in folded:
+        return False
+    compact = folded.replace(" ", "")
+    allowed = (
+        "a40",
+        "a100",
+        "a800",
+        "a" + "6000",
+        "l40",
+        "409" + "0",
+        "6000ada",
+        "5880ada",
+        "h100",
+        "h200",
+        "b200",
+        "b300",
+        "pro6000",
+        "pro5000",
+    )
+    return any(token in compact for token in allowed)
+
+
+def _r2_configured() -> bool:
+    return all(os.environ.get(name) for name in (
+        "R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+    ))
+
+
+def projected_transfer_seconds(inet_down: float) -> Optional[float]:
+    if inet_down <= 0:
+        return None
+    mb_per_sec = (inet_down / 8.0) * LINE_FRACTION
+    if mb_per_sec <= 0:
+        return None
+    return (QWEN_CACHE_MIN_BYTES / (mb_per_sec * 1_000_000)) + OVERHEAD_SECONDS
+
+
+def choose_offer(
+    offers: list,
+    *,
+    volume_machine: int,
+    volume_ready: bool,
+    max_hourly: Decimal,
+    operation_budget: Decimal,
+) -> Optional[ImageChoice]:
+    """Prefer the warm-cache machine. Otherwise the cheapest cold copy that fits."""
+    warm: list[ImageChoice] = []
+    cold: list[ImageChoice] = []
+    for row in offers:
+        if not isinstance(row, dict) or row.get("rentable") is not True:
+            continue
+        if not supports_bf16(str(row.get("gpu_name") or "")):
+            continue
+        try:
+            ram = float(row.get("gpu_ram") or 0)
+            machine = int(row.get("machine_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ram < MIN_VRAM_MIB or machine <= 0:
+            continue
+        on_warm = volume_ready and machine == volume_machine
+        disk = WARM_DISK_GB if on_warm else COLD_DISK_GB
+        inet = 0.0
+        if on_warm:
+            seconds = float(OVERHEAD_SECONDS)
+        else:
+            try:
+                free = float(row.get("disk_space") or 0)
+                inet = float(row.get("inet_down") or 0)
+            except (TypeError, ValueError):
+                continue
+            if free < COLD_DISK_GB:
+                continue
+            estimated = projected_transfer_seconds(inet)
+            if estimated is None:
+                continue
+            seconds = estimated
+        try:
+            hourly = _hourly(row, disk)
+            reliability = float(row.get("reliability2") or 0)
+        except (WorkerStageError, TypeError, ValueError):
+            continue
+        projected = (hourly * Decimal(str(seconds)) / Decimal(3600)).quantize(Decimal("0.000001"))
+        if projected > operation_budget:
+            continue
+        choice = ImageChoice(
+            offer_id=str(row.get("id")),
+            machine_id=machine,
+            gpu_model=str(row.get("gpu_name") or ""),
+            hourly=hourly,
+            disk_gb=disk,
+            source="warm_cache" if on_warm else "r2_cold_stage",
+            projected_cost=projected,
+            inet_down=inet,
+            reliability=reliability,
+        )
+        (warm if on_warm else cold).append(choice)
+    pool = warm or cold
+    if not pool:
+        return None
+    under = [item for item in pool if item.hourly <= max_hourly]
+    ranked = under or pool
+    ranked.sort(key=lambda item: (item.projected_cost, -item.reliability))
+    return ranked[0]
+
+
+def _hourly(row: dict, disk_gb: int) -> Decimal:
     storage = row.get("storage_cost")
     base = row.get("dph_base")
     if storage in (None, "") or base in (None, ""):
         raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
     try:
         monthly = Decimal(str(storage))
-        amount = Decimal(str(base)) + (monthly * Decimal(DISK_GB) / Decimal(720))
+        amount = Decimal(str(base)) + (monthly * Decimal(disk_gb) / Decimal(720))
     except Exception as exc:
         raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE") from exc
     if monthly <= 0 or amount <= 0:
@@ -440,7 +614,7 @@ def _hourly(row: dict) -> Decimal:
     return amount
 
 
-def _cache_ok(text: str) -> bool:
+def _cache_ok(text: str, *, require_mount: bool = True) -> bool:
     line = ""
     for item in text.splitlines():
         if item.startswith("{"):
@@ -457,15 +631,22 @@ def _cache_ok(text: str) -> bool:
         and payload.get("revision") == REVISION
         and payload.get("files") == QWEN_FILE_COUNT
         and payload.get("bytes") == QWEN_CACHE_MIN_BYTES
-        and payload.get("mount") is True
+        and (payload.get("mount") is True or not require_mount)
     )
 
 
 _CACHE_CHECK = r"""python3 - << 'PY'
-import json, os
+import json, os, sys
+sys.path.insert(0, "/workspace")
 manifest = json.load(open("/models/%s"))
+state = manifest.get("state")
+try:
+    import model_cache
+    state = model_cache.assess_cache(model_cache.Path("/models"))
+except Exception:
+    pass
 print(json.dumps({
-    "state": manifest.get("state"),
+    "state": state,
     "repo": manifest.get("repo_id"),
     "revision": manifest.get("revision"),
     "files": manifest.get("expected_file_count"),
@@ -473,6 +654,16 @@ print(json.dumps({
     "mount": os.path.ismount("/models"),
 }))
 PY""" % MANIFEST_NAME
+
+_R2_SYNC = r"""
+set -eu
+mkdir -p /models /workspace
+set -a
+. /workspace/phase2d-r2.env
+set +a
+printf '%s\n' '{"cache_mount":"/models"}' > /workspace/phase2d_job.json
+PHASE2D_CACHE_SYNC_SECONDS=5000 python3 /workspace/qwen_remote.py cache-sync
+"""
 
 _RUNTIME_INSTALL = f"""
 set -eu

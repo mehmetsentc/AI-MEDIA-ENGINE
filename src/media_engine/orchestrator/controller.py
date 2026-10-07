@@ -478,8 +478,11 @@ class MediaController:
             self._fail(job, exc.code)
             return
         if quote.hourly_price_usd > self.limits.max_hourly_price_usd:
-            self._fail(job, "PRICE_ABOVE_CEILING")
-            return
+            projected = getattr(self.provider, "projected_cost_usd", None)
+            allowed = getattr(self.provider, "fits_operation_budget", False) and projected is not None
+            if not allowed:
+                self._fail(job, "PRICE_ABOVE_CEILING")
+                return
         reusable = self._reusable_worker()
         if reusable is None and self.ledger.unresolved():
             self._fail(job, "UNRESOLVED_RESOURCE")

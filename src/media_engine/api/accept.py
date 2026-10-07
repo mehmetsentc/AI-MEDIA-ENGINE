@@ -23,7 +23,7 @@ PROMPT = (
     "palm trees, warm ambient lighting, sea in the background, premium travel photography, "
     "photorealistic, high detail, natural colors, no logos, no readable text"
 )
-CAP = Decimal("0.30")
+CAP = Decimal("1.00")
 
 
 def _api_key() -> str:
@@ -76,9 +76,22 @@ def _local(server: LocalAPIServer, method: str, path: str, token: str, payload: 
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def _load_r2() -> None:
+    path = ROOT / ".env.r2"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
 def main() -> int:
     if os.environ.get("PHASE2E_ACCEPTANCE") != "1":
         return 2
+    _load_r2()
     vast_key = _api_key()
     token = os.environ.get("AI_MEDIA_ENGINE_API_KEY", "").strip() or hashlib.sha256(os.urandom(32)).hexdigest()
     limits = limits_from_env(SafetyLimits(live_external_providers=True, max_gpu_workers=1, max_job_attempts=1))
@@ -109,18 +122,20 @@ def main() -> int:
         if status != 202 or not report["job_id"]:
             report["state"] = "API_REJECTED"
             return 3
-        deadline = time.time() + 1500
+        _health_status, health = _local(server, "GET", "/health", token)
+        report["health"] = health if isinstance(health, dict) else {}
+        deadline = time.time() + 7000
         done = {}
         while time.time() < deadline:
+            _status, done = _local(server, "GET", "/v1/jobs/" + report["job_id"], token)
+            if isinstance(done, dict) and done.get("status") in {"completed", "failed"}:
+                break
             hourly = provider.hourly_amount or Decimal("0.38")
             spent = (hourly * Decimal(str(max(0.0, time.time() - started))) / Decimal(3600)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
             report["spent"] = str(spent)
             if spent >= CAP - Decimal("0.02"):
                 report["state"] = "BUDGET_STOP"
                 return 4
-            _status, done = _local(server, "GET", "/v1/jobs/" + report["job_id"], token)
-            if isinstance(done, dict) and done.get("status") in {"completed", "failed"}:
-                break
             time.sleep(5)
         else:
             report["state"] = "WORKER_TIMEOUT"
@@ -148,6 +163,11 @@ def main() -> int:
         report["instance_id"] = provider._resource_id
         report["gpu"] = provider.gpu_model
         report["hourly"] = str(provider.hourly_amount)
+        report["cache_source"] = provider.cache_source
+        report["offer_id"] = provider.offer_id
+        report["machine_id"] = provider.machine_id
+        report["transfer_seconds"] = provider.transfer_seconds
+        report["transfer_mb_per_sec"] = provider.transfer_mb_per_sec
         born = provider._started_at.get(report["instance_id"]) if report["instance_id"] else None
         try:
             controller.release_worker("ACCEPTANCE_SHUTDOWN")
@@ -179,7 +199,8 @@ def main() -> int:
         print(json.dumps({key: report.get(key) for key in (
             "state", "base_url", "job_id", "post_body_status", "job", "artifact",
             "gpu", "hourly", "instance_id", "lifetime_seconds", "calculated_cost",
-            "active_paid_instances", "volume_preserved",
+            "cache_source", "offer_id", "machine_id", "transfer_seconds", "transfer_mb_per_sec",
+            "active_paid_instances", "volume_preserved", "health",
         )}))
 
 

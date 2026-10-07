@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -18,11 +19,15 @@ from media_engine.jobs.model import PUBLIC_PROGRESS
 from media_engine.orchestrator.controller import ManualClock, MediaController
 from media_engine.providers.base import WorkerStageError
 from media_engine.providers.fake import FakeGPUProvider
+from media_engine.engines.image.qwen_remote import _load_workspace_module
 from media_engine.providers.vast_image import (
+    COLD_DISK_GB,
     MACHINE_ID,
     VOLUME_ID,
+    _R2_SYNC,
     _RUNTIME_INSTALL,
     _generate_command,
+    choose_offer,
     VastImageProvider,
 )
 from media_engine.safety.limits import SafetyLimits, limits_from_env
@@ -397,3 +402,95 @@ class Phase2ETests(unittest.TestCase):
         with self.assertRaises(WorkerStageError) as caught:
             provider.confirm_cache("1")
         self.assertEqual(caught.exception.code, "MODEL_CACHE_INVALID")
+
+    def test_warm_cache_wins_when_that_machine_is_rentable(self) -> None:
+        choice = choose_offer(
+            [
+                _offer(9, "A40", 999, inet_down=8000, disk_space=400, dph_base="0.20"),
+                _offer(8, "RTX A6000", MACHINE_ID, inet_down=100, disk_space=40, dph_base="0.40"),
+            ],
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=Decimal("0.60"),
+            operation_budget=Decimal("1.00"),
+        )
+        self.assertIsNotNone(choice)
+        assert choice is not None
+        self.assertEqual(choice.source, "warm_cache")
+        self.assertEqual(choice.machine_id, MACHINE_ID)
+        self.assertEqual(choice.disk_gb, 40)
+
+    def test_cold_stage_when_warm_machine_is_not_rentable(self) -> None:
+        os.environ["R2_ENDPOINT"] = "https://example.invalid"
+        os.environ["R2_BUCKET"] = "cache"
+        os.environ["R2_ACCESS_KEY_ID"] = "fixture"
+        os.environ["R2_SECRET_ACCESS_KEY"] = "fixture"
+        self.addCleanup(lambda: [os.environ.pop(name, None) for name in (
+            "R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+        )])
+        cold = _offer(21, "A40", 151326, inet_down=2000, disk_space=400, dph_base="0.40")
+        responses = [
+            (200, json.dumps({"volumes": [{"id": VOLUME_ID, "machine_id": MACHINE_ID}]}).encode()),
+            (200, json.dumps({"offers": [
+                _offer(1, "RTX A6000", MACHINE_ID, rentable=False),
+                cold,
+            ]}).encode()),
+            (200, json.dumps({"success": True, "new_contract": 91}).encode()),
+        ]
+        calls: list[tuple[str, str, bytes]] = []
+
+        def transport(method, url, body, headers):
+            calls.append((method, url, body))
+            return responses.pop(0)
+
+        provider = VastImageProvider(api_key="fixture-key", transport=transport, now=self.clock.now, sleep=lambda _s: None)
+        provider.quote("nahaber")
+        self.assertEqual(provider.cache_source, "r2_cold_stage")
+        self.assertEqual(provider.machine_id, "151326")
+        self.assertLessEqual(provider.projected_cost_usd, Decimal("1.00"))
+        provider.create("nahaber")
+        sent = json.loads(calls[2][2].decode("utf-8"))
+        self.assertNotIn("volume_info", sent)
+        self.assertEqual(sent["disk"], COLD_DISK_GB)
+        self.assertIn("qwen_remote.py cache-sync", _R2_SYNC)
+        self.assertNotIn("spec_from_file_location", _R2_SYNC)
+        loaded = _load_workspace_module(
+            "phase2d_r2_cache_test",
+            str(Path("src/media_engine/engines/image/r2_cache.py").resolve()),
+        )
+        self.assertEqual(loaded.COMPLETE, "COMPLETE")
+
+    def test_slow_link_is_rejected_when_the_copy_would_exceed_the_budget(self) -> None:
+        choice = choose_offer(
+            [_offer(3, "RTX A6000", 139301, inet_down=20, disk_space=400, dph_base="0.32")],
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=Decimal("0.60"),
+            operation_budget=Decimal("1.00"),
+        )
+        self.assertIsNone(choice)
+
+
+def _offer(
+    offer_id: int,
+    gpu: str,
+    machine: int,
+    *,
+    rentable: bool = True,
+    inet_down: float = 1000,
+    disk_space: float = 400,
+    dph_base: str = "0.40",
+) -> dict:
+    return {
+        "id": offer_id,
+        "gpu_name": gpu,
+        "gpu_ram": 49140,
+        "machine_id": machine,
+        "rentable": rentable,
+        "dph_base": dph_base,
+        "dph_total": dph_base,
+        "storage_cost": "0.20",
+        "inet_down": inet_down,
+        "disk_space": disk_space,
+        "reliability2": 0.99,
+    }
