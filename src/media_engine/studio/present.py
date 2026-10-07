@@ -6,15 +6,15 @@ from typing import Optional
 CAPACITY = "PROVIDER_CAPACITY_UNAVAILABLE"
 
 _PHASES = {
-    "queued": ("Creating image", "progress"),
-    "planning": ("Creating image", "progress"),
+    "queued": ("Preparing", "progress"),
+    "planning": ("Preparing", "progress"),
     "waiting_capacity": ("Waiting for available GPU capacity", "waiting"),
-    "provisioning": ("Preparing", "progress"),
-    "booting": ("Preparing", "progress"),
-    "runtime_preparing": ("Preparing", "progress"),
-    "model_loading": ("Preparing", "progress"),
-    "generating": ("Generating", "progress"),
-    "saving": ("Saving", "progress"),
+    "provisioning": ("Starting AI worker", "progress"),
+    "booting": ("Starting AI worker", "progress"),
+    "runtime_preparing": ("Starting AI worker", "progress"),
+    "model_loading": ("Loading image model", "progress"),
+    "generating": ("Generating image", "progress"),
+    "saving": ("Saving result", "progress"),
     "completed": ("Complete", "done"),
     "failed": ("Could not create the image", "error"),
     "draft": ("Ready", "idle"),

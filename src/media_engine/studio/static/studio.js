@@ -1,15 +1,15 @@
 "use strict";
 
 const PHASES = {
-  queued: ["Creating image", "progress"],
-  planning: ["Creating image", "progress"],
+  queued: ["Preparing", "progress"],
+  planning: ["Preparing", "progress"],
   waiting_capacity: ["Waiting for available GPU capacity", "waiting"],
-  provisioning: ["Preparing", "progress"],
-  booting: ["Preparing", "progress"],
-  runtime_preparing: ["Preparing", "progress"],
-  model_loading: ["Preparing", "progress"],
-  generating: ["Generating", "progress"],
-  saving: ["Saving", "progress"],
+  provisioning: ["Starting AI worker", "progress"],
+  booting: ["Starting AI worker", "progress"],
+  runtime_preparing: ["Starting AI worker", "progress"],
+  model_loading: ["Loading image model", "progress"],
+  generating: ["Generating image", "progress"],
+  saving: ["Saving result", "progress"],
   completed: ["Complete", "done"],
   failed: ["Could not create the image", "error"],
   draft: ["Ready", "idle"],
@@ -189,6 +189,32 @@ async function redo() {
   await restorePrompt(step.assetId, step.to);
 }
 
+function money(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return "$" + number.toFixed(4);
+}
+
+function flatImage(image) {
+  try {
+    const sample = document.createElement("canvas");
+    sample.width = 8;
+    sample.height = 8;
+    const context = sample.getContext("2d");
+    if (!context) return false;
+    context.drawImage(image, 0, 0, 8, 8);
+    const data = context.getImageData(0, 0, 8, 8).data;
+    for (let index = 4; index < data.length; index += 4) {
+      if (Math.abs(data[index] - data[0]) > 3 || Math.abs(data[index + 1] - data[1]) > 3 || Math.abs(data[index + 2] - data[2]) > 3) {
+        return false;
+      }
+    }
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
 function paintStatus(view) {
   const overlay = document.getElementById("overlay");
   const status = document.getElementById("status");
@@ -245,8 +271,18 @@ function renderCanvas() {
     generate.hidden = true;
   } else if (asset && asset.type === "image" && asset.artifact_id) {
     img.hidden = false;
-    img.src = "/v1/artifacts/" + asset.artifact_id;
     img.alt = "Scene image";
+    img.onload = function () {
+      if (!flatImage(img)) return;
+      img.hidden = true;
+      empty.hidden = false;
+      swatch.hidden = false;
+      swatch.src = img.src;
+      heading.textContent = "Development preview";
+      note.textContent = "This file is local development data, not a finished image.";
+      generate.hidden = true;
+    };
+    img.src = "/v1/artifacts/" + asset.artifact_id;
   } else if (asset && asset.type === "image") {
     empty.hidden = false;
     heading.textContent = "Create your first image";
@@ -469,9 +505,17 @@ function renderInspector() {
   if (hasImage) download.href = "/v1/artifacts/" + asset.artifact_id;
   const costs = document.getElementById("costs");
   const estimate = asset.estimated_cost;
+  const actual = asset.actual_cost;
   const realEstimate = !state.dev && estimate != null && estimate !== "";
-  costs.hidden = !realEstimate;
-  if (realEstimate) document.getElementById("estimated").textContent = String(estimate);
+  const realActual = !state.dev && actual != null && actual !== "";
+  costs.hidden = !(realActual || realEstimate);
+  if (realActual) {
+    document.getElementById("cost-label").textContent = "Actual cost";
+    document.getElementById("estimated").textContent = money(actual);
+  } else if (realEstimate) {
+    document.getElementById("cost-label").textContent = "Estimated cost";
+    document.getElementById("estimated").textContent = money(estimate);
+  }
   document.getElementById("cancel").hidden = true;
 }
 
@@ -598,7 +642,7 @@ async function generateImage(regenerate) {
   state.assetId = asset.id;
   setSave("Saving");
   render();
-  paintStatus({ phase: "queued", title: "Creating image", tone: "progress", progress: 0.05 });
+  paintStatus({ phase: "queued", title: "Preparing", tone: "progress", progress: 0.05 });
   try {
     const patch = { prompt: prompt };
     if (!regenerate && seedField) patch.seed = Number(seedField);

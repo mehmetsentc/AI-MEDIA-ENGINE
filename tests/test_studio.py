@@ -10,6 +10,8 @@ from pathlib import Path
 from media_engine.api.app import LocalAPIServer, authorize, dispatch
 from media_engine.orchestrator.controller import ManualClock, MediaController
 from media_engine.providers.fake import FakeGPUProvider
+from media_engine.engines.image.base import ImageEngineError
+from media_engine.studio.boot import build_controller, resolve_studio_mode
 from media_engine.studio.dev_engine import DevImageEngine
 from media_engine.studio.present import present_job
 
@@ -112,6 +114,12 @@ class StudioTests(unittest.TestCase):
         self.assertEqual(waiting["phase"], "waiting_capacity")
         self.assertEqual(waiting["title"], "Waiting for available GPU capacity")
         self.assertEqual(waiting["tone"], "waiting")
+        self.assertEqual(present_job({"status": "queued"})["title"], "Preparing")
+        self.assertEqual(present_job({"status": "provisioning"})["title"], "Starting AI worker")
+        self.assertEqual(present_job({"status": "model_loading"})["title"], "Loading image model")
+        self.assertEqual(present_job({"status": "generating"})["title"], "Generating image")
+        self.assertEqual(present_job({"status": "saving"})["title"], "Saving result")
+        self.assertEqual(present_job({"status": "completed"})["title"], "Complete")
         failed = present_job({"status": "failed", "error_code": "GENERATION_FAILED", "progress": 0.8})
         self.assertEqual(failed["tone"], "error")
         self.assertNotIn("Vast", failed["title"])
@@ -120,6 +128,9 @@ class StudioTests(unittest.TestCase):
         self.assertIn("Waiting for available GPU capacity", page)
         self.assertIn("PROVIDER_CAPACITY_UNAVAILABLE", page)
         self.assertIn('waiting_capacity: ["Waiting for available GPU capacity", "waiting"]', page)
+        self.assertIn("Loading image model", page)
+        self.assertIn("Actual cost", page)
+        self.assertIn("state.dev", page)
         self.assertIn("Generate Image", html)
         self.assertIn("What do you want to create?", html)
         self.assertNotIn("machine_id", page)
@@ -150,6 +161,24 @@ class StudioTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(created["name"], "With session")
         self.assertEqual(payload["error"], "UNAUTHORIZED")
+
+    def test_development_mode_stays_on_the_fake_provider(self) -> None:
+        self.assertEqual(resolve_studio_mode({"STUDIO_MODE": "development"}), "development")
+        self.assertEqual(resolve_studio_mode({"STUDIO_MODE": "production"}), "real")
+        controller = build_controller(Path(self.tmp.name) / "dev", "development")
+        self.assertEqual(controller.provider.name, "fake")
+        self.assertIsInstance(controller.image_engine, DevImageEngine)
+        controller.stop()
+
+    def test_real_mode_refuses_a_preview_image(self) -> None:
+        controller = build_controller(
+            Path(self.tmp.name) / "real", "real", {"VAST_API_KEY": "unit-test-vast-secret"},
+        )
+        self.addCleanup(controller.stop)
+        self.assertEqual(controller.provider.name, "vast")
+        self.assertTrue(callable(getattr(controller.provider, "generate")))
+        with self.assertRaises(ImageEngineError):
+            controller.image_engine.render("A cinematic resort")
 
 
 def _http(server: LocalAPIServer, method: str, path: str, payload: dict | None = None,
