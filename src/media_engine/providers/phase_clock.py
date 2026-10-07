@@ -13,6 +13,7 @@ from dataclasses import dataclass
 PHASE_LIMITS: dict[str, tuple[float, float]] = {
     "provisioning": (180.0, 120.0),
     "connecting": (420.0, 240.0),
+    "worker_ready": (420.0, 180.0),
     "cache_staging": (2400.0, 180.0),
     "runtime_preparing": (900.0, 300.0),
     "model_loading": (600.0, 300.0),

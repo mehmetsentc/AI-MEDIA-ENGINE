@@ -67,6 +67,7 @@ class FakeGPUProvider(GPUProvider):
         self._fail_stage("boot", "WORKER_BOOT_FAILED")
         self._fail_stage("timeout", "WORKER_TIMEOUT")
         self._fail_stage("connect", "CONNECT_TIMEOUT")
+        self._fail_stage("ready", "WORKER_READY_TIMEOUT")
 
     def confirm_cache(self, resource_id: str) -> None:
         self._require(resource_id)

@@ -16,7 +16,9 @@ from media_engine.providers.vast_image import (
     VOLUME_ID,
     _generate_command,
     choose_offer,
+    classify_readiness,
     cold_stage_allowed,
+    pinned_worker_reference,
     plan_cold_stage,
     worker_image,
     VastImageProvider,
@@ -57,6 +59,7 @@ class PhaseClockTests(unittest.TestCase):
             {
                 "provisioning",
                 "connecting",
+                "worker_ready",
                 "cache_staging",
                 "runtime_preparing",
                 "model_loading",
@@ -114,6 +117,16 @@ class PhaseClockTests(unittest.TestCase):
                 return 200, b'{"success": true}'
             return 200, b"{}"
 
+        previous = os.environ.get("MEDIA_ENGINE_WORKER_IMAGE")
+        os.environ["MEDIA_ENGINE_WORKER_IMAGE"] = INSTANCE_IMAGE
+
+        def restore_image() -> None:
+            if previous is None:
+                os.environ.pop("MEDIA_ENGINE_WORKER_IMAGE", None)
+            else:
+                os.environ["MEDIA_ENGINE_WORKER_IMAGE"] = previous
+
+        self.addCleanup(restore_image)
         provider = VastImageProvider(
             api_key="fixture-key",
             transport=transport,
@@ -268,6 +281,9 @@ class PhaseClockTests(unittest.TestCase):
         self.assertFalse(template["model_weights_baked"])
         self.assertEqual(template["warm_volume"]["id"], VOLUME_ID)
         self.assertEqual(template["image_env"], "MEDIA_ENGINE_WORKER_IMAGE")
+        self.assertFalse(template["ssh_required_for_bootstrap"])
+        self.assertIn("worker_ready.py", template["auto_start"])
+        self.assertNotIn(":latest", template["image"])
         previous = os.environ.pop("MEDIA_ENGINE_WORKER_IMAGE", None)
 
         def restore() -> None:
@@ -277,10 +293,155 @@ class PhaseClockTests(unittest.TestCase):
                 os.environ["MEDIA_ENGINE_WORKER_IMAGE"] = previous
 
         self.addCleanup(restore)
-        self.assertEqual(worker_image(), INSTANCE_IMAGE)
+        pinned = pinned_worker_reference()
+        if pinned:
+            self.assertEqual(worker_image(), pinned)
+            self.assertIn("@sha256:", pinned)
+        else:
+            self.assertEqual(worker_image(), INSTANCE_IMAGE)
         os.environ["MEDIA_ENGINE_WORKER_IMAGE"] = "example.invalid/ai-media-engine-image-worker:runtime"
         self.assertEqual(worker_image(), "example.invalid/ai-media-engine-image-worker:runtime")
 
     def test_phase_failures_are_cleaned_up(self) -> None:
-        for code in ("CONNECT_TIMEOUT", "CACHE_STALL", "CACHE_TIMEOUT", "RUNTIME_TIMEOUT"):
+        for code in ("CONNECT_TIMEOUT", "CACHE_STALL", "CACHE_TIMEOUT", "RUNTIME_TIMEOUT", "WORKER_READY_TIMEOUT"):
             self.assertIn(code, _DESTROY_ON)
+
+
+PIN = "ghcr.io/mehmetsentc/ai-media-engine-worker@sha256:" + ("a" * 64)
+_SECRET_MARKERS = ("R2_ACCESS_KEY", "R2_SECRET", "VAST_API_KEY", "AI_MEDIA_ENGINE_API_KEY", ".env.r2", "COPY .env")
+
+
+class PortableWorkerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.previous = os.environ.get("MEDIA_ENGINE_WORKER_IMAGE")
+        os.environ["MEDIA_ENGINE_WORKER_IMAGE"] = PIN
+
+    def tearDown(self) -> None:
+        if self.previous is None:
+            os.environ.pop("MEDIA_ENGINE_WORKER_IMAGE", None)
+        else:
+            os.environ["MEDIA_ENGINE_WORKER_IMAGE"] = self.previous
+
+    def test_running_instance_is_not_worker_ready(self) -> None:
+        self.assertEqual(classify_readiness("running", False, None), "instance_running")
+        self.assertEqual(
+            classify_readiness("running", True, {"state": "container_starting", "runtime": False}),
+            "container_starting",
+        )
+        self.assertEqual(
+            classify_readiness("running", True, {"state": "worker_ready", "runtime": True}),
+            "worker_ready",
+        )
+        self.assertNotEqual(classify_readiness("running", False, None), "worker_ready")
+
+    def test_create_starts_the_worker_without_ssh_bootstrap(self) -> None:
+        sent: list[dict] = []
+
+        def transport(method, url, body, headers):
+            sent.append(json.loads(body.decode("utf-8")))
+            return 200, b'{"success": true, "new_contract": 5}'
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=Clock().now,
+            sleep=lambda _s: None,
+            ssh_run=lambda *args: (_ for _ in ()).throw(AssertionError("ssh")),
+        )
+        provider.offer_id = "9"
+        provider.disk_gb = 40
+        provider.cache_source = "warm_cache"
+        provider.machine_id = str(MACHINE_ID)
+        provider.create("nahaber")
+        body = sent[0]
+        self.assertEqual(body["image"], PIN)
+        self.assertIn("worker_ready.py", body["onstart"])
+        self.assertNotIn("pip", body["onstart"])
+        encoded = json.dumps(body)
+        for marker in _SECRET_MARKERS:
+            self.assertNotIn(marker, encoded)
+
+    def test_readiness_waits_for_the_health_signal(self) -> None:
+        clock = Clock()
+        ssh_calls = {"n": 0}
+
+        def ssh(*args):
+            ssh_calls["n"] += 1
+            return 0, "", ""
+
+        def transport(method, url, body, headers):
+            if clock.t < 1_015:
+                row = {"id": 7, "actual_status": "running", "machine_id": 26359, "public_ipaddr": "203.0.113.10"}
+            else:
+                row = {
+                    "id": 7,
+                    "actual_status": "running",
+                    "machine_id": 26359,
+                    "public_ipaddr": "203.0.113.10",
+                    "ports": {"8080/tcp": [{"HostPort": "18080"}]},
+                }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        def health(url):
+            if clock.t < 1_030:
+                return 200, b'{"state":"container_starting","runtime":false}'
+            return 200, b'{"state":"worker_ready","runtime":true}'
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=ssh,
+        )
+        provider.machine_id = "26359"
+        provider._health_get = health
+        provider.boot("7")
+        self.assertEqual(provider.worker_state, "worker_ready")
+        self.assertTrue(provider.runtime_ready)
+        self.assertEqual(ssh_calls["n"], 0)
+        provider.prepare_runtime("7")
+        self.assertEqual(ssh_calls["n"], 0)
+
+    def test_readiness_timeout_does_not_use_ssh(self) -> None:
+        clock = Clock()
+
+        def transport(method, url, body, headers):
+            row = {"id": 7, "actual_status": "running", "machine_id": 26359, "public_ipaddr": "203.0.113.10"}
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=lambda *args: (_ for _ in ()).throw(AssertionError("ssh")),
+        )
+        provider.machine_id = "26359"
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, "WORKER_READY_TIMEOUT")
+        self.assertEqual(provider.worker_state, "instance_running")
+        self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][0] + 20)
+
+    def test_image_workflow_and_runtime_contain_no_secrets(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        names = [
+            root / "deploy/worker/Dockerfile",
+            root / "deploy/worker/worker_ready.py",
+            root / "deploy/worker/vast_template.json",
+            root / ".github/workflows/worker-image.yml",
+        ]
+        for path in names:
+            text = path.read_text(encoding="utf-8")
+            for marker in _SECRET_MARKERS:
+                self.assertNotIn(marker, text, path.name)
+        workflow = (root / ".github/workflows/worker-image.yml").read_text(encoding="utf-8")
+        self.assertIn("contents: read", workflow)
+        self.assertIn("packages: write", workflow)
+        self.assertIn("secrets.GITHUB_TOKEN", workflow)
+        self.assertNotIn(":latest", workflow)
+        self.assertIn("sha-${{ github.sha }}", workflow)
+        docker = (root / "deploy/worker/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn('CMD ["python3", "/workspace/worker_ready.py"]', docker)
+        self.assertNotIn("COPY . ", docker)

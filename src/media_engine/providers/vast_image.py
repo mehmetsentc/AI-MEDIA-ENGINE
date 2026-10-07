@@ -116,6 +116,7 @@ class VastImageProvider(GPUProvider):
         self.transfer_seconds = None
         self.transfer_mb_per_sec = None
         self.runtime_ready = False
+        self.worker_state = ""
         self.cost_before_generation_usd = Decimal("0")
         self.last_instance_id = ""
         self._put_done = False
@@ -159,13 +160,24 @@ class VastImageProvider(GPUProvider):
         if not self.offer_id:
             self.quote(owner)
         label = ownership_label(owner)
+        image = worker_image()
         body = {
             "label": label,
-            "image": worker_image(),
+            "image": image,
             "disk": self.disk_gb,
             "runtype": "ssh",
             "cancel_unavail": True,
         }
+        if portable_worker(image):
+            body["onstart"] = WORKER_ONSTART
+            body["env"] = {
+                "HF_HOME": "/models/hf-cache",
+                "HUGGINGFACE_HUB_CACHE": "/models/hf-cache",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_HUB_DISABLE_TELEMETRY": "1",
+                "WORKER_PORT": "8080",
+            }
         if self.cache_source == "warm_cache":
             body["volume_info"] = {
                 "mount_path": MOUNT_PATH, "create_new": False, "volume_id": VOLUME_ID,
@@ -245,6 +257,9 @@ class VastImageProvider(GPUProvider):
         return rows
 
     def boot(self, resource_id: str) -> None:
+        if portable_worker(worker_image()):
+            self._wait_until_ready(resource_id)
+            return
         if self._ssh_run is None:
             self._attach_and_wait(resource_id)
             return
@@ -260,6 +275,8 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("MODEL_CACHE_INVALID")
 
     def prepare_runtime(self, resource_id: str) -> None:
+        if self.runtime_ready:
+            return
         worker = getattr(self, "_worker_ssh", None)
         if worker is not None and self._host and self._port:
             worker.stage(self._host, self._port)
@@ -511,6 +528,50 @@ class VastImageProvider(GPUProvider):
                     return
             self._sleep(5)
 
+    def _wait_until_ready(self, resource_id: str) -> None:
+        """Wait until the worker process reports ready. Instance running is not enough."""
+        watch = PhaseWatch.start("worker_ready", self._now())
+        seen = ""
+        while True:
+            if watch.expired(self._now()):
+                raise WorkerStageError("WORKER_READY_TIMEOUT")
+            row = self._instance_row(resource_id)
+            if row is None:
+                raise WorkerStageError("WORKER_BOOT_FAILED")
+            status_name = str(row.get("actual_status") or "")
+            endpoint = worker_http_endpoint(row)
+            health = self._fetch_health(endpoint) if endpoint else None
+            state = classify_readiness(status_name, endpoint is not None, health)
+            self.worker_state = state
+            if state != seen:
+                seen = state
+                watch.mark(self._now())
+            if state == "worker_ready":
+                self.runtime_ready = True
+                return
+            if state == "worker_failed":
+                raise WorkerStageError("WORKER_BOOT_FAILED")
+            self._sleep(5)
+
+    def _fetch_health(self, endpoint: tuple[str, str]) -> Optional[dict]:
+        url = f"http://{endpoint[0]}:{endpoint[1]}/health"
+        getter = getattr(self, "_health_get", None)
+        try:
+            if getter is not None:
+                status, body = getter(url)
+            else:
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    status, body = int(response.status), response.read(10_000)
+        except Exception:
+            return None
+        if status != 200:
+            return None
+        try:
+            payload = json.loads(body)
+        except (UnicodeError, json.JSONDecodeError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def _watch_cache_sync(self) -> None:
         """Start the R2 copy, then keep it only while bytes keep moving."""
         watch = PhaseWatch.start("cache_staging", self._now())
@@ -636,10 +697,73 @@ def plan_cold_stage(hourly: Decimal, inet_down: float) -> Optional[dict[str, Dec
     }
 
 
+WORKER_ONSTART = (
+    "if ! python3 -c 'import urllib.request; "
+    "urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2)' "
+    ">/dev/null 2>&1; then "
+    "python3 /workspace/worker_ready.py >> /workspace/worker-ready.log 2>&1 & "
+    "fi"
+)
+
+
+def portable_worker(image: str) -> bool:
+    """True when the instance image is the published runtime, not the stock CUDA image."""
+    return image.startswith("ghcr.io/") and "@sha256:" in image
+
+
+def classify_readiness(instance_status: str, has_endpoint: bool, health: Optional[dict]) -> str:
+    """Separate a running VM from a worker that has answered /health."""
+    if str(instance_status) != "running":
+        return "provisioning"
+    if isinstance(health, dict) and health.get("state") == "worker_failed":
+        return "worker_failed"
+    if (
+        isinstance(health, dict)
+        and health.get("state") == "worker_ready"
+        and health.get("runtime") is True
+    ):
+        return "worker_ready"
+    if has_endpoint:
+        return "container_starting"
+    return "instance_running"
+
+
+def worker_http_endpoint(row: dict) -> Optional[tuple[str, str]]:
+    if str(row.get("actual_status") or "") != "running":
+        return None
+    ports = row.get("ports")
+    host = str(row.get("public_ipaddr") or "")
+    if not isinstance(ports, dict) or not host:
+        return None
+    mapped = ports.get("8080/tcp")
+    if not isinstance(mapped, list) or not mapped or not isinstance(mapped[0], dict):
+        return None
+    port = str(mapped[0].get("HostPort") or "")
+    if port.isdigit():
+        return host, port
+    return None
+
+
+def pinned_worker_reference() -> str:
+    path = Path(__file__).resolve().parents[3] / "deploy" / "worker" / "image_ref.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    ref = str(payload.get("pinned_reference") or "").strip()
+    if portable_worker(ref):
+        return ref
+    return ""
+
+
 def worker_image() -> str:
     """Published runtime image, or the stock CUDA image until one is set."""
     configured = os.environ.get("MEDIA_ENGINE_WORKER_IMAGE", "").strip()
-    return configured or INSTANCE_IMAGE
+    if configured:
+        return configured
+    return pinned_worker_reference() or INSTANCE_IMAGE
 
 
 def choose_offer(

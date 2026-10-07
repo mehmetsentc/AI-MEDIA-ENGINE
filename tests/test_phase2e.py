@@ -245,6 +245,7 @@ class Phase2ETests(unittest.TestCase):
             "cache": "MODEL_CACHE_INVALID",
             "load": "MODEL_LOAD_FAILED",
             "connect": "CONNECT_TIMEOUT",
+            "ready": "WORKER_READY_TIMEOUT",
             "cache_stall": "CACHE_STALL",
         }
         for stage, code in cases.items():

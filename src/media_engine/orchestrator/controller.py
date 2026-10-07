@@ -66,6 +66,7 @@ _DESTROY_ON = frozenset({
     "CACHE_STALL",
     "CACHE_TIMEOUT",
     "RUNTIME_TIMEOUT",
+    "WORKER_READY_TIMEOUT",
 })
 
 

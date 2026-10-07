@@ -1,8 +1,11 @@
 {
   "name": "ai-media-engine-image-worker",
   "description": "Runtime-only Vast template. Model weights are not in the image.",
-  "image": "ai-media-engine-image-worker:runtime",
+  "image": "ghcr.io/mehmetsentc/ai-media-engine-worker",
+  "image_repository": "ghcr.io/mehmetsentc/ai-media-engine-worker",
   "image_env": "MEDIA_ENGINE_WORKER_IMAGE",
+  "auto_start": "python3 /workspace/worker_ready.py",
+  "ssh_required_for_bootstrap": false,
   "runtype": "ssh",
   "ssh": true,
   "jupyter": false,
@@ -17,7 +20,7 @@
     "TRANSFORMERS_OFFLINE": "1",
     "HF_HUB_DISABLE_TELEMETRY": "1"
   },
-  "onstart": "",
+  "onstart": "python3 /workspace/worker_ready.py",
   "python": "3.12",
   "preinstalled": [
     "torch==2.11.0+cu128",
@@ -44,6 +47,7 @@
     "image": "${MEDIA_ENGINE_WORKER_IMAGE}",
     "disk": "40 on the warm machine, else 140",
     "runtype": "ssh",
+    "onstart": "python3 /workspace/worker_ready.py",
     "label": "media-engine:{owner}"
   }
 }
