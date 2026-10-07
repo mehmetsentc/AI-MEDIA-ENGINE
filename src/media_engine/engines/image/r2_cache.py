@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,7 +25,12 @@ def _contract():
         if spec is None or spec.loader is None:
             raise
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(spec.name, None)
+            raise
         return module
 
 

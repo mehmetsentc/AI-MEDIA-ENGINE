@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import struct
 import tempfile
 import unittest
@@ -43,6 +44,7 @@ from media_engine.providers.phase2d import (
     projected_max_cost,
     quote_all_in,
     record_host_quarantine,
+    r2_worker_env,
     run_phase2d,
     run_ssh_runtime,
     select_one,
@@ -609,12 +611,75 @@ class Phase2DTests(unittest.TestCase):
         self.assertIn("torch,diffusers,transformers,accelerate", stages["PYTHON_ENV_VERIFY"])
         self.assertIn("DISK_BEFORE_DOWNLOAD", stages["DISK_BEFORE_DOWNLOAD"])
         self.assertIn("apt_fallback", stages["PYTHON_ENV_BOOTSTRAP"])
-        self.assertEqual(stages["PYTHON_RUNTIME"], f"{PHASE2D_PYTHON} /workspace/phase2d_gen.py")
+        self.assertEqual(
+            stages["PYTHON_RUNTIME"],
+            "if [ -f /workspace/phase2d-r2.env ]; then set -a; . /workspace/phase2d-r2.env; set +a; fi; "
+            f"exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py",
+        )
+        self.assertNotIn("R2_", stages["PYTHON_RUNTIME"])
         self.assertIn("python3 -m venv --system-site-packages /workspace/phase2d-venv", stages["PYTHON_ENV_BOOTSTRAP"])
+        self.assertIsNone(r2_worker_env({"MODEL_CACHE_PROVIDER": "r2", "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com"}))
+        secret = "s'ecret value"
+        payload = r2_worker_env({
+            "MODEL_CACHE_PROVIDER": "r2",
+            "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
+            "R2_BUCKET": "models",
+            "R2_ACCESS_KEY_ID": "access",
+            "R2_SECRET_ACCESS_KEY": secret,
+        })
+        self.assertIsNotNone(payload)
+        text = payload.decode("utf-8")
+        self.assertIn("R2_SECRET_ACCESS_KEY=" + shlex.quote(secret), text)
+        self.assertNotIn(secret, stages["PYTHON_RUNTIME"])
         self.assertEqual(MAX_CREATE_ATTEMPTS, 1)
         self.assertEqual(policy_fingerprint(), "b716f03932af9c6621a47aff552765061b0fc64aafe8a2b47f37a792f7ab390d")
         argv = ssh_argv("/tmp/id", "ssh.example", "22", "true")
         self.assertIn("IdentitiesOnly=yes", argv)
+
+    def test_r2_env_file_is_uploaded_without_entering_the_command(self) -> None:
+        clock = _StepClock()
+        secret = "s'ecret value"
+        uploaded = {}
+
+        def ssh(host, port, command, data, timeout):
+            if command.startswith("umask 077") and data is not None:
+                uploaded["command"] = command
+                uploaded["data"] = data
+            self.assertNotIn(secret, command)
+            return 0, b"", b""
+
+        def scp(host, port, remote, local, timeout):
+            if str(remote).endswith("phase2d_report.json"):
+                local.write_text('{"strategy": "bf16-cpu-offload"}\n', encoding="utf-8")
+            else:
+                local.write_bytes(_png())
+
+        run_ssh_runtime(
+            instance_id="555",
+            fetch=lambda: _ready_row(),
+            attach=lambda: None,
+            ssh=ssh,
+            scp=scp,
+            deadline=clock.t + 30,
+            now=clock,
+            sleep=clock.sleep,
+            diagnostic_dir=Path(self.artifacts),
+            script=b"x",
+            job=b"{}",
+            r2_env=r2_worker_env({
+                "MODEL_CACHE_PROVIDER": "r2",
+                "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
+                "R2_BUCKET": "models",
+                "R2_ACCESS_KEY_ID": "access",
+                "R2_SECRET_ACCESS_KEY": secret,
+            }),
+            secrets=(secret,),
+        )
+        self.assertIn("umask 077", uploaded["command"])
+        self.assertIn(shlex.quote(secret), uploaded["data"].decode("utf-8"))
+        diagnostic = Path(self.artifacts) / "phase2d-555.diagnostic.json"
+        if diagnostic.exists():
+            self.assertNotIn(secret, diagnostic.read_text(encoding="utf-8"))
 
     def test_pep668_stderr_is_python_env_bootstrap_failure(self) -> None:
         stderr = (

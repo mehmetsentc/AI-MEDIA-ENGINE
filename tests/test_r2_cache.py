@@ -1,6 +1,7 @@
 """R2 model store. No live network, no secrets, no GPU."""
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import json
 import os
@@ -24,6 +25,7 @@ from media_engine.engines.image.model_cache import (
     snapshot_dir,
 )
 from media_engine.engines.image import qwen_remote
+from media_engine.engines.image.qwen_remote import _load_workspace_module
 from media_engine.engines.image import model_cache, r2_cache
 from media_engine.engines.image.r2_cache import (
     PART_SIZE,
@@ -191,6 +193,16 @@ class _Response:
         return False
 
 
+def _worker_module(directory: Path):
+    workspace = directory / "workspace"
+    workspace.mkdir(parents=True)
+    shutil.copy(Path(model_cache.__file__), workspace / "model_cache.py")
+    shutil.copy(Path(r2_cache.__file__), workspace / "r2_cache.py")
+    name = "phase2d_r2_cache_test"
+    sys.modules.pop(name, None)
+    return _load_workspace_module(name, str(workspace / "r2_cache.py"))
+
+
 def _client(opener, part_size: int = 4) -> R2Client:
     return R2Client(config_from_env({
         "MODEL_CACHE_PROVIDER": "r2",
@@ -199,6 +211,126 @@ def _client(opener, part_size: int = 4) -> R2Client:
         "R2_ACCESS_KEY_ID": "access",
         "R2_SECRET_ACCESS_KEY": "secret",
     }), opener=opener, part_size=part_size)
+
+
+def _manifest(state: str = COMPLETE) -> bytes:
+    return json.dumps({
+        "state": state,
+        "repo_id": "Qwen/Qwen-Image",
+        "revision": "rev1",
+        "expected_file_count": 1,
+        "expected_total_bytes": 3,
+        "completed_at": "2026-10-06T00:00:00Z",
+        "validation_status": state,
+        "files": [{"path": "weights.safetensors", "bytes": 3}],
+    }).encode()
+
+
+_LIST_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>hf-cache/models--Qwen--Qwen-Image/blobs/blob</Key></Contents>
+  <Contents><Key>hf-cache/models--Qwen--Qwen-Image/snapshots/rev1/weights.safetensors</Key></Contents>
+</ListBucketResult>"""
+
+
+class WorkerSyncTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mount = Path(self.tmp.name) / "models"
+
+    def test_unregistered_importlib_load_raises_the_live_attribute_error(self) -> None:
+        workspace = Path(self.tmp.name) / "bare"
+        workspace.mkdir()
+        shutil.copy(Path(model_cache.__file__), workspace / "model_cache.py")
+        shutil.copy(Path(r2_cache.__file__), workspace / "r2_cache.py")
+        spec = importlib.util.spec_from_file_location("phase2d_r2_cache_bare", workspace / "r2_cache.py")
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        with self.assertRaises(AttributeError) as raised:
+            spec.loader.exec_module(module)
+        self.assertIsNone(sys.modules.get("phase2d_r2_cache_bare"))
+        self.assertIn("__dict__", str(raised.exception))
+
+    def test_worker_loader_syncs_through_r2client_without_huggingface(self) -> None:
+        worker = _worker_module(Path(self.tmp.name))
+        self.addCleanup(lambda: sys.modules.pop("phase2d_r2_cache_test", None))
+        calls = []
+
+        def opener(request, timeout):
+            url = request.full_url
+            calls.append(url)
+            if "list-type=" in url:
+                return _Response(200, {}, _LIST_XML)
+            if url.endswith("phase2d-cache.json"):
+                return _Response(200, {}, _manifest())
+            if url.endswith("/blob"):
+                return _Response(200, {}, b"abc")
+            if url.endswith("weights.safetensors"):
+                return _Response(200, {"x-amz-meta-hf-symlink": "../../blobs/blob"}, b"")
+            return _Response(404, {}, b"")
+
+        client = worker.R2Client(worker.config_from_env({
+            "MODEL_CACHE_PROVIDER": "r2",
+            "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
+            "R2_BUCKET": "models",
+            "R2_ACCESS_KEY_ID": "access",
+            "R2_SECRET_ACCESS_KEY": "secret",
+        }), opener=opener)
+        body, meta = client.get("phase2d-cache.json")
+        self.assertIsInstance(body, bytes)
+        self.assertIsInstance(meta, dict)
+        self.assertEqual(json.loads(body.decode())["state"], COMPLETE)
+        self.assertIn("list_keys", worker.R2Client.__dict__)
+        keys = client.list_keys("hf-cache/")
+        self.assertEqual(keys, [
+            "hf-cache/models--Qwen--Qwen-Image/blobs/blob",
+            "hf-cache/models--Qwen--Qwen-Image/snapshots/rev1/weights.safetensors",
+        ])
+        calls.clear()
+        downloads = []
+        local = worker.load_from_r2(
+            client, self.mount, lambda *args, **kwargs: downloads.append((args, kwargs)) or "local",
+            min_bytes=3,
+        )
+        blob = self.mount / "hf-cache/models--Qwen--Qwen-Image/blobs/blob"
+        link = self.mount / "hf-cache/models--Qwen--Qwen-Image/snapshots/rev1/weights.safetensors"
+        self.assertFalse(blob.is_symlink())
+        self.assertEqual(blob.read_bytes(), b"abc")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(link), "../../blobs/blob")
+        self.assertEqual(link.read_bytes(), b"abc")
+        self.assertTrue(any("list-type=" in url for url in calls))
+        self.assertEqual(downloads[0][1]["local_files_only"], True)
+        self.assertEqual(local, "local")
+        source = inspect.getsource(worker.sync_complete_cache)
+        self.assertNotIn("snapshot_download", source)
+        self.assertNotIn("huggingface", source.lower())
+        self.assertIn("list_keys", source)
+
+    def test_incomplete_r2client_cache_does_not_list_or_download(self) -> None:
+        worker = _worker_module(Path(self.tmp.name) / "incomplete")
+        self.addCleanup(lambda: sys.modules.pop("phase2d_r2_cache_test", None))
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            return _Response(200, {}, _manifest(FILLING))
+
+        client = worker.R2Client(worker.config_from_env({
+            "MODEL_CACHE_PROVIDER": "r2",
+            "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
+            "R2_BUCKET": "models",
+            "R2_ACCESS_KEY_ID": "access",
+            "R2_SECRET_ACCESS_KEY": "secret",
+        }), opener=opener)
+        with self.assertRaises(worker.ModelCacheNotReady) as raised:
+            worker.sync_complete_cache(client, self.mount, min_bytes=3)
+        self.assertEqual(raised.exception.state, FILLING)
+        self.assertFalse(any("list-type=" in url for url in calls))
+        self.assertFalse((self.mount / "hf-cache").exists())
 
 
 class MultipartUploadTests(unittest.TestCase):

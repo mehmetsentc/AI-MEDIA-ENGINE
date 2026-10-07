@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -587,7 +588,8 @@ def ssh_generate(instance_id: str, offer: GpuOffer, deadline: float) -> tuple[by
         logs=lambda: _instance_logs_live(instance_id, key),
         script=Path(_REMOTE_FILE).read_bytes(),
         job=json.dumps(generation_job()).encode("utf-8"),
-        secrets=(key,),
+        secrets=_runtime_secrets(key),
+        r2_env=r2_worker_env(os.environ),
     )
 
 
@@ -867,7 +869,11 @@ def remote_python_stages() -> list[tuple[str, str]]:
         "print(json.dumps({\"stage\":\"DISK_BEFORE_DOWNLOAD\",\"filesystem\":\"/workspace\","
         "\"total_bytes\":usage.total,\"free_bytes\":usage.free}))'"
     )
-    run = f"{PHASE2D_PYTHON} /workspace/phase2d_gen.py"
+    # Credentials stay in a mode-600 file. The command never contains them.
+    run = (
+        "if [ -f /workspace/phase2d-r2.env ]; then set -a; . /workspace/phase2d-r2.env; set +a; fi; "
+        f"exec {PHASE2D_PYTHON} /workspace/phase2d_gen.py"
+    )
     return [
         ("PYTHON_ENV_BOOTSTRAP", bootstrap),
         ("PYTHON_ENV_INSTALL", install),
@@ -950,6 +956,37 @@ def classify_python_env_failure(stderr: bytes) -> str:
     return "PYTHON_ENV_BOOTSTRAP_FAILED"
 
 
+_R2_ENV_NAMES = (
+    "MODEL_CACHE_PROVIDER",
+    "R2_ENDPOINT",
+    "R2_BUCKET",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+)
+
+
+def r2_worker_env(env: Mapping[str, str]) -> Optional[bytes]:
+    """Shell assignments for the worker. None unless every R2 value is present."""
+    if env.get("MODEL_CACHE_PROVIDER") != "r2":
+        return None
+    lines: list[str] = []
+    for name in _R2_ENV_NAMES:
+        value = env.get(name) or ""
+        if not value.strip():
+            return None
+        lines.append(name + "=" + shlex.quote(value))
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _runtime_secrets(api_key: str) -> tuple[str, ...]:
+    secrets = [api_key]
+    for name in ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"):
+        value = os.environ.get(name) or ""
+        if value:
+            secrets.append(value)
+    return tuple(secrets)
+
+
 def run_ssh_runtime(
     *,
     instance_id: str,
@@ -966,6 +1003,7 @@ def run_ssh_runtime(
     secrets: tuple[str, ...] = (),
     key_fingerprint: str = "",
     logs=None,
+    r2_env: Optional[bytes] = None,
 ) -> tuple[bytes, dict]:
     """Wait until SSH accepts a command, then run the remote generator once."""
     snapshots: list[dict] = []
@@ -1038,12 +1076,15 @@ def run_ssh_runtime(
     if now() >= deadline:
         record("SSH_NOT_READY", None, None, b"", b"", "Phase2DStop")
         raise Phase2DStop("SSH_NOT_READY")
-    for command, data, timeout in (
+    uploads = [
         ("mkdir -p /workspace && cat > /workspace/model_cache.py", Path(_CACHE_FILE).read_bytes(), 60),
         ("cat > /workspace/r2_cache.py", Path(_R2_FILE).read_bytes(), 60),
         ("cat > /workspace/phase2d_gen.py", script, 60),
         ("cat > /workspace/phase2d_job.json", job, 30),
-    ):
+    ]
+    if r2_env is not None:
+        uploads.append(("umask 077 && cat > /workspace/phase2d-r2.env", r2_env, 30))
+    for command, data, timeout in uploads:
         code, out, err = ssh(host, port, command, data, timeout)
         if code != 0:
             record("REMOTE_COMMAND_FAILED", code, code, out, err, "Phase2DStop")

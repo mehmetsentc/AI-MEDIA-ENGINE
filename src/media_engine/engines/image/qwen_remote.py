@@ -1,9 +1,11 @@
 """Runs on the rented GPU. Importing this file does not load the model."""
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -85,6 +87,21 @@ def main() -> int:
     return 0
 
 
+def _load_workspace_module(name: str, path: str):
+    """Load a copied worker module. dataclass needs it in sys.modules first."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
 def _cache_api():
     try:
         from media_engine.engines.image.model_cache import (
@@ -93,12 +110,7 @@ def _cache_api():
             prepare_generation,
         )
     except ImportError:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("phase2d_model_cache", "/workspace/model_cache.py")
-        if spec is None or spec.loader is None:
-            raise
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_workspace_module("phase2d_model_cache", "/workspace/model_cache.py")
         return module.prepare_generation, module.ModelCacheNotReady, module.MOUNT_PATH
     return prepare_generation, ModelCacheNotReady, MOUNT_PATH
 
@@ -107,12 +119,7 @@ def _sync_r2(mount: Path) -> None:
     try:
         from media_engine.engines.image.r2_cache import sync_from_env
     except ImportError:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("phase2d_r2_cache", "/workspace/r2_cache.py")
-        if spec is None or spec.loader is None:
-            raise
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_workspace_module("phase2d_r2_cache", "/workspace/r2_cache.py")
         sync_from_env = module.sync_from_env
     sync_from_env(mount)
 
