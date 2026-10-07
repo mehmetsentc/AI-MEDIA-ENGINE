@@ -1,7 +1,7 @@
 {
   "name": "ai-media-engine-image-worker",
   "description": "Runtime-only Vast template. Model weights are not in the image.",
-  "image": "ghcr.io/mehmetsentc/ai-media-engine-worker",
+  "image": "ghcr.io/mehmetsentc/ai-media-engine-worker@sha256:25f76c48d3fc6db4571558c8c159b0d59ac243c98c2ab979fada4c86aa680091",
   "image_repository": "ghcr.io/mehmetsentc/ai-media-engine-worker",
   "image_env": "MEDIA_ENGINE_WORKER_IMAGE",
   "auto_start": "python3 /workspace/worker_ready.py",

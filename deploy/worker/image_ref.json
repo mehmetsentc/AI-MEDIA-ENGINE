@@ -1,6 +1,6 @@
 {
   "repository": "ghcr.io/mehmetsentc/ai-media-engine-worker",
-  "tag": "",
-  "digest": "",
-  "pinned_reference": ""
+  "tag": "sha-a14b0974dfc18f9c5b9b0437ceabdc576a8b4e2e",
+  "digest": "sha256:25f76c48d3fc6db4571558c8c159b0d59ac243c98c2ab979fada4c86aa680091",
+  "pinned_reference": "ghcr.io/mehmetsentc/ai-media-engine-worker@sha256:25f76c48d3fc6db4571558c8c159b0d59ac243c98c2ab979fada4c86aa680091"
 }
