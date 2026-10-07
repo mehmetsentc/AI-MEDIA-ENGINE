@@ -30,6 +30,8 @@ class UsageEvent:
     credit_delta: Optional[str] = None
     calculated_runtime_cost: Optional[str] = None
     unexplained_cost_delta: Optional[str] = None
+    instance_id: Optional[str] = None
+    machine_id: Optional[str] = None
 
 
 class UsageStore:
@@ -48,8 +50,9 @@ class UsageStore:
                     duration_seconds, attempt_count, estimated_cost_usd, status,
                     provider, gpu_model, hourly_price_usd, gpu_seconds, actual_cost_usd,
                     credit_before, credit_after, credit_delta,
-                    calculated_runtime_cost, unexplained_cost_delta
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    calculated_runtime_cost, unexplained_cost_delta,
+                    instance_id, machine_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.job_id, event.client_id, event.job_type, event.engine_id,
@@ -59,6 +62,7 @@ class UsageStore:
                     event.gpu_seconds, event.actual_cost_usd,
                     event.credit_before, event.credit_after, event.credit_delta,
                     event.calculated_runtime_cost, event.unexplained_cost_delta,
+                    event.instance_id, event.machine_id,
                 ),
             )
             conn.commit()
@@ -97,6 +101,8 @@ class UsageStore:
             credit_delta=row["credit_delta"],
             calculated_runtime_cost=row["calculated_runtime_cost"],
             unexplained_cost_delta=row["unexplained_cost_delta"],
+            instance_id=row["instance_id"] if "instance_id" in row.keys() else None,
+            machine_id=row["machine_id"] if "machine_id" in row.keys() else None,
         )
 
 
@@ -134,6 +140,8 @@ def _ensure_usage_columns(db_path: str) -> None:
         ("credit_delta", "TEXT"),
         ("calculated_runtime_cost", "TEXT"),
         ("unexplained_cost_delta", "TEXT"),
+        ("instance_id", "TEXT"),
+        ("machine_id", "TEXT"),
     )
     conn = connect(db_path)
     try:

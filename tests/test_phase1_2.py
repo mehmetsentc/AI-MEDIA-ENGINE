@@ -22,9 +22,13 @@ from media_engine.safety.limits import (
 )
 
 
+_TEST_API_KEY = "phase1-test-key"
+
+
 def _http(server: LocalAPIServer, method: str, path: str, payload: Optional[dict] = None):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(server.url + path, data=data, method=method)
+    request.add_header("Authorization", "Bearer " + _TEST_API_KEY)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(request, timeout=2) as response:
@@ -55,7 +59,7 @@ class Phase12Tests(unittest.TestCase):
         return MediaController(self.db_path, self.storage_root, **kwargs)
 
     def _serve(self, controller: MediaController) -> LocalAPIServer:
-        server = LocalAPIServer(controller)
+        server = LocalAPIServer(controller, api_key=_TEST_API_KEY)
         self.servers.append(server)
         server.start()
         return server

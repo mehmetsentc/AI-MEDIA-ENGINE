@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import re
+import secrets
 import threading
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import unquote, urlparse
 
 from media_engine.auth.clients import ClientDirectory
 from media_engine.engines.binding import engine_id_for
-from media_engine.engines.image.base import ImageEngine
+from media_engine.engines.image.base import ImageEngine, ImageEngineError
 from media_engine.engines.image.fake import FakeImageEngine
+from media_engine.engines.image.qwen import sha256_hex, validate_png
 from media_engine.engines.text.base import TextEngine
 from media_engine.engines.text.fake import FakeTextEngine
 from media_engine.jobs.model import (
@@ -19,6 +24,7 @@ from media_engine.jobs.model import (
     TEXT_GENERATE,
     AttemptStatus,
     AttemptStore,
+    PUBLIC_PROGRESS,
     Job,
     JobError,
     JobNotFound,
@@ -37,15 +43,36 @@ from media_engine.providers.base import (
     CreateResult,
     ProviderCapacityError,
     Quote,
+    WorkerStageError,
 )
 from media_engine.providers.fake import FakeGPUProvider
 from media_engine.resources.ledger import ResourceLedger, ResourceRecord, ResourceState
 from media_engine.safety.limits import SafetyLimits
+from media_engine.storage.artifacts import Artifact, ArtifactStore
 from media_engine.storage.local import LocalStorage
 from media_engine.usage import UsageEvent, UsageStore
 
 
 _TASK_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+_DESTROY_ON = frozenset({
+    "WORKER_BOOT_FAILED",
+    "RUNTIME_PREPARE_FAILED",
+    "MODEL_CACHE_INVALID",
+    "MODEL_LOAD_FAILED",
+    "WORKER_TIMEOUT",
+})
+
+
+class WallClock:
+    """Production clock. Tests keep ManualClock so idle checks stay deterministic."""
+
+    def now(self) -> float:
+        return datetime.now(timezone.utc).timestamp()
+
+    def iso(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class ManualClock:
@@ -87,6 +114,7 @@ class MediaController:
         self.text_engine = text_engine or FakeTextEngine()
         self.usage = UsageStore(db_path)
         self.storage = LocalStorage(storage_root)
+        self.artifacts = ArtifactStore(db_path)
         self.trace: list[str] = []
         self.last_shutdown_reason: Optional[str] = None
         self.phase_log: list[str] = []
@@ -95,6 +123,8 @@ class MediaController:
         self._worker_id: Optional[str] = None
         self._worker_created_at: Optional[float] = None
         self._worker_idle_since: Optional[float] = None
+        self._worker_meta: dict[str, str] = {}
+        self._busy = False
         self._lock = threading.Lock()
         self._wake = threading.Condition()
         self._ready = threading.Event()
@@ -177,6 +207,71 @@ class MediaController:
         self._notify()
         return job
 
+    def submit_image(self, prompt: str, *, width: int = 1024, height: int = 1024,
+                     seed: Optional[int] = None) -> Job:
+        if width != 1024 or height != 1024 or isinstance(width, bool) or isinstance(height, bool):
+            raise JobError("RESOLUTION_UNSUPPORTED")
+        if seed is None:
+            chosen = secrets.randbelow(2**31)
+        elif isinstance(seed, bool) or not isinstance(seed, int) or seed < 0 or seed >= 2**31:
+            raise JobError("SEED_INVALID")
+        else:
+            chosen = seed
+        with self._lock:
+            now = self.clock.iso()
+            job = Job(
+                id=new_job_id(),
+                client_id="nahaber",
+                job_type=IMAGE_GENERATE,
+                status=JobStatus.QUEUED,
+                created_at=now,
+                updated_at=now,
+                attempt_count=0,
+                result_uri=None,
+                error_code=None,
+                prompt=prompt.strip() if isinstance(prompt, str) else "",
+                width=width,
+                height=height,
+                seed=chosen,
+                public_status="queued",
+                progress=PUBLIC_PROGRESS["queued"],
+            )
+            if not job.prompt or len(job.prompt) > 4000:
+                raise JobError("PROMPT_REQUIRED")
+            self.clients.require(job.client_id)
+            self.jobs.insert(job)
+            self.queue.enqueue(job.id)
+            self.trace.append(f"{job.id}:QUEUED")
+            self._settled.clear()
+        self._notify()
+        return job
+
+    def health(self) -> dict:
+        return {
+            "status": "ok",
+            "service": "ai-media-engine",
+            "image_engine": "qwen-image",
+            "provider": getattr(self.provider, "name", "fake"),
+            "queue": len(self.queue.pending()),
+            "active_workers": 0 if self._worker_id is None else 1,
+        }
+
+    def artifact_bytes(self, artifact_id: str) -> bytes:
+        record = self.artifacts.get(artifact_id)
+        if record is None:
+            raise JobNotFound(artifact_id)
+        path = Path(record.path)
+        if not path.is_file():
+            raise JobNotFound(artifact_id)
+        return path.read_bytes()
+
+    def release_worker(self, reason: str = "ACCEPTANCE_SHUTDOWN") -> Optional[str]:
+        with self._lock:
+            if self._worker_id is None:
+                return None
+            self._terminate(self._worker_id, reason)
+            return self.last_shutdown_reason
+
     def get_job(self, job_id: str) -> Job:
         return self.jobs.get(job_id)
 
@@ -192,12 +287,20 @@ class MediaController:
             return job
 
     def process_available(self) -> None:
-        with self._lock:
-            while True:
+        while True:
+            with self._lock:
+                if self._busy:
+                    return
                 job_id = self.queue.dequeue()
                 if job_id is None:
                     break
+                self._busy = True
+            try:
                 self._run_one(job_id)
+            finally:
+                with self._lock:
+                    self._busy = False
+        with self._lock:
             self._enforce()
 
     def enforce_lifecycle(self) -> Optional[str]:
@@ -221,22 +324,37 @@ class MediaController:
                     if not announced:
                         self._ready.set()
                         announced = True
-                    self._idle_wait(self._wake)
-                    continue
-                if not announced:
-                    self._ready.set()
-                    announced = True
+                    if isinstance(self.clock, WallClock):
+                        self._wake.wait(timeout=1.0)
+                    else:
+                        self._idle_wait(self._wake)
+                    enforce_idle = isinstance(self.clock, WallClock)
+                else:
+                    enforce_idle = False
+                    if not announced:
+                        self._ready.set()
+                        announced = True
+            if enforce_idle:
+                with self._lock:
+                    if not self._stop_requested:
+                        self._enforce()
+                continue
             self._process_next()
 
     def _process_next(self) -> None:
         with self._lock:
-            if self._stop_requested:
+            if self._stop_requested or self._busy:
                 return
             job_id = self.queue.dequeue()
             if job_id is None:
                 return
+            self._busy = True
+        try:
             self._run_one(job_id)
-            self._enforce()
+        finally:
+            with self._lock:
+                self._busy = False
+                self._enforce()
         self._settled.set()
 
     def _reconcile_ledger(self) -> None:
@@ -263,6 +381,13 @@ class MediaController:
             self.ledger.upsert(record)
 
     def _run_one(self, job_id: str) -> None:
+        self._lock.acquire()
+        try:
+            self._run_one_locked(job_id)
+        finally:
+            self._lock.release()
+
+    def _run_one_locked(self, job_id: str) -> None:
         try:
             job = self.jobs.get(job_id)
         except JobNotFound:
@@ -278,6 +403,9 @@ class MediaController:
         self._usage_opened[job.id] = (self.clock.now(), self.clock.iso())
         if job.job_type == TEXT_GENERATE:
             self._run_text(job)
+            return
+        if job.public_status is not None:
+            self._run_public_image(job)
             return
         quote = self.provider.quote(job.client_id)
         if quote.hourly_price_usd > self.limits.max_hourly_price_usd:
@@ -340,6 +468,146 @@ class MediaController:
         job.result_uri = uri
         self._transition(job, JobStatus.SUCCEEDED)
         self._record_usage(job, JobStatus.SUCCEEDED)
+
+    def _run_public_image(self, job: Job) -> None:
+        self._expire_worker()
+        self._set_public(job, "planning")
+        try:
+            quote = self.provider.quote(job.client_id)
+        except WorkerStageError as exc:
+            self._fail(job, exc.code)
+            return
+        if quote.hourly_price_usd > self.limits.max_hourly_price_usd:
+            self._fail(job, "PRICE_ABOVE_CEILING")
+            return
+        reusable = self._reusable_worker()
+        if reusable is None and self.ledger.unresolved():
+            self._fail(job, "UNRESOLVED_RESOURCE")
+            return
+        self._set_public(job, "provisioning")
+        self._transition(job, JobStatus.WAITING_FOR_WORKER)
+        if reusable is None:
+            resource_id = self._create_worker(job, quote)
+            if resource_id is None:
+                return
+        else:
+            resource_id = reusable
+            self.trace.append(f"{resource_id}:REUSED")
+        self._remember_worker(resource_id, quote)
+        try:
+            self._set_public(job, "booting")
+            self._unlocked(lambda: self.provider.boot(resource_id))
+            self._unlocked(lambda: self.provider.confirm_cache(resource_id))
+            self._set_public(job, "runtime_preparing")
+            self._unlocked(lambda: self.provider.prepare_runtime(resource_id))
+            self._set_public(job, "model_loading")
+            self._unlocked(lambda: self.provider.ensure_model(resource_id))
+        except WorkerStageError as exc:
+            self._fail_worker(job, exc.code, resource_id, destroy=exc.code in _DESTROY_ON)
+            return
+        self.provider.begin_busy(resource_id)
+        self._worker_idle_since = None
+        self.trace.append(f"{resource_id}:BUSY")
+        self._transition(job, JobStatus.RUNNING)
+        now_iso = self.clock.iso()
+        attempt_id = self.attempts.start(job.id, now_iso)
+        job.attempt_count += 1
+        job.updated_at = now_iso
+        self.jobs.save(job)
+        self._set_public(job, "generating")
+        try:
+            data = self._unlocked(lambda: self._render_public(job))
+            width, height = validate_png(data)
+            if (width, height) != (job.width, job.height):
+                raise ImageEngineError("RESOLUTION_MISMATCH")
+        except WorkerStageError as exc:
+            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), exc.code)
+            self._fail_worker(job, exc.code, resource_id, destroy=exc.code in _DESTROY_ON)
+            return
+        except ImageEngineError as exc:
+            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "GENERATION_FAILED")
+            self._mark_idle(resource_id)
+            self._fail(job, exc.code or "GENERATION_FAILED")
+            return
+        except Exception:
+            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "GENERATION_FAILED")
+            self._mark_idle(resource_id)
+            self._fail(job, "GENERATION_FAILED")
+            return
+        self._set_public(job, "saving")
+        try:
+            uri = self.storage.put(
+                client_id=job.client_id, job_id=job.id, name="image.png", data=data,
+            )
+            path = Path(unquote(urlparse(uri).path))
+            digest = sha256_hex(data)
+            artifact_id = "art_" + uuid.uuid4().hex
+            self.artifacts.insert(Artifact(
+                artifact_id=artifact_id, job_id=job.id, engine="image", model="qwen-image",
+                prompt=job.prompt, seed=job.seed, width=width, height=height,
+                created_at=self.clock.iso(), byte_count=len(data), sha256=digest, path=str(path),
+            ))
+        except Exception:
+            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "ARTIFACT_TRANSFER_FAILED")
+            self._mark_idle(resource_id)
+            self._fail(job, "ARTIFACT_TRANSFER_FAILED")
+            return
+        self.attempts.finish(attempt_id, AttemptStatus.SUCCEEDED, self.clock.iso())
+        job.result_uri = uri
+        job.artifact_id = artifact_id
+        job.sha256 = digest
+        job.byte_count = len(data)
+        job.width = width
+        job.height = height
+        self._transition(job, JobStatus.SUCCEEDED)
+        self._set_public(job, "completed")
+        self._mark_idle(resource_id)
+        self._record_usage(job, JobStatus.SUCCEEDED)
+
+    def _render_public(self, job: Job) -> bytes:
+        generate = getattr(self.provider, "generate", None)
+        if callable(generate):
+            return generate(prompt=job.prompt, width=job.width or 1024, height=job.height or 1024, seed=job.seed or 0)
+        return self.image_engine.render(
+            job.prompt, width=job.width or 1024, height=job.height or 1024, seed=job.seed or 0,
+        )
+
+    def _unlocked(self, fn: Callable[[], object]) -> object:
+        self._lock.release()
+        try:
+            return fn()
+        finally:
+            self._lock.acquire()
+
+    def _set_public(self, job: Job, status: str) -> None:
+        job.public_status = status
+        job.progress = PUBLIC_PROGRESS[status]
+        job.updated_at = self.clock.iso()
+        self.jobs.save(job)
+        self.trace.append(f"{job.id}:public:{status}")
+
+    def _expire_worker(self) -> None:
+        if self._worker_id is None or self._worker_created_at is None:
+            return
+        if self.clock.now() - self._worker_created_at >= self.limits.max_worker_lifetime_seconds:
+            self._terminate(self._worker_id, "MAX_WORKER_LIFETIME")
+
+    def _remember_worker(self, resource_id: str, quote: Quote) -> None:
+        self._worker_meta = {
+            "provider": quote.provider,
+            "gpu_model": str(getattr(self.provider, "gpu_model", "") or ""),
+            "hourly": str(quote.hourly_price_usd),
+            "instance_id": resource_id,
+            "machine_id": str(getattr(self.provider, "machine_id", "") or ""),
+            "started_epoch": str(self._worker_created_at or self.clock.now()),
+        }
+
+    def _fail_worker(self, job: Job, code: str, resource_id: str, *, destroy: bool) -> None:
+        if destroy:
+            self._terminate(resource_id, code)
+        else:
+            self._mark_idle(resource_id)
+        self._fail(job, code)
 
     def _create_worker(self, job: Job, quote: Quote) -> Optional[str]:
         self.phase_log.append("provision")
@@ -406,6 +674,9 @@ class MediaController:
 
     def _fail(self, job: Job, code: str) -> None:
         job.error_code = code
+        if job.public_status is not None and job.public_status != "failed":
+            job.public_status = "failed"
+            self.trace.append(f"{job.id}:public:failed")
         if job.status != JobStatus.FAILED:
             job.transition_to(JobStatus.FAILED)
         job.updated_at = self.clock.iso()
@@ -419,6 +690,14 @@ class MediaController:
             started_epoch, started_at = self.clock.now(), self.clock.iso()
         else:
             started_epoch, started_at = opened
+        meta = self._worker_meta if job.public_status is not None else {}
+        hourly = meta.get("hourly")
+        lifetime = None
+        cost = None
+        worker_started = meta.get("started_epoch")
+        if hourly and worker_started:
+            lifetime = max(0.0, self.clock.now() - float(worker_started))
+            cost = format(Decimal(hourly) * Decimal(str(lifetime)) / Decimal(3600), "f")
         self.usage.record(UsageEvent(
             job_id=job.id,
             client_id=job.client_id,
@@ -430,6 +709,13 @@ class MediaController:
             attempt_count=job.attempt_count,
             estimated_cost_usd=None,
             status=status,
+            provider=meta.get("provider"),
+            gpu_model=meta.get("gpu_model") or None,
+            hourly_price_usd=hourly,
+            gpu_seconds=lifetime,
+            actual_cost_usd=cost,
+            instance_id=meta.get("instance_id"),
+            machine_id=meta.get("machine_id") or None,
         ))
 
     def _mark_idle(self, resource_id: str) -> None:
@@ -462,7 +748,16 @@ class MediaController:
             record.state = ResourceState.TERMINATING
             record.updated_at = now
             self.ledger.upsert(record)
-        self.provider.terminate(resource_id)
+        try:
+            self.provider.terminate(resource_id)
+        except WorkerStageError:
+            if record is not None:
+                record.state = ResourceState.TERMINATING
+                record.updated_at = now
+                record.last_error = "OWNERSHIP_MISMATCH"
+                self.ledger.upsert(record)
+            self.last_shutdown_reason = "OWNERSHIP_MISMATCH"
+            return
         self.trace.append(f"{resource_id}:STOPPING")
         self.trace.append(f"{resource_id}:TERMINATED")
         if record is not None:

@@ -1,7 +1,8 @@
 """Central safety defaults. External providers fail closed."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Optional
 
@@ -35,6 +36,33 @@ def external_provider_permitted(limits: SafetyLimits) -> bool:
     if limits.global_kill_switch:
         return False
     return limits.live_external_providers is True
+
+
+def limits_from_env(limits: Optional[SafetyLimits] = None) -> SafetyLimits:
+    """Apply operator ceilings. Invalid values fail closed."""
+    current = limits or SafetyLimits()
+    updates: dict[str, object] = {}
+    raw_price = os.environ.get("MEDIA_ENGINE_MAX_GPU_HOURLY_USD", "").strip()
+    if raw_price:
+        try:
+            price = Decimal(raw_price)
+        except Exception as exc:
+            raise ExternalProvidersDisabled("MEDIA_ENGINE_MAX_GPU_HOURLY_USD") from exc
+        if price <= 0:
+            raise ExternalProvidersDisabled("MEDIA_ENGINE_MAX_GPU_HOURLY_USD")
+        updates["max_hourly_price_usd"] = price
+    raw_life = os.environ.get("MEDIA_ENGINE_MAX_WORKER_LIFETIME_SECONDS", "").strip()
+    if raw_life:
+        try:
+            lifetime = float(raw_life)
+        except ValueError as exc:
+            raise ExternalProvidersDisabled("MEDIA_ENGINE_MAX_WORKER_LIFETIME_SECONDS") from exc
+        if lifetime <= 0:
+            raise ExternalProvidersDisabled("MEDIA_ENGINE_MAX_WORKER_LIFETIME_SECONDS")
+        updates["max_worker_lifetime_seconds"] = lifetime
+    if not updates:
+        return current
+    return replace(current, **updates)
 
 
 def require_live_external_provider(limits: SafetyLimits) -> None:

@@ -35,6 +35,18 @@ ALLOWED_TRANSITIONS = {
     JobStatus.CANCELLED: set(),
 }
 
+PUBLIC_PROGRESS = {
+    "queued": 0.0,
+    "planning": 0.1,
+    "provisioning": 0.2,
+    "booting": 0.35,
+    "runtime_preparing": 0.5,
+    "model_loading": 0.65,
+    "generating": 0.8,
+    "saving": 0.9,
+    "completed": 1.0,
+}
+
 RESTART_DURING_JOB = "RESTART_DURING_JOB"
 INTERRUPTED_ATTEMPT = "INTERRUPTED_BY_RESTART"
 
@@ -82,6 +94,14 @@ class Job:
     error_code: Optional[str]
     prompt: str
     task: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    seed: Optional[int] = None
+    public_status: Optional[str] = None
+    progress: float = 0.0
+    artifact_id: Optional[str] = None
+    sha256: Optional[str] = None
+    byte_count: Optional[int] = None
 
     def transition_to(self, target: str) -> None:
         allowed = ALLOWED_TRANSITIONS.get(self.status, set())
@@ -101,6 +121,23 @@ class Job:
             "result_uri": self.result_uri,
             "error_code": self.error_code,
         }
+
+    def to_image_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "job_id": self.id,
+            "status": self.public_status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "progress": self.progress,
+            "error_code": self.error_code,
+        }
+        if self.public_status == "completed":
+            payload["artifact_id"] = self.artifact_id
+            payload["width"] = self.width
+            payload["height"] = self.height
+            payload["seed"] = self.seed
+            payload["sha256"] = self.sha256
+        return payload
 
 
 class JobStore:
@@ -136,12 +173,13 @@ class JobStore:
                 """
                 UPDATE jobs
                    SET status = ?, updated_at = ?, attempt_count = ?,
-                       result_uri = ?, error_code = ?
+                       result_uri = ?, error_code = ?, input_json = ?
                  WHERE id = ?
                 """,
                 (
                     job.status, job.updated_at, job.attempt_count, job.result_uri,
-                    job.error_code, job.id,
+                    job.error_code, json.dumps(_input_payload(job), separators=(",", ":")),
+                    job.id,
                 ),
             )
             if cur.rowcount != 1:
@@ -174,6 +212,18 @@ def _input_payload(job: Job) -> dict[str, Any]:
     payload: dict[str, Any] = {"prompt": job.prompt}
     if job.task:
         payload["task"] = job.task
+    if job.public_status is not None:
+        payload["width"] = job.width
+        payload["height"] = job.height
+        payload["seed"] = job.seed
+        payload["public_status"] = job.public_status
+        payload["progress"] = job.progress
+        if job.artifact_id is not None:
+            payload["artifact_id"] = job.artifact_id
+        if job.sha256 is not None:
+            payload["sha256"] = job.sha256
+        if job.byte_count is not None:
+            payload["byte_count"] = job.byte_count
     return payload
 
 
@@ -191,6 +241,14 @@ def _row_to_job(row: Any) -> Job:
         error_code=row["error_code"],
         prompt=payload.get("prompt", ""),
         task=payload.get("task"),
+        width=payload.get("width"),
+        height=payload.get("height"),
+        seed=payload.get("seed"),
+        public_status=payload.get("public_status"),
+        progress=float(payload.get("progress") or 0.0),
+        artifact_id=payload.get("artifact_id"),
+        sha256=payload.get("sha256"),
+        byte_count=payload.get("byte_count"),
     )
 
 

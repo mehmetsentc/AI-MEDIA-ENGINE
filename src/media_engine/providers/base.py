@@ -15,6 +15,14 @@ class ProviderCapacityError(ProviderError):
     code = "MAX_GPU_WORKERS"
 
 
+class WorkerStageError(ProviderError):
+    """Stable worker failure. The message is the code and never includes secrets."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class Quote:
     hourly_price_usd: Decimal
@@ -73,3 +81,15 @@ class GPUProvider(abc.ABC):
 
     def end_busy(self, resource_id: str) -> None:
         """Return a finished job's worker to idle."""
+
+    def boot(self, resource_id: str) -> None:
+        """Wait until the worker accepts a command. The default is already booted."""
+
+    def confirm_cache(self, resource_id: str) -> None:
+        """Refuse generation when the mounted model cache is not complete."""
+
+    def prepare_runtime(self, resource_id: str) -> None:
+        """Install image dependencies inside the worker virtualenv."""
+
+    def ensure_model(self, resource_id: str) -> None:
+        """Confirm the local pipeline can be imported. Weights stay on the worker."""

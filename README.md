@@ -83,3 +83,35 @@ VAST_PROVISIONING=1 \
 VAST_HUMAN_POLICY_APPROVAL='approve-policy:<fingerprint>' \
 PYTHONPATH=src python3 -m media_engine.providers.phase2c
 ```
+
+## Phase 2E image API
+
+NaHaber talks only to this process. The bearer is `AI_MEDIA_ENGINE_API_KEY`.
+If that variable is missing, every route except `GET /health` fails closed.
+The server does not print the key.
+
+```bash
+curl -s http://127.0.0.1:8080/health
+
+curl -s -X POST http://127.0.0.1:8080/v1/images/generations \
+  -H "Authorization: Bearer $AI_MEDIA_ENGINE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"A cinematic luxury Mediterranean hotel terrace at sunset","width":1024,"height":1024}'
+
+curl -s http://127.0.0.1:8080/v1/jobs/JOB_ID \
+  -H "Authorization: Bearer $AI_MEDIA_ENGINE_API_KEY"
+
+curl -s -o image.png http://127.0.0.1:8080/v1/artifacts/ARTIFACT_ID \
+  -H "Authorization: Bearer $AI_MEDIA_ENGINE_API_KEY"
+```
+
+`POST /v1/images/generations` returns `job_id` and `status: queued` immediately.
+Poll `GET /v1/jobs/{job_id}` until `completed` or `failed`. A completed job
+includes `artifact_id`, dimensions, `seed`, and `sha256`. Fetch the PNG from
+`GET /v1/artifacts/{artifact_id}`.
+
+The image worker reuses one Vast GPU on machine 47281 and the persistent
+cache volume 54653022 mounted at `/models`. It does not download the model.
+An idle worker is destroyed after 300 seconds. The hard lifetime defaults to
+1800 seconds. `MEDIA_ENGINE_MAX_GPU_HOURLY_USD` defaults to 0.60.
+`negative_prompt` is rejected because the Qwen path does not apply it.

@@ -63,6 +63,20 @@ CREATE TABLE IF NOT EXISTS external_resources (
     updated_at REAL NOT NULL,
     last_error TEXT
 );
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    seed INTEGER,
+    width INTEGER,
+    height INTEGER,
+    created_at TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    path TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS host_quarantine (
     provider TEXT NOT NULL,
     offer_id TEXT NOT NULL,

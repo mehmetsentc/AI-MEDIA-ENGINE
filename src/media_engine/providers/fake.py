@@ -15,6 +15,7 @@ from media_engine.providers.base import (
     ProviderCapacityError,
     ProviderError,
     Quote,
+    WorkerStageError,
 )
 
 OFF = "OFF"
@@ -47,12 +48,40 @@ class FakeGPUProvider(GPUProvider):
         self.create_calls = 0
         self.terminate_calls = 0
         self.reachable = True
+        self.unavailable = False
+        self.fail_stage: Optional[str] = None
+        self.name = "fake"
+        self.gpu_model = "fake"
+        self.machine_id = "local"
         self._resources: dict[str, _Resource] = {}
 
     def quote(self, owner: str) -> Quote:
         if not owner:
             raise ProviderError("owner is required")
+        if self.unavailable:
+            raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
         return Quote(hourly_price_usd=self.hourly_price, provider="fake")
+
+    def boot(self, resource_id: str) -> None:
+        self._require(resource_id)
+        self._fail_stage("boot", "WORKER_BOOT_FAILED")
+        self._fail_stage("timeout", "WORKER_TIMEOUT")
+
+    def confirm_cache(self, resource_id: str) -> None:
+        self._require(resource_id)
+        self._fail_stage("cache", "MODEL_CACHE_INVALID")
+
+    def prepare_runtime(self, resource_id: str) -> None:
+        self._require(resource_id)
+        self._fail_stage("runtime", "RUNTIME_PREPARE_FAILED")
+
+    def ensure_model(self, resource_id: str) -> None:
+        self._require(resource_id)
+        self._fail_stage("load", "MODEL_LOAD_FAILED")
+
+    def _fail_stage(self, stage: str, code: str) -> None:
+        if self.fail_stage == stage:
+            raise WorkerStageError(code)
 
     def create(self, owner: str) -> CreateResult:
         self.create_calls += 1
