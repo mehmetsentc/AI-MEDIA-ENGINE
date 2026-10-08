@@ -1,7 +1,7 @@
 {
   "repository": "ghcr.io/mehmetsentc/ai-media-engine-worker",
-  "tag": "sha-44e89f56d058c8c3b7f995f9b47c7151119e6fa5",
-  "digest": "sha256:ef30975de805629656e47cf300f8ddf53c6eea17ee121154e3bf6c5e6ab951d4",
-  "pinned_reference": "ghcr.io/mehmetsentc/ai-media-engine-worker@sha256:ef30975de805629656e47cf300f8ddf53c6eea17ee121154e3bf6c5e6ab951d4",
-  "previous_digest": "sha256:25f76c48d3fc6db4571558c8c159b0d59ac243c98c2ab979fada4c86aa680091"
+  "tag": "sha-68fdebb06a74ccc09abb1c0566018455bad8191a",
+  "digest": "sha256:863ddf06e3f04114f9e516159d292e86967b860502d984546449060454b1ca1b",
+  "pinned_reference": "ghcr.io/mehmetsentc/ai-media-engine-worker@sha256:863ddf06e3f04114f9e516159d292e86967b860502d984546449060454b1ca1b",
+  "previous_digest": "sha256:ef30975de805629656e47cf300f8ddf53c6eea17ee121154e3bf6c5e6ab951d4"
 }
