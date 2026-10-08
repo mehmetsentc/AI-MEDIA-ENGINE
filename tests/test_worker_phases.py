@@ -38,9 +38,30 @@ class Clock:
         self.t += seconds
 
 
+def _restore_env(previous: dict[str, str | None]) -> None:
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 def _which(name: str) -> str:
     import shutil
     return shutil.which(name) or ""
+
+
+def _stop_pid(pid: int) -> None:
+    import time
+    if not _alive(pid):
+        return
+    os.kill(pid, 15)
+    for _ in range(20):
+        if not _alive(pid):
+            return
+        time.sleep(0.05)
+    if _alive(pid):
+        os.kill(pid, 9)
 
 
 def _alive(pid: int) -> bool:
@@ -380,7 +401,7 @@ class PortableWorkerTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         path = root / "deploy/worker/worker_ready.py"
         text = path.read_text(encoding="utf-8")
-        for marker in ("snapshot_download", "hf_hub_download", "from_pretrained", "R2_", "VAST_API_KEY"):
+        for marker in ("snapshot_download", "hf_hub_download", "from_pretrained", "R2_", "VAST_API_KEY", "import torch", "import diffusers"):
             self.assertNotIn(marker, text)
         spec = importlib.util.spec_from_file_location("worker_ready_under_test", path)
         assert spec is not None and spec.loader is not None
@@ -405,6 +426,42 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertEqual(content_type, "application/json")
         self.assertEqual(payload["state"], "container_starting")
         self.assertIs(payload["runtime"], False)
+        self.assertIs(payload["model_loaded"], False)
+
+    def test_worker_ready_does_not_claim_the_model_is_loaded(self) -> None:
+        import importlib.util
+        import tempfile
+        root = Path(__file__).resolve().parents[1]
+        path = root / "deploy/worker/worker_ready.py"
+        spec = importlib.util.spec_from_file_location("worker_ready_marker", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        marker = base / "runtime-ready"
+        marker.write_text("ok\n", encoding="utf-8")
+        files = []
+        for name in ("qwen_remote.py", "model_cache.py", "r2_cache.py"):
+            item = base / name
+            item.write_text("# generation file\n", encoding="utf-8")
+            files.append(str(item))
+        previous = {
+            "WORKER_RUNTIME_MARKER": os.environ.get("WORKER_RUNTIME_MARKER"),
+            "WORKER_GENERATION_FILES": os.environ.get("WORKER_GENERATION_FILES"),
+        }
+        os.environ["WORKER_RUNTIME_MARKER"] = str(marker)
+        os.environ["WORKER_GENERATION_FILES"] = ",".join(files)
+        self.addCleanup(lambda: _restore_env(previous))
+        status = module.assess_runtime()
+        self.assertEqual(status["state"], "worker_ready")
+        self.assertIs(status["runtime"], True)
+        self.assertIs(status["model_loaded"], False)
+        os.environ["WORKER_RUNTIME_MARKER"] = str(base / "absent")
+        failed = module.assess_runtime()
+        self.assertEqual(failed["state"], "startup_failed")
+        self.assertIs(failed["model_loaded"], False)
 
     def test_startup_failure_is_reported_without_secrets(self) -> None:
         import importlib.util
@@ -461,9 +518,10 @@ class PortableWorkerTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             pid = proc.pid
-        self.addCleanup(lambda: os.kill(pid, 15) if _alive(pid) else None)
+        self.addCleanup(lambda: _stop_pid(pid))
         payload = _wait_health(port, 10)
         self.assertIn(payload["state"], {"container_starting", "startup_failed", "worker_ready"})
+        self.assertIs(payload["model_loaded"], False)
         self.assertTrue(_alive(pid))
         terminal = payload
         deadline = time.time() + 20

@@ -1,7 +1,7 @@
-"""In-container readiness server. It does not load Qwen weights.
+"""In-container readiness server. It does not import or load Qwen.
 
-Vast SSH mode replaces the image command, so this process is started by
-onstart. /health answers before the runtime imports finish.
+Vast SSH mode replaces the image command, so onstart starts this process.
+/health reports that the generation files are present. Model weights stay unloaded.
 """
 from __future__ import annotations
 
@@ -14,7 +14,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 _LOCK = threading.Lock()
-_STATUS: dict[str, object] = {"state": "container_starting", "runtime": False}
+_STATUS: dict[str, object] = {
+    "state": "container_starting",
+    "runtime": False,
+    "model_loaded": False,
+}
+_GENERATION_FILES = (
+    "/workspace/qwen_remote.py",
+    "/workspace/model_cache.py",
+    "/workspace/r2_cache.py",
+)
 _SECRET = re.compile(
     r"(?i)(api[_-]?key|secret|token|password|bearer)(\s*[=:]\s*)(\S+)"
 )
@@ -43,29 +52,32 @@ def failure_status(exc: BaseException) -> dict[str, object]:
     return {
         "state": "startup_failed",
         "runtime": False,
+        "model_loaded": False,
         "error": type(exc).__name__,
         "detail": detail[:180],
     }
 
 
 def assess_runtime() -> dict[str, object]:
-    """Import the preinstalled runtime. This never downloads model weights."""
-    marker = Path("/opt/ai-media-engine/runtime-ready")
-    try:
-        import torch  # noqa: F401
-        import diffusers
-        import transformers  # noqa: F401
-        import accelerate  # noqa: F401
-        import safetensors  # noqa: F401
-        from diffusers import QwenImagePipeline
-
-        pipeline = QwenImagePipeline.__name__
-        ready = marker.is_file() and pipeline == "QwenImagePipeline" and bool(diffusers.__name__)
-    except Exception as exc:
-        return failure_status(exc)
-    if not ready:
-        return {"state": "container_starting", "runtime": False}
-    return {"state": "worker_ready", "runtime": True}
+    """Confirm the generation files are present. This does not import or load Qwen."""
+    marker = Path(os.environ.get("WORKER_RUNTIME_MARKER", "/opt/ai-media-engine/runtime-ready"))
+    configured = os.environ.get("WORKER_GENERATION_FILES", "")
+    files = tuple(item for item in configured.split(",") if item) if configured else _GENERATION_FILES
+    missing = []
+    if not marker.is_file():
+        missing.append(marker.name)
+    for name in files:
+        if not Path(name).is_file():
+            missing.append(Path(name).name)
+    if missing:
+        return {
+            "state": "startup_failed",
+            "runtime": False,
+            "model_loaded": False,
+            "error": "RuntimeIncomplete",
+            "detail": "missing " + ",".join(missing),
+        }
+    return {"state": "worker_ready", "runtime": True, "model_loaded": False}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -92,19 +104,15 @@ def main() -> None:
     address = listen_address()
     _write_pid()
     _log("listen=%s:%s event=start" % address)
-    threading.Thread(target=_assess, name="worker-assess", daemon=True).start()
+    try:
+        publish(assess_runtime())
+    except Exception as exc:
+        publish(failure_status(exc))
     try:
         serve(address).serve_forever()
     except Exception as exc:
         publish(failure_status(exc))
         raise
-
-
-def _assess() -> None:
-    try:
-        publish(assess_runtime())
-    except Exception as exc:
-        publish(failure_status(exc))
 
 
 def _write_pid() -> None:

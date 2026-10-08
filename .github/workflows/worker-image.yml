@@ -82,8 +82,8 @@ jobs:
                   payload = json.loads(response.read().decode("utf-8"))
               state = payload.get("state")
               if state in {"worker_ready", "startup_failed"}:
-                  print("smoke_terminal", state, payload.get("error", ""))
-                  if state != "worker_ready":
+                  print("smoke_terminal", state, payload.get("error", ""), payload.get("model_loaded"))
+                  if state != "worker_ready" or payload.get("model_loaded") is not False:
                       raise SystemExit("startup_failed")
                   break
               time.sleep(4)
