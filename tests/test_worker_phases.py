@@ -685,8 +685,9 @@ class PortableWorkerTests(unittest.TestCase):
         def ssh(host, port, command, timeout):
             commands.append((host, port, command, timeout))
             if clock.t < 1_020:
-                return 1, "", "Connection refused"
-            return 0, '{"state":"worker_ready","runtime":true,"model_loaded":false}\n', ""
+                return 0, '{"probe":"connect","error":"URLError"}\n', ""
+            body = '{"state":"worker_ready","runtime":true,"model_loaded":false}'
+            return 0, '{"probe":"http","status":200,"body":' + json.dumps(body) + '}\n', ""
 
         provider = VastImageProvider(
             api_key="fixture-key",
@@ -704,7 +705,175 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:8080/health", commands[-1][2])
         self.assertNotIn("203.0.113.10", commands[-1][2])
         self.assertEqual(commands[-1][0], "ssh4.example")
+        self.assertEqual(commands[-1][3], 15)
         self.assertEqual(LOCAL_HEALTH_COMMAND, commands[-1][2])
+        self.assertIn("http://127.0.0.1:8080/health", LOCAL_HEALTH_COMMAND)
+        self.assertIn("timeout=2", LOCAL_HEALTH_COMMAND)
+        self.assertNotIn("203.0.113.10", LOCAL_HEALTH_COMMAND)
+
+    def test_ssh_health_reports_connect_http_and_not_ready_separately(self) -> None:
+        from media_engine.providers.vast_image import classify_ssh_probe
+        body = '{"state":"worker_ready","runtime":true}'
+        self.assertEqual(
+            classify_ssh_probe(0, '{"probe":"http","status":200,"body":' + json.dumps(body) + "}")[0],
+            "ready",
+        )
+        self.assertEqual(classify_ssh_probe(255, "")[0], "ssh")
+        self.assertEqual(classify_ssh_probe(0, '{"probe":"connect","error":"URLError"}')[0], "connect")
+        self.assertEqual(classify_ssh_probe(0, '{"probe":"http","status":503,"body":""}')[0], "http")
+        starting = '{"state":"container_starting","runtime":false}'
+        self.assertEqual(
+            classify_ssh_probe(0, '{"probe":"http","status":200,"body":' + json.dumps(starting) + "}")[0],
+            "not_ready",
+        )
+        self._assert_ssh_deadline('{"probe":"connect","error":"URLError"}', "HEALTH_CONNECT_FAILED", 180)
+        self._assert_ssh_deadline("", "SSH_HEALTH_UNREACHABLE", 180, code=255)
+        self._assert_ssh_http_failure()
+        self._assert_ssh_not_ready_deadline()
+
+    def _ssh_provider(self, clock: Clock, ssh):
+        def transport(method, url, body, headers):
+            row = {
+                "id": 7,
+                "actual_status": "running",
+                "machine_id": 26359,
+                "ssh_host": "ssh4.example",
+                "ssh_port": 11982,
+            }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=ssh,
+        )
+        provider.machine_id = "26359"
+        provider._health_get = lambda url: (_ for _ in ()).throw(AssertionError("public http"))
+        return provider
+
+    def _assert_ssh_deadline(self, line: str, expected: str, stall: float, code: int = 0) -> None:
+        clock = Clock()
+
+        def ssh(host, port, command, timeout):
+            return code, line + "\n", ""
+
+        provider = self._ssh_provider(clock, ssh)
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, expected)
+        self.assertGreater(clock.t - 1_000, stall)
+        self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][0])
+
+    def _assert_ssh_http_failure(self) -> None:
+        clock = Clock()
+
+        def ssh(host, port, command, timeout):
+            return 0, '{"probe":"http","status":503,"body":""}\n', ""
+
+        provider = self._ssh_provider(clock, ssh)
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, "HTTP_HEALTH_FAILED")
+        self.assertLess(clock.t - 1_000, 10)
+
+    def _assert_ssh_not_ready_deadline(self) -> None:
+        clock = Clock()
+        starting = json.dumps('{"state":"container_starting","runtime":false}')
+
+        def ssh(host, port, command, timeout):
+            return 0, '{"probe":"http","status":200,"body":' + starting + "}\n", ""
+
+        provider = self._ssh_provider(clock, ssh)
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, "WORKER_NOT_READY")
+        self.assertGreater(clock.t - 1_000, PHASE_LIMITS["worker_ready"][1])
+        self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][0] + 10)
+
+    def test_loopback_probe_checks_status_and_json(self) -> None:
+        import subprocess
+        import sys
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from media_engine.providers.vast_image import classify_ssh_probe
+        script = LOCAL_HEALTH_COMMAND.removeprefix("python3 -c '").removesuffix("'")
+        self.assertIn("http://127.0.0.1:8080/health", script)
+        self.assertIn("response.status", script)
+
+        def run_probe() -> tuple[str, dict | None]:
+            completed = subprocess.run(
+                [sys.executable, "-c", script], text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return classify_ssh_probe(completed.returncode, completed.stdout)
+
+        self.assertEqual(run_probe()[0], "connect")
+
+        class Ready(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"state":"worker_ready","runtime":true,"model_loaded":false}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+        ThreadingHTTPServer.allow_reuse_address = True
+        ready = ThreadingHTTPServer(("127.0.0.1", 8080), Ready)
+        thread = __import__("threading").Thread(target=ready.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(ready.shutdown)
+        self.addCleanup(ready.server_close)
+        kind, health = run_probe()
+        ready.shutdown()
+        thread.join(timeout=2)
+        ready.server_close()
+        self.assertEqual(kind, "ready")
+        self.assertEqual(health["state"], "worker_ready")
+        self.assertIs(health["runtime"], True)
+
+        class Broken(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+        broken = ThreadingHTTPServer(("127.0.0.1", 8080), Broken)
+        broken_thread = __import__("threading").Thread(target=broken.serve_forever, daemon=True)
+        broken_thread.start()
+        self.addCleanup(broken.shutdown)
+        self.addCleanup(broken.server_close)
+        self.assertEqual(run_probe()[0], "http")
+        broken.shutdown()
+
+    def test_bind_failure_does_not_claim_the_socket_is_listening(self) -> None:
+        import importlib.util
+        import tempfile
+        root = Path(__file__).resolve().parents[1]
+        path = root / "deploy/worker/worker_ready.py"
+        spec = importlib.util.spec_from_file_location("worker_ready_bind", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = Path(tmp.name) / "worker-ready.log"
+        previous = os.environ.get("WORKER_LOG")
+        os.environ["WORKER_LOG"] = str(log)
+        self.addCleanup(lambda: os.environ.__setitem__("WORKER_LOG", previous) if previous is not None else os.environ.pop("WORKER_LOG", None))
+        module.serve = lambda address: (_ for _ in ()).throw(OSError("address already in use"))
+        with self.assertRaises(OSError):
+            module.main()
+        text = log.read_text(encoding="utf-8")
+        self.assertNotIn("listen=", text)
+        self.assertIn("startup_failed", text)
 
     def test_public_endpoint_uses_the_mapped_host_port(self) -> None:
         endpoint = worker_http_endpoint({
@@ -793,6 +962,85 @@ class PortableWorkerTests(unittest.TestCase):
         controller.process_available()
         self.assertEqual(provider.creates, 1)
         self.assertEqual(provider.terminated, ["42"])
+
+    def test_boot_failure_reserves_and_settles_once(self) -> None:
+        import tempfile
+
+        from media_engine.orchestrator.controller import ManualClock, MediaController
+        from media_engine.providers.base import CreateResult, Quote
+
+        class Books:
+            def __init__(self) -> None:
+                self.reserves: list[str] = []
+                self.settlements: list[str] = []
+
+            def authorize_paid(self, user_id: str, job_id: str, **_kwargs: object) -> str:
+                self.reserves.append(job_id)
+                return "price"
+
+            def claim_specific(self, job_id: str, worker_id: str, **_kwargs: object) -> bool:
+                return True
+
+            def settle_failure(self, user_id: str, job_id: str, legitimate_cost: int = 0) -> None:
+                self.settlements.append(job_id)
+
+            def settle(self, user_id: str, job_id: str, actual: int) -> None:
+                raise AssertionError("successful settlement")
+
+        class Once:
+            name = "vast"
+
+            def __init__(self) -> None:
+                self.creates = 0
+                self.terminated: list[str] = []
+
+            def quote(self, owner: str) -> Quote:
+                return Quote(hourly_price_usd=Decimal("0.10"), provider="vast")
+
+            def create(self, owner: str) -> CreateResult:
+                self.creates += 1
+                return CreateResult(outcome="created", resource_id="42")
+
+            def boot(self, resource_id: str) -> None:
+                raise WorkerStageError("HEALTH_CONNECT_FAILED")
+
+            def terminate(self, resource_id: str) -> None:
+                self.terminated.append(resource_id)
+
+            def status(self, resource_id: str) -> str:
+                return "READY"
+
+            def begin_busy(self, resource_id: str) -> None:
+                return None
+
+            def end_busy(self, resource_id: str) -> None:
+                return None
+
+            def observe(self, resource_id: str, owner: str) -> str:
+                return "gone"
+
+            def list_owned(self) -> list[dict]:
+                return []
+
+        books = Books()
+        provider = Once()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        controller = MediaController(
+            str(root / "studio.sqlite3"),
+            str(root / "artifacts"),
+            clock=ManualClock(),
+            provider=provider,
+        )
+        controller.platform = books
+        controller.submit_image("a newsroom", seed=20260804)
+        controller.process_available()
+        controller.process_available()
+        self.assertEqual(provider.creates, 1)
+        self.assertEqual(provider.terminated, ["42"])
+        self.assertEqual(len(books.reserves), 1)
+        self.assertEqual(books.settlements, books.reserves)
 
     def test_loading_instance_keeps_the_port_grace(self) -> None:
         clock = Clock()
@@ -914,7 +1162,15 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][1])
 
     def test_ready_timeout_destroys_the_gpu(self) -> None:
-        for code in ("WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED", "STARTUP_FAILED"):
+        for code in (
+            "WORKER_READY_TIMEOUT",
+            "PORT_UNPUBLISHED",
+            "STARTUP_FAILED",
+            "SSH_HEALTH_UNREACHABLE",
+            "HEALTH_CONNECT_FAILED",
+            "HTTP_HEALTH_FAILED",
+            "WORKER_NOT_READY",
+        ):
             self._assert_boot_failure_destroys(code)
 
     def _assert_boot_failure_destroys(self, code: str) -> None:

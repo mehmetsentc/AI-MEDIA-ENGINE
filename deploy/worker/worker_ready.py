@@ -103,13 +103,18 @@ def serve(address: tuple[str, int] | None = None) -> ThreadingHTTPServer:
 def main() -> None:
     address = listen_address()
     _write_pid()
+    try:
+        server = serve(address)
+    except Exception as exc:
+        publish(failure_status(exc))
+        raise
     _log("listen=%s:%s event=start" % address)
     try:
         publish(assess_runtime())
     except Exception as exc:
         publish(failure_status(exc))
     try:
-        serve(address).serve_forever()
+        server.serve_forever()
     except Exception as exc:
         publish(failure_status(exc))
         raise

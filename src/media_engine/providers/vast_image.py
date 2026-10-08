@@ -134,6 +134,7 @@ class VastImageProvider(GPUProvider):
         self.runtime_ready = False
         self.worker_state = ""
         self.health_transport = ""
+        self.health_error = ""
         self.cost_before_generation_usd = Decimal("0")
         self.last_instance_id = ""
         self._put_done = False
@@ -563,9 +564,10 @@ class VastImageProvider(GPUProvider):
         watch = PhaseWatch.start("worker_ready", self._now())
         seen = ""
         running_without_port: Optional[float] = None
+        self.health_error = ""
         while True:
             if watch.expired(self._now()):
-                raise WorkerStageError("WORKER_READY_TIMEOUT")
+                raise WorkerStageError(_readiness_timeout_code(self.health_error))
             row = self._instance_row(resource_id)
             if row is None:
                 raise WorkerStageError("WORKER_BOOT_FAILED")
@@ -581,13 +583,22 @@ class VastImageProvider(GPUProvider):
             else:
                 running_without_port = None
             if ssh_endpoint is not None:
-                health = self._ssh_local_health(row)
+                kind, health = self._ssh_local_health(row)
+                if kind == "http":
+                    self.worker_state = "http_failed"
+                    raise WorkerStageError("HTTP_HEALTH_FAILED")
+                if kind in {"ssh", "connect", "not_ready"}:
+                    self.health_error = kind
             elif endpoint is not None:
                 health = self._fetch_health(endpoint)
                 self.health_transport = "public"
             else:
                 health = None
-            state = classify_readiness(status_name, endpoint is not None, health)
+            state = classify_readiness(
+                status_name,
+                endpoint is not None or isinstance(health, dict),
+                health,
+            )
             self.worker_state = state
             if state != seen:
                 seen = state
@@ -603,11 +614,11 @@ class VastImageProvider(GPUProvider):
                 raise WorkerStageError("WORKER_BOOT_FAILED")
             self._sleep(5)
 
-    def _ssh_local_health(self, row: dict) -> Optional[dict]:
-        """Read /health on the container loopback. Public HostPort is not required."""
+    def _ssh_local_health(self, row: dict) -> tuple[str, Optional[dict]]:
+        """GET loopback /health through the instance SSH proxy. No public HTTP."""
         endpoint = worker_ssh_endpoint(row)
         if endpoint is None:
-            return None
+            return "missing", None
         host, port = endpoint
         if self._ssh_run is None:
             try:
@@ -615,17 +626,20 @@ class VastImageProvider(GPUProvider):
             except WorkerStageError as exc:
                 if exc.code in {"CONNECT_TIMEOUT", "WORKER_BOOT_FAILED"}:
                     raise
-                return None
+                self.health_error = "ssh"
+                return "ssh", None
         if self._ssh_run is None:
-            return None
+            self.health_error = "ssh"
+            return "ssh", None
         try:
             code, out, _err = self._ssh_run(host, port, LOCAL_HEALTH_COMMAND, 15)
         except WorkerStageError:
-            return None
+            self.health_error = "ssh"
+            return "ssh", None
         self.health_transport = "ssh"
-        if code != 0:
-            return None
-        return parse_health_output(out)
+        kind, health = classify_ssh_probe(code, out)
+        self.health_error = kind if kind != "ready" else ""
+        return kind, health
 
     def _fetch_health(self, endpoint: tuple[str, str]) -> Optional[dict]:
         url = f"http://{endpoint[0]}:{endpoint[1]}/health"
@@ -774,10 +788,19 @@ def plan_cold_stage(hourly: Decimal, inet_down: float) -> Optional[dict[str, Dec
 # A running instance should already have its published ports. This is long
 # enough for Vast to fill the ports map and far shorter than the readiness stall.
 PORT_MAP_GRACE_SECONDS = 45.0
-LOCAL_HEALTH_COMMAND = (
-    "python3 -c 'import urllib.request; "
-    "print(urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2).read().decode())'"
-)
+_LOOPBACK_HEALTH_PROBE = """
+import json, urllib.request, urllib.error
+url = "http://127.0.0.1:8080/health"
+try:
+    response = urllib.request.urlopen(url, timeout=2)
+    body = response.read(10000).decode()
+    print(json.dumps({"probe": "http", "status": int(response.status), "body": body}))
+except urllib.error.HTTPError as exc:
+    print(json.dumps({"probe": "http", "status": int(exc.code), "body": ""}))
+except Exception as exc:
+    print(json.dumps({"probe": "connect", "error": type(exc).__name__}))
+""".strip()
+LOCAL_HEALTH_COMMAND = "python3 -c '" + _LOOPBACK_HEALTH_PROBE + "'"
 
 # SSH mode does not run the image command. This script detaches the server
 # into its own session and records a secret-free launch line.
@@ -835,6 +858,13 @@ def worker_ssh_endpoint(row: dict) -> Optional[tuple[str, str]]:
 
 
 def parse_health_output(text: str) -> Optional[dict]:
+    payload = last_json_object(text)
+    if isinstance(payload, dict) and "state" in payload:
+        return payload
+    return None
+
+
+def last_json_object(text: str) -> Optional[dict]:
     for line in reversed(str(text).splitlines()):
         candidate = line.strip()
         if not candidate.startswith("{"):
@@ -843,9 +873,46 @@ def parse_health_output(text: str) -> Optional[dict]:
             payload = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(payload, dict) and "state" in payload:
+        if isinstance(payload, dict):
             return payload
     return None
+
+
+def classify_ssh_probe(code: int, text: str) -> tuple[str, Optional[dict]]:
+    """Separate a dead SSH session, a refused loopback connection, and an HTTP answer."""
+    if code != 0:
+        return "ssh", None
+    probe = last_json_object(text)
+    if not isinstance(probe, dict) or "probe" not in probe:
+        return "ssh", None
+    if probe.get("probe") == "connect":
+        return "connect", None
+    if probe.get("probe") != "http":
+        return "ssh", None
+    if probe.get("status") != 200:
+        return "http", None
+    body = probe.get("body")
+    if not isinstance(body, str):
+        return "http", None
+    try:
+        health = json.loads(body)
+    except json.JSONDecodeError:
+        return "http", None
+    if not isinstance(health, dict) or "state" not in health:
+        return "http", None
+    if health.get("state") == "worker_ready" and health.get("runtime") is True:
+        return "ready", health
+    return "not_ready", health
+
+
+def _readiness_timeout_code(kind: str) -> str:
+    if kind == "ssh":
+        return "SSH_HEALTH_UNREACHABLE"
+    if kind == "connect":
+        return "HEALTH_CONNECT_FAILED"
+    if kind == "not_ready":
+        return "WORKER_NOT_READY"
+    return "WORKER_READY_TIMEOUT"
 
 
 def classify_connect_failure(exc: BaseException) -> str:
