@@ -39,7 +39,7 @@ from media_engine.studio.boot import build_controller
 
 PINNED = (
     "ghcr.io/mehmetsentc/ai-media-engine-worker"
-    "@sha256:863ddf06e3f04114f9e516159d292e86967b860502d984546449060454b1ca1b"
+    "@sha256:be2c96a09947b15ff1fd8fb1d2aaa4692dcc9c06083ef1486674ac4fbc4a907c"
 )
 ROOT = Path(__file__).resolve().parents[1]
 
