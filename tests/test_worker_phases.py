@@ -38,6 +38,36 @@ class Clock:
         self.t += seconds
 
 
+def _which(name: str) -> str:
+    import shutil
+    return shutil.which(name) or ""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _wait_health(port: int, seconds: float) -> dict:
+    import time
+    import urllib.request
+    deadline = time.time() + seconds
+    last: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%s/health" % port, timeout=1) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception as exc:
+            last = exc
+        time.sleep(0.05)
+    raise AssertionError(last)
+
+
 def _offer(offer_id: int, machine: int, *, inet_down: float, dph_base: str) -> dict:
     return {
         "id": offer_id,
@@ -307,7 +337,7 @@ class PhaseClockTests(unittest.TestCase):
     def test_phase_failures_are_cleaned_up(self) -> None:
         for code in (
             "CONNECT_TIMEOUT", "CACHE_STALL", "CACHE_TIMEOUT", "RUNTIME_TIMEOUT",
-            "WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED",
+            "WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED", "STARTUP_FAILED",
         ):
             self.assertIn(code, _DESTROY_ON)
 
@@ -376,6 +406,79 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertEqual(payload["state"], "container_starting")
         self.assertIs(payload["runtime"], False)
 
+    def test_startup_failure_is_reported_without_secrets(self) -> None:
+        import importlib.util
+        root = Path(__file__).resolve().parents[1]
+        path = root / "deploy/worker/worker_ready.py"
+        spec = importlib.util.spec_from_file_location("worker_ready_failure", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        status = module.failure_status(RuntimeError("token=supersecret bearer: abc"))
+        encoded = json.dumps(status)
+        self.assertEqual(status["state"], "startup_failed")
+        self.assertEqual(status["error"], "RuntimeError")
+        self.assertNotIn("supersecret", encoded)
+        self.assertIn("[redacted]", encoded)
+
+    def test_detached_process_answers_before_imports_finish(self) -> None:
+        import socket
+        import subprocess
+        import sys
+        import tempfile
+        import time
+        root = Path(__file__).resolve().parents[1]
+        script = root / "deploy/worker/worker_ready.py"
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+        holder.close()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = Path(tmp.name) / "worker-ready.log"
+        pidfile = Path(tmp.name) / "worker-ready.pid"
+        env = os.environ.copy()
+        env.update({
+            "WORKER_PORT": str(port),
+            "WORKER_LOG": str(log),
+            "WORKER_PID_FILE": str(pidfile),
+            "WORKER_SCRIPT": str(script),
+            "WORKER_PYTHON": sys.executable,
+            "VAST_API_KEY": "do-not-log-this-secret",
+        })
+        launcher = root / "deploy/worker/start_worker.sh"
+        if _which("setsid"):
+            completed = subprocess.run(["bash", str(launcher)], env=env, timeout=15, check=False)
+            self.assertEqual(completed.returncode, 0)
+            pid = int(pidfile.read_text(encoding="utf-8").strip())
+        else:
+            proc = subprocess.Popen(
+                [sys.executable, str(script)],
+                env=env,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            pid = proc.pid
+        self.addCleanup(lambda: os.kill(pid, 15) if _alive(pid) else None)
+        payload = _wait_health(port, 10)
+        self.assertIn(payload["state"], {"container_starting", "startup_failed", "worker_ready"})
+        self.assertTrue(_alive(pid))
+        terminal = payload
+        deadline = time.time() + 20
+        while time.time() < deadline and terminal["state"] == "container_starting":
+            time.sleep(0.1)
+            terminal = _wait_health(port, 2)
+        self.assertIn(terminal["state"], {"startup_failed", "worker_ready"})
+        text = log.read_text(encoding="utf-8")
+        self.assertIn("pid=", text)
+        self.assertIn("event=start", text)
+        self.assertNotIn("do-not-log-this-secret", text)
+        if terminal["state"] == "startup_failed":
+            self.assertTrue(terminal.get("error"))
+            self.assertNotIn("do-not-log-this-secret", json.dumps(terminal))
+
     def test_running_instance_is_not_worker_ready(self) -> None:
         self.assertEqual(classify_readiness("running", False, None), "instance_running")
         self.assertEqual(
@@ -387,6 +490,10 @@ class PortableWorkerTests(unittest.TestCase):
             "worker_ready",
         )
         self.assertNotEqual(classify_readiness("running", False, None), "worker_ready")
+        self.assertEqual(
+            classify_readiness("running", True, {"state": "startup_failed", "runtime": False, "error": "OSError"}),
+            "startup_failed",
+        )
 
     def test_create_starts_the_worker_without_ssh_bootstrap(self) -> None:
         sent: list[dict] = []
@@ -410,10 +517,16 @@ class PortableWorkerTests(unittest.TestCase):
         body = sent[0]
         self.assertEqual(body["image"], PIN)
         self.assertEqual(body["runtype"], "ssh")
-        self.assertIn("worker_ready.py", body["onstart"])
+        self.assertEqual(body["onstart"], "bash /workspace/start_worker.sh")
         self.assertNotIn("pip", body["onstart"])
         self.assertNotIn("args_str", body)
-        self.assertIn("python3 /workspace/worker_ready.py", body["onstart"])
+        launcher = Path(__file__).resolve().parents[1] / "deploy/worker/start_worker.sh"
+        script = launcher.read_text(encoding="utf-8")
+        self.assertIn("setsid", script)
+        self.assertIn('"$python" "$script"', script)
+        self.assertIn("/workspace/worker_ready.py", script)
+        self.assertIn("/workspace/worker-ready.log", script)
+        self.assertNotIn("pip", script)
         self.assertEqual(body["env"]["WORKER_PORT"], "8080")
         self.assertEqual(body["env"]["-p 8080:8080"], "1")
         self.assertEqual(body["env"]["HF_HUB_OFFLINE"], "1")
@@ -522,8 +635,97 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertGreaterEqual(clock.t - 1_000, 60)
         self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][1])
 
+    def test_unreachable_health_stalls_before_the_maximum(self) -> None:
+        clock = Clock()
+
+        def transport(method, url, body, headers):
+            row = {
+                "id": 7,
+                "actual_status": "running",
+                "machine_id": 26359,
+                "public_ipaddr": "203.0.113.10",
+                "ports": {"8080/tcp": [{"HostPort": "18080"}]},
+            }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=lambda *args: (_ for _ in ()).throw(AssertionError("ssh")),
+        )
+        provider.machine_id = "26359"
+        provider._health_get = lambda url: (_ for _ in ()).throw(TimeoutError("timed out"))
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, "WORKER_READY_TIMEOUT")
+        elapsed = clock.t - 1_000
+        self.assertGreater(elapsed, PHASE_LIMITS["worker_ready"][1])
+        self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][1] + 10)
+        self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][0])
+
+    def test_live_container_starting_keeps_the_readiness_window(self) -> None:
+        clock = Clock()
+
+        def transport(method, url, body, headers):
+            row = {
+                "id": 7,
+                "actual_status": "running",
+                "machine_id": 26359,
+                "public_ipaddr": "203.0.113.10",
+                "ports": {"8080/tcp": [{"HostPort": "18080"}]},
+            }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        def health(url):
+            if clock.t < 1_220:
+                return 200, b'{"state":"container_starting","runtime":false}'
+            return 200, b'{"state":"worker_ready","runtime":true}'
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=lambda *args: (_ for _ in ()).throw(AssertionError("ssh")),
+        )
+        provider.machine_id = "26359"
+        provider._health_get = health
+        provider.boot("7")
+        self.assertEqual(provider.worker_state, "worker_ready")
+        self.assertGreaterEqual(clock.t - 1_000, 220)
+        self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][0])
+
+    def test_startup_failed_stops_without_waiting_out_the_stall(self) -> None:
+        clock = Clock()
+
+        def transport(method, url, body, headers):
+            row = {
+                "id": 7,
+                "actual_status": "running",
+                "machine_id": 26359,
+                "public_ipaddr": "203.0.113.10",
+                "ports": {"8080/tcp": [{"HostPort": "18080"}]},
+            }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=lambda *args: (_ for _ in ()).throw(AssertionError("ssh")),
+        )
+        provider.machine_id = "26359"
+        provider._health_get = lambda url: (200, b'{"state":"startup_failed","runtime":false,"error":"OSError"}')
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, "STARTUP_FAILED")
+        self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][1])
+
     def test_ready_timeout_destroys_the_gpu(self) -> None:
-        for code in ("WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED"):
+        for code in ("WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED", "STARTUP_FAILED"):
             self._assert_boot_failure_destroys(code)
 
     def _assert_boot_failure_destroys(self, code: str) -> None:
@@ -589,6 +791,7 @@ class PortableWorkerTests(unittest.TestCase):
         names = [
             root / "deploy/worker/Dockerfile",
             root / "deploy/worker/worker_ready.py",
+            root / "deploy/worker/start_worker.sh",
             root / "deploy/worker/vast_template.json",
             root / ".github/workflows/worker-image.yml",
         ]
@@ -604,4 +807,5 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertIn("sha-${{ github.sha }}", workflow)
         docker = (root / "deploy/worker/Dockerfile").read_text(encoding="utf-8")
         self.assertIn('CMD ["python3", "/workspace/worker_ready.py"]', docker)
+        self.assertIn("COPY deploy/worker/start_worker.sh /workspace/start_worker.sh", docker)
         self.assertNotIn("COPY . ", docker)

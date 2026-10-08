@@ -584,9 +584,13 @@ class VastImageProvider(GPUProvider):
             if state != seen:
                 seen = state
                 watch.mark(self._now())
+            if isinstance(health, dict) and health.get("state") == "container_starting":
+                watch.mark(self._now())
             if state == "worker_ready":
                 self.runtime_ready = True
                 return
+            if state == "startup_failed":
+                raise WorkerStageError("STARTUP_FAILED")
             if state == "worker_failed":
                 raise WorkerStageError("WORKER_BOOT_FAILED")
             self._sleep(5)
@@ -739,13 +743,9 @@ def plan_cold_stage(hourly: Decimal, inet_down: float) -> Optional[dict[str, Dec
 # enough for Vast to fill the ports map and far shorter than the readiness stall.
 PORT_MAP_GRACE_SECONDS = 45.0
 
-WORKER_ONSTART = (
-    "if ! python3 -c 'import urllib.request; "
-    "urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2)' "
-    ">/dev/null 2>&1; then "
-    "python3 /workspace/worker_ready.py >> /workspace/worker-ready.log 2>&1 & "
-    "fi"
-)
+# SSH mode does not run the image command. This script detaches the server
+# into its own session and records a secret-free launch line.
+WORKER_ONSTART = "bash /workspace/start_worker.sh"
 
 
 def portable_worker(image: str) -> bool:
@@ -757,6 +757,8 @@ def classify_readiness(instance_status: str, has_endpoint: bool, health: Optiona
     """Separate a running VM from a worker that has answered /health."""
     if str(instance_status) != "running":
         return "provisioning"
+    if isinstance(health, dict) and health.get("state") == "startup_failed":
+        return "startup_failed"
     if isinstance(health, dict) and health.get("state") == "worker_failed":
         return "worker_failed"
     if (

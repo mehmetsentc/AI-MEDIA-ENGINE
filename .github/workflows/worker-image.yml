@@ -7,6 +7,7 @@ on:
     paths:
       - deploy/worker/Dockerfile
       - deploy/worker/worker_ready.py
+      - deploy/worker/start_worker.sh
       - src/media_engine/engines/image/qwen_remote.py
       - src/media_engine/engines/image/model_cache.py
       - src/media_engine/engines/image/r2_cache.py
@@ -51,3 +52,49 @@ jobs:
 
       - name: Record digest
         run: echo "pinned=ghcr.io/${{ github.repository_owner }}/ai-media-engine-worker@${{ steps.push.outputs.digest }}"
+
+      - name: Startup smoke test
+        run: |
+          set -eu
+          image="ghcr.io/${{ github.repository_owner }}/ai-media-engine-worker:sha-${{ github.sha }}"
+          docker pull "$image"
+          docker rm -f daidoi-worker-smoke >/dev/null 2>&1 || true
+          docker run -d --name daidoi-worker-smoke -p 18080:8080 --entrypoint bash "$image" \
+            -lc 'bash /workspace/start_worker.sh; sleep 300'
+          trap 'docker rm -f daidoi-worker-smoke >/dev/null 2>&1 || true' EXIT
+          python3 - << 'PY'
+          import json, time, urllib.request
+          deadline = time.time() + 30
+          payload = None
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:18080/health", timeout=2) as response:
+                      payload = json.loads(response.read().decode("utf-8"))
+                  break
+              except Exception:
+                  time.sleep(1)
+          if not isinstance(payload, dict) or payload.get("state") not in {"container_starting", "worker_ready", "startup_failed"}:
+              raise SystemExit("health did not answer: %r" % (payload,))
+          print("smoke_first", payload.get("state"))
+          deadline = time.time() + 360
+          while time.time() < deadline:
+              with urllib.request.urlopen("http://127.0.0.1:18080/health", timeout=5) as response:
+                  payload = json.loads(response.read().decode("utf-8"))
+              state = payload.get("state")
+              if state in {"worker_ready", "startup_failed"}:
+                  print("smoke_terminal", state, payload.get("error", ""))
+                  if state != "worker_ready":
+                      raise SystemExit("startup_failed")
+                  break
+              time.sleep(4)
+          else:
+              raise SystemExit("runtime did not become ready")
+          PY
+          docker exec daidoi-worker-smoke bash -lc 'test -s /workspace/worker-ready.log && kill -0 "$(cat /workspace/worker-ready.pid)"'
+          docker exec daidoi-worker-smoke bash -lc 'grep -q "event=start" /workspace/worker-ready.log'
+
+      - name: Anonymous image pull
+        run: |
+          set -eu
+          docker logout ghcr.io || true
+          docker pull "ghcr.io/${{ github.repository_owner }}/ai-media-engine-worker@${{ steps.push.outputs.digest }}"

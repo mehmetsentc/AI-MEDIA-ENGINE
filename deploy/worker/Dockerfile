@@ -21,9 +21,11 @@ COPY src/media_engine/engines/image/qwen_remote.py /workspace/qwen_remote.py
 COPY src/media_engine/engines/image/model_cache.py /workspace/model_cache.py
 COPY src/media_engine/engines/image/r2_cache.py /workspace/r2_cache.py
 COPY deploy/worker/worker_ready.py /workspace/worker_ready.py
+COPY deploy/worker/start_worker.sh /workspace/start_worker.sh
 
 RUN mkdir -p /opt/ai-media-engine \
     && touch /opt/ai-media-engine/runtime-ready \
+    && chmod 755 /workspace/start_worker.sh \
     && python3 -c "import torch,diffusers,transformers,accelerate,safetensors"
 
 ENV HF_HOME=/models/hf-cache \

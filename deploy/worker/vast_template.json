@@ -22,7 +22,7 @@
     "WORKER_PORT": "8080",
     "-p 8080:8080": "1"
   },
-  "onstart": "if ! python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2)' >/dev/null 2>&1; then python3 /workspace/worker_ready.py >> /workspace/worker-ready.log 2>&1 & fi",
+  "onstart": "bash /workspace/start_worker.sh",
   "python": "3.12",
   "preinstalled": [
     "torch==2.11.0+cu128",
@@ -49,7 +49,7 @@
     "image": "${MEDIA_ENGINE_WORKER_IMAGE}",
     "disk": "40 on the warm machine, else 140",
     "runtype": "ssh",
-    "onstart": "if ! python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2)' >/dev/null 2>&1; then python3 /workspace/worker_ready.py >> /workspace/worker-ready.log 2>&1 & fi",
+    "onstart": "bash /workspace/start_worker.sh",
     "label": "media-engine:{owner}"
   }
 }

@@ -69,6 +69,7 @@ _DESTROY_ON = frozenset({
     "RUNTIME_TIMEOUT",
     "WORKER_READY_TIMEOUT",
     "PORT_UNPUBLISHED",
+    "STARTUP_FAILED",
 })
 
 
