@@ -566,12 +566,18 @@ class VastImageProvider(GPUProvider):
         running_without_port: Optional[float] = None
         self.health_error = ""
         while True:
-            if watch.expired(self._now()):
-                raise WorkerStageError(_readiness_timeout_code(self.health_error))
             row = self._instance_row(resource_id)
             if row is None:
                 raise WorkerStageError("WORKER_BOOT_FAILED")
             status_name = str(row.get("actual_status") or "")
+            # Image pull has no worker yet. The 180s stall applies only after
+            # the instance is running. The startup maximum is unchanged.
+            if status_name != "running":
+                watch.mark(self._now())
+            if watch.expired(self._now()):
+                if status_name != "running" and not self.health_error:
+                    raise WorkerStageError("INSTANCE_NOT_RUNNING")
+                raise WorkerStageError(_readiness_timeout_code(self.health_error))
             endpoint = worker_http_endpoint(row)
             ssh_endpoint = worker_ssh_endpoint(row)
             if status_name == "running" and endpoint is None and ssh_endpoint is None:

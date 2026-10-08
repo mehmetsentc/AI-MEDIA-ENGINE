@@ -362,6 +362,7 @@ class PhaseClockTests(unittest.TestCase):
         for code in (
             "CONNECT_TIMEOUT", "CACHE_STALL", "CACHE_TIMEOUT", "RUNTIME_TIMEOUT",
             "WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED", "STARTUP_FAILED",
+            "INSTANCE_NOT_RUNNING",
         ):
             self.assertIn(code, _DESTROY_ON)
 
@@ -1071,6 +1072,108 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertEqual(provider.worker_state, "worker_ready")
         self.assertGreaterEqual(clock.t - 1_000, 60)
         self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][1])
+
+    def test_image_pull_is_not_reported_as_a_worker_stall(self) -> None:
+        clock = Clock()
+
+        def transport(method, url, body, headers):
+            if clock.t < 1_000 + 200:
+                row = {"id": 7, "actual_status": "loading", "machine_id": 26359}
+            else:
+                row = {
+                    "id": 7,
+                    "actual_status": "running",
+                    "machine_id": 26359,
+                    "public_ipaddr": "203.0.113.10",
+                    "ports": {"8080/tcp": [{"HostPort": "18080"}]},
+                }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+        )
+        provider.machine_id = "26359"
+        provider._health_get = lambda url: (200, b'{"state":"worker_ready","runtime":true}')
+        provider.boot("7")
+        elapsed = clock.t - 1_000
+        self.assertGreaterEqual(elapsed, 200)
+        self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][0])
+        self.assertEqual(provider.worker_state, "worker_ready")
+
+    def test_a_pull_that_never_starts_is_not_a_worker_timeout(self) -> None:
+        clock = Clock()
+
+        def transport(method, url, body, headers):
+            row = {"id": 7, "actual_status": "loading", "machine_id": 26359}
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+        )
+        provider.machine_id = "26359"
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, "INSTANCE_NOT_RUNNING")
+        self.assertEqual(provider.health_error, "")
+        elapsed = clock.t - 1_000
+        self.assertGreater(elapsed, PHASE_LIMITS["worker_ready"][0])
+        self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][0] + 10)
+
+    def test_refreshing_the_stall_clock_cannot_extend_the_startup_maximum(self) -> None:
+        watch = PhaseWatch.start("worker_ready", 0)
+        maximum, stall = PHASE_LIMITS["worker_ready"]
+        self.assertEqual((maximum, stall), (420.0, 180.0))
+        for now in range(0, int(maximum) + 1, 5):
+            watch.mark(float(now))
+            self.assertEqual(watch.started, 0)
+            self.assertIsNone(watch.expired(float(now)))
+        watch.mark(maximum + 6)
+        self.assertEqual(watch.expired(maximum + 6), "PHASE_TIMEOUT")
+
+    def test_worker_deadlines_resume_after_a_long_pull(self) -> None:
+        clock = Clock()
+        calls: list[float] = []
+
+        def transport(method, url, body, headers):
+            if clock.t < 1_000 + 200:
+                row = {"id": 7, "actual_status": "loading", "machine_id": 26359}
+            else:
+                row = {
+                    "id": 7,
+                    "actual_status": "running",
+                    "machine_id": 26359,
+                    "ssh_host": "ssh4.example",
+                    "ssh_port": 11982,
+                }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        def ssh(host, port, command, timeout):
+            calls.append(clock.t)
+            return 255, "", ""
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=ssh,
+        )
+        provider.machine_id = "26359"
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.boot("7")
+        self.assertEqual(caught.exception.code, "SSH_HEALTH_UNREACHABLE")
+        self.assertGreaterEqual(calls[0], 1_000 + 200)
+        elapsed = clock.t - 1_000
+        stall = PHASE_LIMITS["worker_ready"][1]
+        self.assertGreater(elapsed, 200 + stall)
+        self.assertLess(elapsed, 200 + stall + 10)
+        self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][0])
 
     def test_unreachable_health_stalls_before_the_maximum(self) -> None:
         clock = Clock()
