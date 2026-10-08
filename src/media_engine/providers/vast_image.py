@@ -133,6 +133,7 @@ class VastImageProvider(GPUProvider):
         self.transfer_mb_per_sec = None
         self.runtime_ready = False
         self.worker_state = ""
+        self.health_transport = ""
         self.cost_before_generation_usd = Decimal("0")
         self.last_instance_id = ""
         self._put_done = False
@@ -570,7 +571,8 @@ class VastImageProvider(GPUProvider):
                 raise WorkerStageError("WORKER_BOOT_FAILED")
             status_name = str(row.get("actual_status") or "")
             endpoint = worker_http_endpoint(row)
-            if status_name == "running" and endpoint is None:
+            ssh_endpoint = worker_ssh_endpoint(row)
+            if status_name == "running" and endpoint is None and ssh_endpoint is None:
                 if running_without_port is None:
                     running_without_port = self._now()
                 elif self._now() - running_without_port >= PORT_MAP_GRACE_SECONDS:
@@ -578,7 +580,13 @@ class VastImageProvider(GPUProvider):
                     raise WorkerStageError("PORT_UNPUBLISHED")
             else:
                 running_without_port = None
-            health = self._fetch_health(endpoint) if endpoint else None
+            if ssh_endpoint is not None:
+                health = self._ssh_local_health(row)
+            elif endpoint is not None:
+                health = self._fetch_health(endpoint)
+                self.health_transport = "public"
+            else:
+                health = None
             state = classify_readiness(status_name, endpoint is not None, health)
             self.worker_state = state
             if state != seen:
@@ -594,6 +602,30 @@ class VastImageProvider(GPUProvider):
             if state == "worker_failed":
                 raise WorkerStageError("WORKER_BOOT_FAILED")
             self._sleep(5)
+
+    def _ssh_local_health(self, row: dict) -> Optional[dict]:
+        """Read /health on the container loopback. Public HostPort is not required."""
+        endpoint = worker_ssh_endpoint(row)
+        if endpoint is None:
+            return None
+        host, port = endpoint
+        if self._ssh_run is None:
+            try:
+                self._attach_and_wait(str(row.get("id") or ""))
+            except WorkerStageError as exc:
+                if exc.code in {"CONNECT_TIMEOUT", "WORKER_BOOT_FAILED"}:
+                    raise
+                return None
+        if self._ssh_run is None:
+            return None
+        try:
+            code, out, _err = self._ssh_run(host, port, LOCAL_HEALTH_COMMAND, 15)
+        except WorkerStageError:
+            return None
+        self.health_transport = "ssh"
+        if code != 0:
+            return None
+        return parse_health_output(out)
 
     def _fetch_health(self, endpoint: tuple[str, str]) -> Optional[dict]:
         url = f"http://{endpoint[0]}:{endpoint[1]}/health"
@@ -742,6 +774,10 @@ def plan_cold_stage(hourly: Decimal, inet_down: float) -> Optional[dict[str, Dec
 # A running instance should already have its published ports. This is long
 # enough for Vast to fill the ports map and far shorter than the readiness stall.
 PORT_MAP_GRACE_SECONDS = 45.0
+LOCAL_HEALTH_COMMAND = (
+    "python3 -c 'import urllib.request; "
+    "print(urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2).read().decode())'"
+)
 
 # SSH mode does not run the image command. This script detaches the server
 # into its own session and records a secret-free launch line.
@@ -786,6 +822,43 @@ def worker_http_endpoint(row: dict) -> Optional[tuple[str, str]]:
     if port.isdigit():
         return host, port
     return None
+
+
+def worker_ssh_endpoint(row: dict) -> Optional[tuple[str, str]]:
+    if str(row.get("actual_status") or "") != "running":
+        return None
+    host = str(row.get("ssh_host") or "")
+    port = "" if row.get("ssh_port") is None else str(row.get("ssh_port"))
+    if host and port.isdigit():
+        return host, port
+    return None
+
+
+def parse_health_output(text: str) -> Optional[dict]:
+    for line in reversed(str(text).splitlines()):
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "state" in payload:
+            return payload
+    return None
+
+
+def classify_connect_failure(exc: BaseException) -> str:
+    """Separate a dropped handshake from a completed refusal. Neither is an HTTP success."""
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, TimeoutError) or isinstance(exc, TimeoutError):
+        return "timeout"
+    text = str(reason).lower()
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if isinstance(reason, ConnectionRefusedError) or "refused" in text:
+        return "refused"
+    return "unreachable"
 
 
 def pinned_worker_reference() -> str:

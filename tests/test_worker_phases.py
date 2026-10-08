@@ -15,10 +15,13 @@ from media_engine.providers.vast_image import (
     MACHINE_ID,
     VOLUME_ID,
     _generate_command,
+    LOCAL_HEALTH_COMMAND,
     PORT_MAP_GRACE_SECONDS,
     choose_offer,
+    classify_connect_failure,
     classify_readiness,
     cold_stage_allowed,
+    parse_health_output,
     pinned_worker_reference,
     plan_cold_stage,
     worker_http_endpoint,
@@ -662,6 +665,134 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, PORT_MAP_GRACE_SECONDS)
         self.assertLess(elapsed, PORT_MAP_GRACE_SECONDS + 5)
         self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][1])
+
+    def test_ssh_local_health_does_not_use_the_public_port(self) -> None:
+        clock = Clock()
+        commands: list[tuple] = []
+        public: list[str] = []
+
+        def transport(method, url, body, headers):
+            row = {
+                "id": 7,
+                "actual_status": "running",
+                "machine_id": 26359,
+                "public_ipaddr": "203.0.113.10",
+                "ssh_host": "ssh4.example",
+                "ssh_port": 11982,
+            }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        def ssh(host, port, command, timeout):
+            commands.append((host, port, command, timeout))
+            if clock.t < 1_020:
+                return 1, "", "Connection refused"
+            return 0, '{"state":"worker_ready","runtime":true,"model_loaded":false}\n', ""
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=ssh,
+        )
+        provider.machine_id = "26359"
+        provider._health_get = lambda url: public.append(url) or (200, b"{}")
+        provider.boot("7")
+        self.assertEqual(provider.health_transport, "ssh")
+        self.assertEqual(provider.worker_state, "worker_ready")
+        self.assertEqual(public, [])
+        self.assertIn("http://127.0.0.1:8080/health", commands[-1][2])
+        self.assertNotIn("203.0.113.10", commands[-1][2])
+        self.assertEqual(commands[-1][0], "ssh4.example")
+        self.assertEqual(LOCAL_HEALTH_COMMAND, commands[-1][2])
+
+    def test_public_endpoint_uses_the_mapped_host_port(self) -> None:
+        endpoint = worker_http_endpoint({
+            "actual_status": "running",
+            "public_ipaddr": "203.0.113.10",
+            "ports": {"8080/tcp": [{"HostPort": "41044"}]},
+        })
+        self.assertEqual(endpoint, ("203.0.113.10", "41044"))
+        self.assertIsNone(worker_http_endpoint({
+            "actual_status": "running",
+            "public_ipaddr": "203.0.113.10",
+        }))
+
+    def test_connect_failures_distinguish_timeout_from_refusal(self) -> None:
+        import socket
+        import urllib.error
+        self.assertEqual(classify_connect_failure(TimeoutError("timed out")), "timeout")
+        self.assertEqual(classify_connect_failure(urllib.error.URLError("timed out")), "timeout")
+        self.assertEqual(classify_connect_failure(urllib.error.URLError(TimeoutError("timed out"))), "timeout")
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1)
+            self.fail("closed port accepted a connection")
+        except OSError as exc:
+            self.assertEqual(classify_connect_failure(exc), "refused")
+        banner = parse_health_output('Welcome\n{"state":"worker_ready","runtime":true}\n')
+        self.assertEqual(banner["state"], "worker_ready")
+        self.assertIsNone(parse_health_output("Connection refused"))
+
+    def test_failed_boot_does_not_create_a_second_job(self) -> None:
+        import tempfile
+
+        from media_engine.orchestrator.controller import ManualClock, MediaController
+        from media_engine.providers.base import CreateResult, Quote
+
+        class Once:
+            name = "vast"
+
+            def __init__(self) -> None:
+                self.creates = 0
+                self.terminated: list[str] = []
+
+            def quote(self, owner: str) -> Quote:
+                return Quote(hourly_price_usd=Decimal("0.10"), provider="vast")
+
+            def create(self, owner: str) -> CreateResult:
+                self.creates += 1
+                return CreateResult(outcome="created", resource_id="42")
+
+            def boot(self, resource_id: str) -> None:
+                raise WorkerStageError("WORKER_READY_TIMEOUT")
+
+            def terminate(self, resource_id: str) -> None:
+                self.terminated.append(resource_id)
+
+            def status(self, resource_id: str) -> str:
+                return "READY"
+
+            def begin_busy(self, resource_id: str) -> None:
+                return None
+
+            def end_busy(self, resource_id: str) -> None:
+                return None
+
+            def observe(self, resource_id: str, owner: str) -> str:
+                return "gone"
+
+            def list_owned(self) -> list[dict]:
+                return []
+
+        provider = Once()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        controller = MediaController(
+            str(root / "studio.sqlite3"),
+            str(root / "artifacts"),
+            clock=ManualClock(),
+            provider=provider,
+        )
+        controller.submit_image("a newsroom", seed=20260804)
+        controller.process_available()
+        controller.process_available()
+        self.assertEqual(provider.creates, 1)
+        self.assertEqual(provider.terminated, ["42"])
 
     def test_loading_instance_keeps_the_port_grace(self) -> None:
         clock = Clock()
