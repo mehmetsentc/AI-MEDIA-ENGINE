@@ -186,6 +186,8 @@ class VastImageProvider(GPUProvider):
         }
         if portable_worker(image):
             body["onstart"] = WORKER_ONSTART
+            # runtype ssh replaces the image command and publishes no ports.
+            # Vast maps this docker -p key to a random public HostPort.
             body["env"] = {
                 "HF_HOME": "/models/hf-cache",
                 "HUGGINGFACE_HUB_CACHE": "/models/hf-cache",
@@ -193,6 +195,7 @@ class VastImageProvider(GPUProvider):
                 "TRANSFORMERS_OFFLINE": "1",
                 "HF_HUB_DISABLE_TELEMETRY": "1",
                 "WORKER_PORT": "8080",
+                "-p 8080:8080": "1",
             }
         if self.cache_source == "warm_cache":
             body["volume_info"] = {
@@ -558,6 +561,7 @@ class VastImageProvider(GPUProvider):
         """Wait until the worker process reports ready. Instance running is not enough."""
         watch = PhaseWatch.start("worker_ready", self._now())
         seen = ""
+        running_without_port: Optional[float] = None
         while True:
             if watch.expired(self._now()):
                 raise WorkerStageError("WORKER_READY_TIMEOUT")
@@ -566,6 +570,14 @@ class VastImageProvider(GPUProvider):
                 raise WorkerStageError("WORKER_BOOT_FAILED")
             status_name = str(row.get("actual_status") or "")
             endpoint = worker_http_endpoint(row)
+            if status_name == "running" and endpoint is None:
+                if running_without_port is None:
+                    running_without_port = self._now()
+                elif self._now() - running_without_port >= PORT_MAP_GRACE_SECONDS:
+                    self.worker_state = "instance_running"
+                    raise WorkerStageError("PORT_UNPUBLISHED")
+            else:
+                running_without_port = None
             health = self._fetch_health(endpoint) if endpoint else None
             state = classify_readiness(status_name, endpoint is not None, health)
             self.worker_state = state
@@ -722,6 +734,10 @@ def plan_cold_stage(hourly: Decimal, inet_down: float) -> Optional[dict[str, Dec
         "projected_cost": total,
     }
 
+
+# A running instance should already have its published ports. This is long
+# enough for Vast to fill the ports map and far shorter than the readiness stall.
+PORT_MAP_GRACE_SECONDS = 45.0
 
 WORKER_ONSTART = (
     "if ! python3 -c 'import urllib.request; "

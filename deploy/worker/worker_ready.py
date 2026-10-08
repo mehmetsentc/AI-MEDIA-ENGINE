@@ -47,10 +47,17 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
+def listen_address() -> tuple[str, int]:
+    """The process must accept Vast's published port, not only loopback."""
+    return "0.0.0.0", int(os.environ.get("WORKER_PORT", "8080"))
+
+
+def serve(address: tuple[str, int] | None = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer(address or listen_address(), _Handler)
+
+
 def main() -> None:
-    port = int(os.environ.get("WORKER_PORT", "8080"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
-    server.serve_forever()
+    serve().serve_forever()
 
 
 if __name__ == "__main__":

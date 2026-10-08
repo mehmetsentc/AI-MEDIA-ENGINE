@@ -68,6 +68,7 @@ _DESTROY_ON = frozenset({
     "CACHE_TIMEOUT",
     "RUNTIME_TIMEOUT",
     "WORKER_READY_TIMEOUT",
+    "PORT_UNPUBLISHED",
 })
 
 

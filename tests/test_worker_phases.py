@@ -15,11 +15,13 @@ from media_engine.providers.vast_image import (
     MACHINE_ID,
     VOLUME_ID,
     _generate_command,
+    PORT_MAP_GRACE_SECONDS,
     choose_offer,
     classify_readiness,
     cold_stage_allowed,
     pinned_worker_reference,
     plan_cold_stage,
+    worker_http_endpoint,
     worker_image,
     VastImageProvider,
 )
@@ -303,7 +305,10 @@ class PhaseClockTests(unittest.TestCase):
         self.assertEqual(worker_image(), "example.invalid/ai-media-engine-image-worker:runtime")
 
     def test_phase_failures_are_cleaned_up(self) -> None:
-        for code in ("CONNECT_TIMEOUT", "CACHE_STALL", "CACHE_TIMEOUT", "RUNTIME_TIMEOUT", "WORKER_READY_TIMEOUT"):
+        for code in (
+            "CONNECT_TIMEOUT", "CACHE_STALL", "CACHE_TIMEOUT", "RUNTIME_TIMEOUT",
+            "WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED",
+        ):
             self.assertIn(code, _DESTROY_ON)
 
 
@@ -321,6 +326,55 @@ class PortableWorkerTests(unittest.TestCase):
             os.environ.pop("MEDIA_ENGINE_WORKER_IMAGE", None)
         else:
             os.environ["MEDIA_ENGINE_WORKER_IMAGE"] = self.previous
+
+    def test_readiness_uses_the_published_host_port(self) -> None:
+        mapped = {
+            "actual_status": "running",
+            "public_ipaddr": "203.0.113.10",
+            "ports": {"8080/tcp": [{"HostPort": "41523"}]},
+        }
+        self.assertEqual(worker_http_endpoint(mapped), ("203.0.113.10", "41523"))
+        ssh_only = {
+            "actual_status": "running",
+            "public_ipaddr": "203.0.113.10",
+            "ports": {"22/tcp": [{"HostPort": "34567"}]},
+        }
+        self.assertIsNone(worker_http_endpoint(ssh_only))
+        self.assertIsNone(worker_http_endpoint({"actual_status": "running", "public_ipaddr": "203.0.113.10"}))
+        self.assertEqual(classify_readiness("running", False, None), "instance_running")
+
+    def test_health_answers_before_any_model_download(self) -> None:
+        import importlib.util
+        import threading
+        import urllib.request
+        root = Path(__file__).resolve().parents[1]
+        path = root / "deploy/worker/worker_ready.py"
+        text = path.read_text(encoding="utf-8")
+        for marker in ("snapshot_download", "hf_hub_download", "from_pretrained", "R2_", "VAST_API_KEY"):
+            self.assertNotIn(marker, text)
+        spec = importlib.util.spec_from_file_location("worker_ready_under_test", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        previous_port = os.environ.pop("WORKER_PORT", None)
+        self.addCleanup(lambda: os.environ.__setitem__("WORKER_PORT", previous_port) if previous_port is not None else None)
+        self.assertEqual(module.listen_address(), ("0.0.0.0", 8080))
+        server = module.serve(("127.0.0.1", 0))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(stop)
+        host, port = server.server_address
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            content_type = response.headers.get("Content-Type")
+        self.assertEqual(content_type, "application/json")
+        self.assertEqual(payload["state"], "container_starting")
+        self.assertIs(payload["runtime"], False)
 
     def test_running_instance_is_not_worker_ready(self) -> None:
         self.assertEqual(classify_readiness("running", False, None), "instance_running")
@@ -355,8 +409,14 @@ class PortableWorkerTests(unittest.TestCase):
         provider.create("nahaber")
         body = sent[0]
         self.assertEqual(body["image"], PIN)
+        self.assertEqual(body["runtype"], "ssh")
         self.assertIn("worker_ready.py", body["onstart"])
         self.assertNotIn("pip", body["onstart"])
+        self.assertNotIn("args_str", body)
+        self.assertIn("python3 /workspace/worker_ready.py", body["onstart"])
+        self.assertEqual(body["env"]["WORKER_PORT"], "8080")
+        self.assertEqual(body["env"]["-p 8080:8080"], "1")
+        self.assertEqual(body["env"]["HF_HUB_OFFLINE"], "1")
         encoded = json.dumps(body)
         for marker in _SECRET_MARKERS:
             self.assertNotIn(marker, encoded)
@@ -382,7 +442,10 @@ class PortableWorkerTests(unittest.TestCase):
                 }
             return 200, json.dumps({"instances": [row]}).encode()
 
+        seen_urls: list[str] = []
+
         def health(url):
+            seen_urls.append(url)
             if clock.t < 1_030:
                 return 200, b'{"state":"container_starting","runtime":false}'
             return 200, b'{"state":"worker_ready","runtime":true}'
@@ -400,6 +463,8 @@ class PortableWorkerTests(unittest.TestCase):
         self.assertEqual(provider.worker_state, "worker_ready")
         self.assertTrue(provider.runtime_ready)
         self.assertEqual(ssh_calls["n"], 0)
+        self.assertIn("http://203.0.113.10:18080/health", seen_urls)
+        self.assertFalse(any(url.endswith(":8080/health") for url in seen_urls))
         provider.prepare_runtime("7")
         self.assertEqual(ssh_calls["n"], 0)
 
@@ -420,9 +485,104 @@ class PortableWorkerTests(unittest.TestCase):
         provider.machine_id = "26359"
         with self.assertRaises(WorkerStageError) as caught:
             provider.boot("7")
-        self.assertEqual(caught.exception.code, "WORKER_READY_TIMEOUT")
+        self.assertEqual(caught.exception.code, "PORT_UNPUBLISHED")
         self.assertEqual(provider.worker_state, "instance_running")
-        self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][0] + 20)
+        elapsed = clock.t - 1_000
+        self.assertGreaterEqual(elapsed, PORT_MAP_GRACE_SECONDS)
+        self.assertLess(elapsed, PORT_MAP_GRACE_SECONDS + 5)
+        self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][1])
+
+    def test_loading_instance_keeps_the_port_grace(self) -> None:
+        clock = Clock()
+
+        def transport(method, url, body, headers):
+            if clock.t < 1_060:
+                row = {"id": 7, "actual_status": "loading", "machine_id": 26359}
+            else:
+                row = {
+                    "id": 7,
+                    "actual_status": "running",
+                    "machine_id": 26359,
+                    "public_ipaddr": "203.0.113.10",
+                    "ports": {"8080/tcp": [{"HostPort": "18080"}]},
+                }
+            return 200, json.dumps({"instances": [row]}).encode()
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=transport,
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=lambda *args: (_ for _ in ()).throw(AssertionError("ssh")),
+        )
+        provider.machine_id = "26359"
+        provider._health_get = lambda url: (200, b'{"state":"worker_ready","runtime":true}')
+        provider.boot("7")
+        self.assertEqual(provider.worker_state, "worker_ready")
+        self.assertGreaterEqual(clock.t - 1_000, 60)
+        self.assertLess(clock.t - 1_000, PHASE_LIMITS["worker_ready"][1])
+
+    def test_ready_timeout_destroys_the_gpu(self) -> None:
+        for code in ("WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED"):
+            self._assert_boot_failure_destroys(code)
+
+    def _assert_boot_failure_destroys(self, code: str) -> None:
+        import tempfile
+
+        from media_engine.orchestrator.controller import ManualClock, MediaController
+        from media_engine.providers.base import CreateResult, Quote
+
+        class TimeoutGPU:
+            name = "vast"
+
+            def __init__(self, failure: str) -> None:
+                self.failure = failure
+                self.terminated: list[str] = []
+
+            def quote(self, owner: str) -> Quote:
+                return Quote(hourly_price_usd=Decimal("0.10"), provider="vast")
+
+            def create(self, owner: str) -> CreateResult:
+                return CreateResult(outcome="created", resource_id="42")
+
+            def boot(self, resource_id: str) -> None:
+                raise WorkerStageError(self.failure)
+
+            def terminate(self, resource_id: str) -> None:
+                self.terminated.append(resource_id)
+
+            def status(self, resource_id: str) -> str:
+                return "READY"
+
+            def begin_busy(self, resource_id: str) -> None:
+                return None
+
+            def end_busy(self, resource_id: str) -> None:
+                return None
+
+            def observe(self, resource_id: str, owner: str) -> str:
+                return "gone"
+
+            def list_owned(self) -> list[dict]:
+                return []
+
+        provider = TimeoutGPU(code)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        controller = MediaController(
+            str(root / "studio.sqlite3"),
+            str(root / "artifacts"),
+            clock=ManualClock(),
+            provider=provider,
+        )
+        job = controller.submit_image("a newsroom", seed=20260804)
+        controller.process_available()
+        self.assertEqual(provider.terminated, ["42"])
+        saved = controller.get_job(job.id)
+        self.assertEqual(saved.public_status, "failed")
+        self.assertEqual(saved.error_code, code)
+        self.assertFalse(saved.artifact_id)
 
     def test_image_workflow_and_runtime_contain_no_secrets(self) -> None:
         root = Path(__file__).resolve().parents[1]

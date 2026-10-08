@@ -18,9 +18,11 @@
     "HUGGINGFACE_HUB_CACHE": "/models/hf-cache",
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
-    "HF_HUB_DISABLE_TELEMETRY": "1"
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "WORKER_PORT": "8080",
+    "-p 8080:8080": "1"
   },
-  "onstart": "python3 /workspace/worker_ready.py",
+  "onstart": "if ! python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2)' >/dev/null 2>&1; then python3 /workspace/worker_ready.py >> /workspace/worker-ready.log 2>&1 & fi",
   "python": "3.12",
   "preinstalled": [
     "torch==2.11.0+cu128",
@@ -47,7 +49,7 @@
     "image": "${MEDIA_ENGINE_WORKER_IMAGE}",
     "disk": "40 on the warm machine, else 140",
     "runtype": "ssh",
-    "onstart": "python3 /workspace/worker_ready.py",
+    "onstart": "if ! python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=2)' >/dev/null 2>&1; then python3 /workspace/worker_ready.py >> /workspace/worker-ready.log 2>&1 & fi",
     "label": "media-engine:{owner}"
   }
 }
