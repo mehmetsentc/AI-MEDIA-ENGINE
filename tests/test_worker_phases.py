@@ -26,8 +26,115 @@ from media_engine.providers.vast_image import (
     plan_cold_stage,
     worker_http_endpoint,
     worker_image,
+    decide_staging_budget,
     VastImageProvider,
 )
+
+
+class StagingBudgetTests(unittest.TestCase):
+    TOTAL = 57_704_594_653
+
+    def test_live5_first_sample_stays_in_warmup(self) -> None:
+        decision = decide_staging_budget(
+            [(0.0, 0), (10.0, 199_078)],
+            now=10.0,
+            deadline=16_118.0,
+            reserve_seconds=1_380.0,
+            total_bytes=self.TOTAL,
+        )
+        self.assertEqual(decision["action"], "continue")
+        self.assertEqual(decision["reason"], "warmup")
+        self.assertEqual(decision["bytes_done"], 199_078)
+
+    def test_a_slow_start_then_a_normal_rate_fits(self) -> None:
+        samples = [(0.0, 0), (10.0, 199_078)]
+        done = 199_078
+        now = 10.0
+        for _step in range(3):
+            now += 20.0
+            done += 100_000_000
+            samples.append((now, done))
+        decision = decide_staging_budget(
+            samples, now=now, deadline=16_118.0, reserve_seconds=1_380.0, total_bytes=self.TOTAL,
+        )
+        self.assertEqual(decision["action"], "continue")
+        self.assertEqual(decision["reason"], "within_budget")
+        self.assertGreater(decision["sustained_mb_per_sec"], 4)
+
+    def test_one_slow_interval_does_not_set_the_rate(self) -> None:
+        samples = [(0.0, 0), (10.0, 199_078), (30.0, 200_199_078)]
+        done = 200_199_078
+        now = 30.0
+        now += 30.0
+        done += 300_000
+        samples.append((now, done))
+        now += 20.0
+        done += 200_000_000
+        samples.append((now, done))
+        decision = decide_staging_budget(
+            samples, now=now, deadline=16_118.0, reserve_seconds=1_380.0, total_bytes=self.TOTAL,
+        )
+        self.assertEqual(decision["action"], "continue")
+        self.assertEqual(decision["reason"], "within_budget")
+        self.assertGreater(decision["sustained_mb_per_sec"], 4)
+
+    def test_several_slow_samples_cannot_finish(self) -> None:
+        samples = []
+        done = 0
+        for step in range(5):
+            samples.append((step * 20.0, done))
+            done += 6_000_000
+        decision = decide_staging_budget(
+            samples, now=80.0, deadline=10_000.0, reserve_seconds=1_380.0, total_bytes=self.TOTAL,
+        )
+        self.assertEqual(decision["action"], "stop")
+        self.assertEqual(decision["reason"], "SUSTAINED_RATE_OVER_BUDGET")
+        self.assertLess(decision["sustained_mb_per_sec"], 1)
+        self.assertGreater(decision["remaining_seconds"], 10_000)
+
+    def test_a_pause_is_not_a_rate_stop(self) -> None:
+        samples = [
+            (0.0, 0),
+            (20.0, 200_000_000),
+            (40.0, 400_000_000),
+            (60.0, 600_000_000),
+            (240.0, 600_000_000),
+        ]
+        decision = decide_staging_budget(
+            samples, now=240.0, deadline=20_000.0, reserve_seconds=1_380.0, total_bytes=self.TOTAL,
+        )
+        self.assertEqual(decision["action"], "continue")
+        self.assertEqual(decision["reason"], "within_budget")
+        self.assertGreater(decision["sustained_mb_per_sec"], 5)
+
+    def test_the_clock_stops_when_the_reserve_is_all_that_remains(self) -> None:
+        decision = decide_staging_budget(
+            [(0.0, 199_078)],
+            now=50.0,
+            deadline=60.0,
+            reserve_seconds=20.0,
+            total_bytes=self.TOTAL,
+        )
+        self.assertEqual(decision["reason"], "BUDGET_RESERVE")
+        expired = decide_staging_budget(
+            [], now=100.0, deadline=100.0, reserve_seconds=20.0, total_bytes=self.TOTAL,
+        )
+        self.assertEqual(expired["reason"], "BUDGET_DEADLINE")
+
+    def test_a_fast_copy_finishes_inside_the_budget(self) -> None:
+        samples = [
+            (0.0, 10_000_000),
+            (20.0, 30_000_000),
+            (40.0, 50_000_000),
+            (60.0, 70_000_000),
+            (80.0, 90_000_000),
+        ]
+        decision = decide_staging_budget(
+            samples, now=80.0, deadline=180.0, reserve_seconds=30.0, total_bytes=100_000_000,
+        )
+        self.assertEqual(decision["action"], "continue")
+        self.assertEqual(decision["reason"], "within_budget")
+        self.assertLess(decision["remaining_seconds"] + 30, 100)
 
 
 class Clock:
@@ -258,6 +365,92 @@ class PhaseClockTests(unittest.TestCase):
         provider._watch_cache_sync()
         self.assertGreater(clock.t - 1_000, PHASE_LIMITS["cache_staging"][1])
         self.assertGreater(sent["n"], 0)
+
+    def test_first_transfer_sample_does_not_stop_staging(self) -> None:
+        clock = Clock()
+        killed = []
+        seen = {"progress": 0}
+
+        def ssh(host, port, command, timeout):
+            if "cache-sync.pid" in command and "kill" in command:
+                killed.append(command)
+                return 0, "", ""
+            if "echo STARTED" in command:
+                return 0, "STARTED\n", ""
+            if "r2-sync-progress" in command:
+                seen["progress"] += 1
+                return 0, '{"bytes_done": 199078, "bytes_total": 57704594653, "MB_per_sec": 0.37}\n', ""
+            if "cache-sync.exit" in command:
+                if seen["progress"] >= 2:
+                    return 0, "0\n", ""
+                return 0, "RUNNING\n", ""
+            return 0, "", ""
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=lambda *args: (200, b"{}"),
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=ssh,
+        )
+        provider._host = "203.0.113.10"
+        provider._port = "22"
+        provider.budget_exceeded = lambda: True
+        provider.staging_deadline = 1_000 + 16_118
+        provider.staging_reserve_seconds = 1_380
+        provider._watch_cache_sync()
+        self.assertEqual(killed, [])
+        self.assertEqual(provider.staging_stop_reason, "")
+        self.assertEqual(provider.staging_events[0]["reason"], "warmup")
+        self.assertEqual(provider.staging_events[0]["action"], "continue")
+        self.assertEqual(provider.staging_events[0]["bytes_done"], 199078)
+        self.assertIsNone(provider.staging_events[0]["sustained_mb_per_sec"])
+
+    def test_a_sustained_slow_rate_stops_before_the_budget(self) -> None:
+        clock = Clock()
+        killed = []
+        sent = {"n": 0}
+
+        def ssh(host, port, command, timeout):
+            if "cache-sync.pid" in command and "kill" in command:
+                killed.append(command)
+                return 0, "", ""
+            if "echo STARTED" in command:
+                return 0, "STARTED\n", ""
+            if "r2-sync-progress" in command:
+                sent["n"] += 3_000_000
+                body = json.dumps({
+                    "bytes_done": sent["n"],
+                    "bytes_total": 57_704_594_653,
+                    "MB_per_sec": 0.3,
+                })
+                return 0, body + "\n", ""
+            if "cache-sync.exit" in command:
+                return 0, "RUNNING\n", ""
+            return 0, "", ""
+
+        provider = VastImageProvider(
+            api_key="fixture-key",
+            transport=lambda *args: (200, b"{}"),
+            now=clock.now,
+            sleep=clock.sleep,
+            ssh_run=ssh,
+        )
+        provider._host = "203.0.113.10"
+        provider._port = "22"
+        provider.staging_deadline = 1_000 + 2_000
+        provider.staging_reserve_seconds = 1_380
+        with self.assertRaises(WorkerStageError) as caught:
+            provider._watch_cache_sync()
+        self.assertEqual(caught.exception.code, "CACHE_TIMEOUT")
+        self.assertEqual(provider.staging_stop_reason, "SUSTAINED_RATE_OVER_BUDGET")
+        self.assertEqual(len(killed), 1)
+        last = provider.staging_events[-1]
+        self.assertGreaterEqual(last["elapsed_seconds"], 60)
+        self.assertGreater(last["bytes_done"], 8 * 1024 * 1024)
+        self.assertIsNotNone(last["sustained_mb_per_sec"])
+        self.assertIsNotNone(last["remaining_seconds"])
+        self.assertNotIn("VAST_API_KEY", json.dumps(last))
 
     def test_runtime_ready_image_skips_pip(self) -> None:
         seen: list[str] = []
@@ -1023,25 +1216,29 @@ class PortableWorkerTests(unittest.TestCase):
             def list_owned(self) -> list[dict]:
                 return []
 
-        books = Books()
-        provider = Once()
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        controller = MediaController(
-            str(root / "studio.sqlite3"),
-            str(root / "artifacts"),
-            clock=ManualClock(),
-            provider=provider,
-        )
-        controller.platform = books
-        controller.submit_image("a newsroom", seed=20260804)
-        controller.process_available()
-        controller.process_available()
-        self.assertEqual(provider.creates, 1)
-        self.assertEqual(provider.terminated, ["42"])
-        self.assertEqual(len(books.reserves), 1)
-        self.assertEqual(books.settlements, books.reserves)
+        for code in ("HEALTH_CONNECT_FAILED", "CACHE_TIMEOUT"):
+            with self.subTest(code=code):
+                books = Books()
+                provider = Once()
+                provider.boot = lambda resource_id, code=code: (_ for _ in ()).throw(WorkerStageError(code))
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                root = Path(tmp.name)
+                controller = MediaController(
+                    str(root / "studio.sqlite3"),
+                    str(root / "artifacts"),
+                    clock=ManualClock(),
+                    provider=provider,
+                )
+                controller.platform = books
+                controller.submit_image("a newsroom", seed=20260804)
+                controller.process_available()
+                controller.process_available()
+                self.assertEqual(provider.creates, 1)
+                self.assertEqual(provider.terminated, ["42"])
+                self.assertEqual(len(books.reserves), 1)
+                self.assertEqual(books.settlements, books.reserves)
+
 
     def test_loading_instance_keeps_the_port_grace(self) -> None:
         clock = Clock()

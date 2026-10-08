@@ -62,8 +62,84 @@ def active_operation_budget() -> Decimal:
     return min(amount, OPERATION_BUDGET_USD)
 
 
+def decide_staging_budget(
+    samples: list[tuple[float, int]],
+    *,
+    now: float,
+    deadline: Optional[float],
+    reserve_seconds: float,
+    total_bytes: int,
+) -> dict:
+    """Decide whether staging still fits. The first interval is not a rate.
+
+    After warm-up, the sustained rate is the later bytes divided by the
+    later time. One slow interval does not set that rate. The 180-second
+    stall timer is separate.
+    """
+    latest_bytes = samples[-1][1] if samples else 0
+    elapsed = 0.0 if not samples else max(0.0, now - samples[0][0])
+    decision = {
+        "action": "continue",
+        "reason": "warmup",
+        "sampled_mb_per_sec": None,
+        "sustained_mb_per_sec": None,
+        "remaining_seconds": None,
+        "elapsed_seconds": round(elapsed, 3),
+        "bytes_done": latest_bytes,
+    }
+    remaining_bytes = max(0, int(total_bytes) - latest_bytes)
+    if deadline is not None and now >= float(deadline):
+        decision["action"] = "stop"
+        decision["reason"] = "BUDGET_DEADLINE"
+        return decision
+    if (
+        deadline is not None
+        and remaining_bytes > 0
+        and float(deadline) - now <= max(0.0, reserve_seconds)
+    ):
+        decision["action"] = "stop"
+        decision["reason"] = "BUDGET_RESERVE"
+        return decision
+    if deadline is None or total_bytes <= 0:
+        decision["reason"] = "no_deadline"
+        return decision
+    intervals: list[tuple[float, float]] = []
+    for (earlier, earlier_bytes), (later, later_bytes) in zip(samples, samples[1:]):
+        span = later - earlier
+        moved = later_bytes - earlier_bytes
+        if span <= 0 or moved <= 0:
+            continue
+        intervals.append((float(moved), float(span)))
+    if (
+        len(samples) < STAGING_WARMUP_SAMPLES
+        or latest_bytes < STAGING_WARMUP_BYTES
+        or samples[-1][0] - samples[0][0] < STAGING_WARMUP_SECONDS
+        or len(intervals) < 3
+    ):
+        return decision
+    later = intervals[1:]
+    sustained = sum(moved for moved, _span in later) / sum(span for _moved, span in later)
+    decision["sampled_mb_per_sec"] = round((intervals[-1][0] / intervals[-1][1]) / 1_000_000, 6)
+    decision["sustained_mb_per_sec"] = round(sustained / 1_000_000, 6)
+    if sustained <= 0:
+        decision["reason"] = "no_sustained_progress"
+        return decision
+    remaining_seconds = remaining_bytes / sustained
+    decision["remaining_seconds"] = round(remaining_seconds, 3)
+    if remaining_seconds + max(0.0, reserve_seconds) > float(deadline) - now:
+        decision["action"] = "stop"
+        decision["reason"] = "SUSTAINED_RATE_OVER_BUDGET"
+        return decision
+    decision["reason"] = "within_budget"
+    return decision
+
 OVERHEAD_SECONDS = 600
 GENERATE_ALLOWANCE_SECONDS = 180
+# The first progress report is not a sustained rate. LIVE-5 stopped on
+# 0.37 MB/s after 199,078 bytes. These bounds require later samples.
+STAGING_WARMUP_SAMPLES = 4
+STAGING_WARMUP_BYTES = 8 * 1024 * 1024
+STAGING_WARMUP_SECONDS = 60.0
 # Planning rate is a quarter of the advertised download, between the slow
 # and fast transfers already measured on Vast.
 LINE_FRACTION = 0.25
@@ -131,6 +207,13 @@ class VastImageProvider(GPUProvider):
         self.projected_cost_usd = Decimal("0")
         self.transfer_seconds = None
         self.transfer_mb_per_sec = None
+        self.transfer_bytes_done = None
+        self.transfer_bytes_total = None
+        self.transfer_samples: list[tuple[float, int]] = []
+        self.staging_events: list[dict] = []
+        self.staging_deadline: Optional[float] = None
+        self.staging_reserve_seconds = 0.0
+        self.staging_stop_reason = ""
         self.runtime_ready = False
         self.worker_state = ""
         self.health_transport = ""
@@ -685,6 +768,13 @@ class VastImageProvider(GPUProvider):
                         continue
                     if isinstance(record, dict) and "MB_per_sec" in record:
                         self.transfer_mb_per_sec = record.get("MB_per_sec")
+                        done = record.get("bytes_done")
+                        total = record.get("bytes_total")
+                        if isinstance(done, int) and not isinstance(done, bool) and done >= 0:
+                            self.transfer_bytes_done = done
+                            self.transfer_samples.append((self._now(), done))
+                        if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                            self.transfer_bytes_total = total
             _code, exit_out, _err = self._remote(_CACHE_EXIT, 30, "CACHE_TIMEOUT")
             status = ""
             for line in reversed(exit_out.splitlines()):
@@ -695,6 +785,18 @@ class VastImageProvider(GPUProvider):
                 if status != "0":
                     raise WorkerStageError("MODEL_CACHE_INVALID")
                 return
+            decision = decide_staging_budget(
+                self.transfer_samples,
+                now=self._now(),
+                deadline=getattr(self, "staging_deadline", None),
+                reserve_seconds=float(getattr(self, "staging_reserve_seconds", 0) or 0),
+                total_bytes=int(self.transfer_bytes_total or 0),
+            )
+            self.staging_events.append(decision)
+            if decision["action"] == "stop":
+                self.staging_stop_reason = decision["reason"]
+                self._remote(_CACHE_KILL, 20, "CACHE_TIMEOUT")
+                raise WorkerStageError("CACHE_TIMEOUT")
             reason = watch.expired(self._now())
             if reason == "PHASE_STALL":
                 self._remote(_CACHE_KILL, 20, "CACHE_STALL")
