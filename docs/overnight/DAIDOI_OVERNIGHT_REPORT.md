@@ -14,7 +14,8 @@ Machine `47281` was rentable during the one allowed inventory read. No instance 
 | Branch | `overnight/readiness` |
 | Worktree | `/Users/user/AI-MEDIA-ENGINE-overnight` |
 | Original checkout | `/Users/user/AI-MEDIA-ENGINE` on `main`, still dirty and uncommitted |
-| Final SHA | See the last commit on `overnight/readiness` after the documentation commit |
+| Documentation SHA | `784c2f75a9b38d2533b5250c34f371ed601728a7` |
+| Final SHA | The branch tip that records this line. It contains no code beyond the audit. |
 
 Commits on this branch:
 
@@ -22,7 +23,7 @@ Commits on this branch:
 2. `4df9e376e27642de367ab6cc81ef6fa7f1cb87df` `feat(cache): keep resumable transfers behind a default-off flag`
 3. `92728cee3857a48f1d7c9804e2195f55d7f286b7` `feat(safety): require a one-execution spend grant and independent stop rules`
 4. `2ab7058bfa3dd0aa5e72351ea0e9b8ae863c79a8` `test(studio): cover the image pipeline with an offline fixture`
-5. Documentation commit that adds this report
+5. `784c2f75a9b38d2533b5250c34f371ed601728a7` `docs(overnight): record the readiness audit and studio plan`
 
 The branch was not pushed, merged, or deployed.
 
