@@ -207,8 +207,15 @@ def warm_session_seconds() -> float:
 
 
 def warm_verify_window(hourly: Decimal, ceiling: Decimal) -> dict:
-    """Warm-cache session window. Network transfer is not part of this budget."""
+    """Warm-cache session window. Network transfer is not part of this budget.
+
+    The $0.50 verification run uses the shared planning allocation. Other
+    ceilings keep a 20 percent reserve.
+    """
     required = warm_session_seconds()
+    if Decimal(ceiling) == VERIFY_RUN_BUDGET_USD:
+        from media_engine.safety.execution_budget import live6_planning_window
+        return live6_planning_window(hourly, required)
     reserve = (ceiling * Decimal("0.20")).quantize(Decimal("0.01"))
     safe = safe_runtime_seconds(
         hourly,
@@ -343,7 +350,9 @@ class VastImageProvider(GPUProvider):
         self._put_done = False
         self.execution_grant = None
         self.execution_id = ""
-        self.execution_deadline: float | None = None
+        self.execution_budget = None
+        self.authorization_expires_at: float | None = None
+        self._monotonic = time.monotonic
         self.live6_stop = ""
         self.launch_trace: list[str] = []
         self.watchdog_pid = 0
@@ -374,7 +383,8 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("EXPIRED_AUTHORIZATION")
         self.execution_grant = grant
         self.execution_id = execution_id
-        self.execution_deadline = float(grant.expires_at)
+        self.authorization_expires_at = float(grant.expires_at)
+        self.execution_budget = None
 
     def _reject_unverified_run(self) -> str:
         """The $0.50 path rents nothing until this execution's grant matches the offer."""
@@ -411,37 +421,85 @@ class VastImageProvider(GPUProvider):
             return "BUDGET_MISMATCH"
         return ""
 
+    def spending_stop(self, wall_now: float, monotonic_now: float) -> bool:
+        budget = self.execution_budget
+        if budget is None:
+            return False
+        return budget.stop(wall_now, monotonic_now)
+
     def _arm_guard(self) -> bool:
         """Start the detached watchdog before any instance request."""
+        from media_engine.safety.execution_budget import ExecutionBudget, open_budget, retain_deadline
         popen = self._watchdog_popen
         if popen is None:
             if os.environ.get("MEDIA_ENGINE_WATCHDOG_LAUNCH") != "1":
                 return False
             import subprocess
             popen = subprocess.Popen
-        if self.execution_grant is None or self.execution_deadline is None:
+        if self.execution_grant is None:
             return False
         root = Path(self.runtime)
         root.mkdir(parents=True, exist_ok=True)
+        path = root / "watchdog.json"
         local = os.environ.get("MEDIA_ENGINE_WATCHDOG_LOCAL", "").strip() == "1"
         try:
             poll = float(os.environ.get("MEDIA_ENGINE_WATCHDOG_POLL_SECONDS", "15"))
         except ValueError:
             poll = 15.0
-        spec = {
-            "mode": "local" if local else "provider",
-            "machine_id": MACHINE_ID,
-            "safe_seconds": max(0.0, float(self.execution_deadline) - float(self._now())),
-            "deadline_epoch": float(self.execution_deadline),
-            "heartbeat": str(root / "watchdog.heartbeat"),
-            "stop": str(root / "watchdog.stop"),
-            "result": str(root / "watchdog.result"),
-            "instances_path": str(root / "watchdog-instances.json"),
-            "delete_log": str(root / "watchdog-deletes.json"),
-            "poll_seconds": poll,
-        }
-        path = root / "watchdog.json"
-        path.write_text(json.dumps(spec), encoding="utf-8")
+        if path.is_file():
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                self.live6_stop = "BUDGET_MISMATCH"
+                return False
+            try:
+                retain_deadline(stored, float(self._now()) + 10**9, self.execution_id)
+                self.execution_budget = ExecutionBudget.from_mapping(stored)
+            except (KeyError, TypeError, ValueError):
+                self.live6_stop = "BUDGET_MISMATCH"
+                return False
+            except WorkerStageError as exc:
+                self.live6_stop = exc.code
+                return False
+        else:
+            studio = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
+            if studio:
+                try:
+                    studio_amount = Decimal(studio)
+                except Exception:
+                    self.live6_stop = "BUDGET_MISMATCH"
+                    return False
+                if studio_amount != VERIFY_RUN_BUDGET_USD:
+                    self.live6_stop = "BUDGET_MISMATCH"
+                    return False
+            try:
+                budget = open_budget(
+                    execution_id=self.execution_id,
+                    grant_execution_id=self.execution_grant.execution_id,
+                    grant_ceiling=self.execution_grant.ceiling_usd,
+                    hourly=self.hourly_amount,
+                    wall_now=float(self._now()),
+                    monotonic_now=float(self._monotonic()),
+                    observed_starts=[float(self._now())],
+                )
+            except WorkerStageError as exc:
+                self.live6_stop = exc.code
+                return False
+            spec = {
+                "mode": "local" if local else "provider",
+                "machine_id": MACHINE_ID,
+                "safe_seconds": budget.allowed_seconds,
+                "authorization_expires_at": self.authorization_expires_at,
+                "heartbeat": str(root / "watchdog.heartbeat"),
+                "stop": str(root / "watchdog.stop"),
+                "result": str(root / "watchdog.result"),
+                "instances_path": str(root / "watchdog-instances.json"),
+                "delete_log": str(root / "watchdog-deletes.json"),
+                "poll_seconds": poll,
+            }
+            spec.update(budget.as_mapping())
+            path.write_text(json.dumps(spec), encoding="utf-8")
+            self.execution_budget = budget
         from media_engine.providers.vast_watchdog import arm_watchdog
         self.launch_trace.append("watchdog")
         pid = arm_watchdog(path, popen=popen)
@@ -483,7 +541,8 @@ class VastImageProvider(GPUProvider):
                 self.live6_stop = reason
                 return CreateResult(outcome="definite_failure")
             if not self._arm_guard():
-                self.live6_stop = "WATCHDOG_NOT_ARMED"
+                if not self.live6_stop:
+                    self.live6_stop = "WATCHDOG_NOT_ARMED"
                 return CreateResult(outcome="definite_failure")
         label = ownership_label(owner)
         image = worker_image()

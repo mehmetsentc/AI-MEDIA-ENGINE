@@ -29,8 +29,21 @@ def main() -> None:
         server.stop()
 
 
+def supervisor_action(controller, *, wall_now: float, monotonic_now: float, finished: bool) -> str | None:
+    """Stop at the stored spending deadline. This does not recompute a budget."""
+    provider = controller.provider
+    if getattr(provider, "execution_budget", None) is None:
+        return None
+    stop = getattr(provider, "spending_stop", None)
+    if callable(stop) and stop(wall_now, monotonic_now):
+        return "SPENDING_DEADLINE"
+    if finished:
+        return "ACCEPTANCE_SHUTDOWN"
+    return None
+
+
 def _supervise(controller, ceiling: Decimal) -> None:
-    """Release the worker when its image job finishes, or before the budget is crossed."""
+    """Release the worker when its image job finishes, or at the shared deadline."""
     watched: set[str] = set()
     while True:
         time.sleep(3)
@@ -45,19 +58,29 @@ def _supervise(controller, ceiling: Decimal) -> None:
         resource_id = controller._worker_id
         if not resource_id:
             continue
-        deadline = getattr(controller.provider, "execution_deadline", None)
-        if deadline is not None and time.time() >= float(deadline):
-            try:
-                controller.release_worker("EXECUTION_DEADLINE")
-            except Exception:
-                continue
-            print({"release": "EXECUTION_DEADLINE"}, flush=True)
-            return
-        spent = _spent(controller, resource_id)
         finished = any(
             job.id in watched and getattr(job, "public_status", None) in {"completed", "failed"}
             for job in jobs
         )
+        if getattr(controller.provider, "execution_budget", None) is not None:
+            action = supervisor_action(
+                controller,
+                wall_now=time.time(),
+                monotonic_now=time.monotonic(),
+                finished=finished,
+            )
+            if action is None:
+                continue
+            try:
+                controller.release_worker(action)
+            except Exception:
+                continue
+            print({"release": action}, flush=True)
+            if action == "SPENDING_DEADLINE":
+                return
+            watched.clear()
+            continue
+        spent = _spent(controller, resource_id)
         if spent < ceiling and not finished:
             continue
         reason = "BUDGET_STOP" if spent >= ceiling else "ACCEPTANCE_SHUTDOWN"

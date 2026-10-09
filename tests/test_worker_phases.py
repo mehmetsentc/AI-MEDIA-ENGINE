@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -600,7 +601,7 @@ class PhaseClockTests(unittest.TestCase):
             expires_at=moment + 500,
             machine_id=MACHINE_ID,
         ), execution_id="live6-test")
-        allowed.runtime = Path(os.environ.get("TMPDIR", "/tmp")) / "live6-watchdog-test"
+        allowed.runtime = Path(tempfile.mkdtemp())
 
         class _Proc:
             pid = 91

@@ -205,7 +205,8 @@ class Live6PreflightTests(unittest.TestCase):
         provider = prepare_provider(environ, runtime=runtime, api_key="fixture-key")
         self.assertIsInstance(provider, VastImageProvider)
         self.assertEqual(provider.execution_id, "exec-fresh")
-        self.assertAlmostEqual(provider.execution_deadline, issued + 300, places=3)
+        self.assertAlmostEqual(provider.authorization_expires_at, issued + 300, places=3)
+        self.assertIsNone(provider.execution_budget)
         self.assertEqual(provider.execution_grant.ceiling_usd, Decimal("0.50"))
         self.assertEqual(provider.execution_grant.max_instances, 1)
         with self.assertRaises(WorkerStageError) as reused:
@@ -235,7 +236,8 @@ class Live6PreflightTests(unittest.TestCase):
         controller = build_controller(root, "real", environ)
         self.assertIsInstance(controller.provider, VastImageProvider)
         self.assertEqual(controller.provider.execution_id, "studio-exec")
-        self.assertAlmostEqual(controller.provider.execution_deadline, issued + 300, places=3)
+        self.assertAlmostEqual(controller.provider.authorization_expires_at, issued + 300, places=3)
+        self.assertIsNone(controller.provider.execution_budget)
         with self.assertRaises(WorkerStageError) as reused:
             build_controller(root, "real", environ)
         self.assertEqual(reused.exception.code, "STALE_AUTHORIZATION")
@@ -260,7 +262,10 @@ class Live6PreflightTests(unittest.TestCase):
         self.assertEqual(provider.launch_trace, ["watchdog", "put"])
         spec = json.loads((Path(self.tmp.name) / "watchdog.json").read_text(encoding="utf-8"))
         self.assertEqual(spec["mode"], "local")
-        self.assertEqual(spec["deadline_epoch"], provider.execution_deadline)
+        self.assertEqual(spec["deadline_epoch"], spec["spending_deadline_wall"])
+        self.assertEqual(spec["execution_id"], "exec-fresh")
+        self.assertEqual(spec["billing_start_event"], "create_request")
+        self.assertGreater(spec["spending_deadline_wall"], provider.authorization_expires_at)
         self.assertEqual(spec["machine_id"], MACHINE_ID)
         body = json.loads(self.put_body.decode("utf-8"))
         self.assertEqual(body["volume_info"]["volume_id"], VOLUME_ID)
@@ -290,7 +295,10 @@ class Live6PreflightTests(unittest.TestCase):
             "mode": "local",
             "machine_id": MACHINE_ID,
             "safe_seconds": 30,
-            "deadline_epoch": time.time() + 30,
+            "execution_id": "parent-crash",
+            "spending_deadline_wall": 9_000_000_000.0,
+            "authorization_expires_at": 8_000_000_000.0,
+            "deadline_epoch": 8_000_000_000.0,
             "heartbeat": str(parent_root / "beat"),
             "stop": str(parent_root / "stop"),
             "result": str(parent_root / "result.json"),
@@ -330,6 +338,7 @@ class Live6PreflightTests(unittest.TestCase):
         cleaned = json.loads(Path(child_spec["result"]).read_text(encoding="utf-8"))
         self.assertEqual(cleaned["stopped"], ["local-1"])
         self.assertEqual(cleaned["termination_failures"], [])
+        self.assertEqual(cleaned["deadline"], 9_000_000_000.0)
         self.assertFalse(_wait_dead(child))
 
     def test_watchdog_reports_a_failed_delete_and_exits(self) -> None:
@@ -476,7 +485,7 @@ class Live6PreflightTests(unittest.TestCase):
 
         deadline = FakeGPUProvider(lambda: 1_000.0)
         deadline.execution_grant = self._grant("deadline")
-        deadline.execution_deadline = 1_000.0
+        deadline.spending_stop = lambda wall, _mono: wall >= 1_000.0
         controller = self._controller(deadline)
         controller.clock.t = 1_000.0
         dispatch(controller, "POST", "/v1/images/generations", json.dumps({"prompt": "deadline"}).encode())
@@ -484,7 +493,7 @@ class Live6PreflightTests(unittest.TestCase):
         self.assertEqual(deadline.create_calls, 1)
         controller.clock.advance(0)
         controller._expire_worker()
-        self.assertEqual(controller.last_shutdown_reason, "EXECUTION_DEADLINE")
+        self.assertEqual(controller.last_shutdown_reason, "SPENDING_DEADLINE")
         self.assertEqual(deadline.terminate_calls, 1)
         self.assertEqual(deadline.create_calls, 1)
 

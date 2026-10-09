@@ -141,17 +141,23 @@ def run_until_stopped(spec: dict, *, fetch, delete, now, sleep) -> dict:
     seen: float | None = None
     deadline: float | None = None
     armed: float | None = None
+    locked = spec.get("spending_deadline_wall")
     while True:
         current = float(now())
         if armed is None:
             armed = current
         rows = fetch()
         owned = matching_instances(rows, machine_id)
-        absolute = spec.get("deadline_epoch")
         if owned and seen is None:
             seen = current
-            deadline = float(absolute) if absolute is not None else min(seen + safe_seconds, armed + safe_seconds)
-        window_end = float(absolute) if absolute is not None else armed + safe_seconds
+        if locked is not None:
+            deadline = float(locked)
+            window_end = deadline
+        else:
+            absolute = spec.get("deadline_epoch")
+            if owned and seen is not None and deadline is None:
+                deadline = float(absolute) if absolute is not None else min(seen + safe_seconds, armed + safe_seconds)
+            window_end = float(absolute) if absolute is not None else armed + safe_seconds
         if not owned and current >= window_end:
             return {"stopped": [], "deadline": deadline, "termination_failures": []}
         heartbeat_age = None

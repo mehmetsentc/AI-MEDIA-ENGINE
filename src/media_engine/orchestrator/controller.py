@@ -659,10 +659,13 @@ class MediaController:
     def _expire_worker(self) -> None:
         if self._worker_id is None:
             return
-        deadline = getattr(self.provider, "execution_deadline", None)
-        if deadline is not None and self.clock.now() >= float(deadline):
-            self._terminate(self._worker_id, "EXECUTION_DEADLINE")
-            return
+        stop = getattr(self.provider, "spending_stop", None)
+        if callable(stop):
+            mono = getattr(self.provider, "_monotonic", None)
+            mono_now = mono() if callable(mono) else self.clock.now()
+            if stop(self.clock.now(), mono_now):
+                self._terminate(self._worker_id, "SPENDING_DEADLINE")
+                return
         if self._worker_created_at is None:
             return
         if self.clock.now() - self._worker_created_at >= self.limits.max_worker_lifetime_seconds:
