@@ -105,6 +105,11 @@ class MemoryObjectStore:
         return sorted(key for key in self.objects if key.startswith(prefix))
 
 
+def reliable_transfer_enabled() -> bool:
+    from media_engine.engines.image.r2_reliability import reliable_transfer_enabled as enabled
+    return enabled()
+
+
 def sync_complete_cache(
     store,
     mount: Path,
@@ -169,12 +174,15 @@ def _sync_parallel(store, mount: Path, *, on_progress, progress_path, deadline_s
     def emit() -> None:
         elapsed = time.perf_counter() - started
         with lock:
+            inflight = sum(state.get("inflight", {}).values())
+            visible = state["bytes_done"] + inflight
             record = {
                 "stage": "R2_SYNC",
                 "objects_done": state["objects_done"],
-                "bytes_done": state["bytes_done"],
+                "bytes_done": visible if inflight else state["bytes_done"],
+                "bytes_validated": state["bytes_done"],
                 "bytes_total": state["bytes_total"],
-                "MB_per_sec": round((state["bytes_done"] / elapsed / 1_000_000) if elapsed else 0.0, 3),
+                "MB_per_sec": round((visible / elapsed / 1_000_000) if elapsed else 0.0, 3),
                 "current": sorted(state["current"]),
             }
             if progress_path is not None:
@@ -208,7 +216,23 @@ def _sync_parallel(store, mount: Path, *, on_progress, progress_path, deadline_s
             ):
                 finish(key, size)
                 return
-            meta = store.download_file(key, destination, should_stop=should_stop)
+            if (
+                size > 0
+                and reliable_transfer_enabled()
+                and hasattr(store, "download_reliable")
+            ):
+                def _received(nbytes: int, name: str = key) -> None:
+                    with lock:
+                        state.setdefault("inflight", {})[name] = nbytes
+                    emit()
+
+                meta = store.download_reliable(
+                    key, destination, object_size=size, should_stop=should_stop, on_received=_received,
+                )
+                with lock:
+                    state.setdefault("inflight", {}).pop(key, None)
+            else:
+                meta = store.download_file(key, destination, should_stop=should_stop)
             if meta.get("hf-symlink"):
                 with lock:
                     symlinks.append((key, meta))
@@ -408,6 +432,13 @@ class R2Client:
         os.replace(partial, destination)
         return {}
 
+    def download_reliable(self, key: str, destination: Path, *, object_size: int, should_stop=None, on_received=None) -> dict[str, str]:
+        from media_engine.engines.image.r2_reliability import download_with_resume
+        return download_with_resume(
+            self, key, destination, object_size=object_size,
+            should_stop=should_stop, on_received=on_received,
+        )
+
     def list_entries(self, prefix: str) -> list[tuple[str, int]]:
         """Keys and sizes. Size is -1 when the listing has no size."""
         entries: list[tuple[str, int]] = []
@@ -450,6 +481,8 @@ class R2Client:
         query: dict[str, str] | None = None,
         stream_to: Path | None = None,
         should_stop=None,
+        stream_mode: str = "wb",
+        on_chunk=None,
     ):
         parts = urlsplit(self.config.endpoint)
         host = parts.netloc
@@ -479,8 +512,8 @@ class R2Client:
             with self._opener(request, timeout=60) as response:
                 status = response.status
                 headers = dict(response.headers.items())
-                if stream_to is not None and status == 200 and not _symlink_meta(headers):
-                    _stream_to_file(response, stream_to, should_stop)
+                if stream_to is not None and status in {200, 206} and not _symlink_meta(headers):
+                    _stream_to_file(response, stream_to, should_stop, stream_mode, on_chunk)
                     return status, headers, b""
                 return status, headers, response.read()
         except TimeoutError as exc:
@@ -578,8 +611,10 @@ def _symlink_meta(headers: dict) -> dict[str, str]:
     return {}
 
 
-def _stream_to_file(response, path: Path, should_stop) -> None:
-    with path.open("wb") as handle:
+def _stream_to_file(response, path: Path, should_stop, stream_mode: str = "wb", on_chunk=None) -> None:
+    if stream_mode not in {"wb", "ab"}:
+        raise ValueError("stream_mode")
+    with path.open(stream_mode) as handle:
         while True:
             if should_stop is not None and should_stop():
                 raise TimeoutError("CACHE_SYNC_DEADLINE")
@@ -587,6 +622,8 @@ def _stream_to_file(response, path: Path, should_stop) -> None:
             if not chunk:
                 return
             handle.write(chunk)
+            if on_chunk is not None:
+                on_chunk(len(chunk))
 
 
 def _parse_list(body: bytes) -> tuple[list[str], str]:
