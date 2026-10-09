@@ -485,6 +485,7 @@ class VastImageProvider(GPUProvider):
         if self.cuda_max_good is None or self.gpu_ram_mib is None or self.compute_cap is None:
             return "CUDA_MISMATCH"
         reason = accept_offer({
+            "id": int(self.offer_id or 0),
             "machine_id": LIVE7_MACHINE_ID,
             "gpu_name": self.gpu_model,
             "gpu_ram": self.gpu_ram_mib,

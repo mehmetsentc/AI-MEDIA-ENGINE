@@ -16,9 +16,10 @@ from media_engine.safety.execution_budget import (
 )
 from media_engine.safety.spend_grant import SpendGrant
 
-LIVE7_MACHINE_ID = 142658
-LIVE7_GPU_FAMILY = "5880ada"
-LIVE7_GPU_NAME = "RTX 5880 Ada"
+LIVE7_MACHINE_ID = 150718
+LIVE7_OFFER_ID = 53055111
+LIVE7_GPU_FAMILY = "6000ada"
+LIVE7_GPU_NAME = "RTX 6000 Ada"
 LIVE7_MIN_VRAM_MIB = 49140
 LIVE7_MAX_VRAM_MIB = 52000
 LIVE7_DISK_GB = 140
@@ -31,6 +32,8 @@ REVISION = "75e0b4be04f60ec59a75f475837eced720f823b6"
 
 def gpu_family_token(name: str) -> str:
     compact = str(name).casefold().replace(" ", "").replace("_", "").replace("-", "")
+    if "6000ada" in compact:
+        return "6000ada"
     if "5880ada" in compact:
         return "5880ada"
     return compact
@@ -106,6 +109,8 @@ def accept_offer(row: dict, hourly: Decimal) -> str:
         return "OFFER_REJECTED"
     if machine != LIVE7_MACHINE_ID:
         return "MACHINE_SCOPE"
+    if int(row.get("id") or 0) != LIVE7_OFFER_ID:
+        return "OFFER_REJECTED"
     if row.get("rentable") is not True or gpus != 1:
         return "OFFER_REJECTED"
     if gpu_family_token(str(row.get("gpu_name") or "")) != LIVE7_GPU_FAMILY:
@@ -170,7 +175,7 @@ def static_compatibility(root: Path | None = None) -> dict:
         "reference_hourly_usd": str(LIVE7_REFERENCE_HOURLY_USD),
         "maximum_hourly_usd": str(LIVE7_MAX_HOURLY_USD),
         "unverified": [
-            "No worker process loaded Qwen-Image on an RTX 5880 Ada",
+            "No worker process loaded Qwen-Image on an RTX 6000 Ada",
             "The offer's driver and cuda_max_good must be read again before rental",
             "Peak VRAM for this model load has not been measured",
         ],

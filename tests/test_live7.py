@@ -24,6 +24,7 @@ from media_engine.providers.live6_prepare import claim_execution_id
 from media_engine.providers.live7_contract import (
     FORBIDDEN_VOLUME_ID,
     LIVE7_MACHINE_ID,
+    LIVE7_OFFER_ID,
     REVISION,
     accept_live7_grant,
     image_contract,
@@ -91,9 +92,9 @@ def _manifest(files: dict[str, bytes]) -> dict:
 
 def _offer(**overrides) -> dict:
     row = {
-        "id": 44120922,
+        "id": LIVE7_OFFER_ID,
         "machine_id": LIVE7_MACHINE_ID,
-        "gpu_name": "RTX 5880 Ada",
+        "gpu_name": "RTX 6000 Ada",
         "gpu_ram": 49140,
         "num_gpus": 1,
         "rentable": True,
@@ -212,7 +213,11 @@ class Live7GrantTests(unittest.TestCase):
                 puts.append(json.loads(body.decode("utf-8")))
                 return 200, b'{"success": true, "new_contract": 77}'
             if method == "POST":
-                return 200, json.dumps({"offers": [_offer(), _offer(id=1, machine_id=26359, gpu_name="RTX A6000")]}).encode()
+                return 200, json.dumps({"offers": [
+                _offer(),
+                _offer(id=1, machine_id=26359, gpu_name="RTX A6000"),
+                _offer(id=999, dph_base="0.10", dph_total="0.10"),
+            ]}).encode()
             return 200, b'{"instances": []}'
 
         provider = VastImageProvider(
@@ -226,8 +231,8 @@ class Live7GrantTests(unittest.TestCase):
     def _arm(self, provider: VastImageProvider, execution_id: str = "live7-fresh") -> None:
         grant = make_live7_grant(execution_id=execution_id, issued_at=1_000, expires_at=20_000)
         provider.bind_execution(grant, execution_id=execution_id)
-        provider.offer_id = "44120922"
-        provider.gpu_model = "RTX 5880 Ada"
+        provider.offer_id = str(LIVE7_OFFER_ID)
+        provider.gpu_model = "RTX 6000 Ada"
         provider.gpu_ram_mib = 49140
         provider.cuda_max_good = 13.2
         provider.compute_cap = 890
@@ -264,6 +269,7 @@ class Live7GrantTests(unittest.TestCase):
         os.environ["MEDIA_ENGINE_WATCHDOG_LAUNCH"] = "1"
         cases = (
             ("machine_id", "26359", "MACHINE_SCOPE"),
+            ("offer_id", "999", "OFFER_REJECTED"),
             ("gpu_model", "RTX A6000", "GPU_MISMATCH"),
             ("cuda_max_good", 12.5, "CUDA_MISMATCH"),
             ("gpu_ram_mib", 24576, "VRAM_MISMATCH"),
@@ -330,6 +336,7 @@ class Live7GrantTests(unittest.TestCase):
         created = provider.create("daidoi")
         self.assertEqual(created.outcome, "created")
         self.assertEqual(queries[0]["machine_id"], {"eq": LIVE7_MACHINE_ID})
+        self.assertEqual(provider.offer_id, str(LIVE7_OFFER_ID))
         self.assertEqual(provider.machine_id, str(LIVE7_MACHINE_ID))
         self.assertNotIn("volume_info", provider.puts[0])
         self.assertNotEqual(provider.puts[0].get("volume_id"), FORBIDDEN_VOLUME_ID)
