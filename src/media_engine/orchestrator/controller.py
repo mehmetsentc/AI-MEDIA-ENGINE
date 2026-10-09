@@ -261,6 +261,10 @@ class MediaController:
             )
             if not job.prompt or len(job.prompt) > 4000:
                 raise JobError("PROMPT_REQUIRED")
+            if getattr(self.provider, "single_image_only", False):
+                if getattr(self.provider, "image_claimed", False):
+                    raise JobError("SINGLE_IMAGE_ONLY")
+                self.provider.image_claimed = True
             self.clients.require(job.client_id)
             self.jobs.insert(job)
             self.queue.enqueue(job.id)

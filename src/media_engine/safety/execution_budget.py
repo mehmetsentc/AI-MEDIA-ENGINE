@@ -1,12 +1,15 @@
-"""One LIVE-6 spending deadline shared by the planner, studio, provider, and watchdog.
+"""One spending deadline shared by the planner, studio, provider, and watchdog.
 
 Authorization expiry is not this deadline. The clock starts at the create
 request and is not moved forward when later stages are observed.
+
+The $0.50 verification profile is unchanged. The $1.50 profile has its own
+reserve and refuses any other ceiling.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from typing import Optional
 
 from media_engine.providers.base import WorkerStageError
@@ -15,6 +18,20 @@ LIVE6_CEILING_USD = Decimal("0.50")
 LIVE6_RESERVE_USD = Decimal("0.10")
 LIVE6_PLANNING_USD = Decimal("0.40")
 LIVE6_MAX_HOURLY_USD = Decimal("0.375")
+# LIVE-7 alternative GPU. These numbers do not apply to the $0.50 path.
+LIVE7_CEILING_USD = Decimal("1.50")
+LIVE7_MAX_HOURLY_USD = Decimal("0.95")
+LIVE7_REFERENCE_HOURLY_USD = Decimal("0.8648")
+LIVE7_RESERVE_SECONDS = 840
+LIVE7_PROVISION_SECONDS = 420
+LIVE7_LOAD_SECONDS = 600
+LIVE7_INFERENCE_SECONDS = 600
+LIVE7_UPLOAD_SECONDS = 180
+LIVE7_TAIL_SECONDS = LIVE7_LOAD_SECONDS + LIVE7_INFERENCE_SECONDS + LIVE7_UPLOAD_SECONDS
+LIVE7_TRANSFER_FLOOR_SECONDS = 2400
+LIVE7_MINIMUM_SESSION_SECONDS = (
+    LIVE7_PROVISION_SECONDS + LIVE7_TRANSFER_FLOOR_SECONDS + LIVE7_TAIL_SECONDS
+)
 BILLING_START_EVENT = "create_request"
 
 
@@ -36,6 +53,58 @@ def billable_seconds(hourly: Decimal) -> Optional[int]:
     if cost > LIVE6_PLANNING_USD:
         return None
     return seconds
+
+
+def termination_reserve_usd(hourly: Decimal) -> Decimal:
+    """Fourteen minutes at the actual hourly rate, rounded up.
+
+    The $0.10 LIVE-6 reserve is not reused. A higher hourly rate needs a
+    larger dollar reserve for the same deletion delay.
+    """
+    amount = Decimal(hourly)
+    if amount <= 0:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    raw = (amount * Decimal(LIVE7_RESERVE_SECONDS)) / Decimal(3600)
+    return raw.quantize(Decimal("0.000001"), rounding=ROUND_UP)
+
+
+def live7_planning_usd(hourly: Decimal) -> Decimal:
+    reserve = termination_reserve_usd(hourly)
+    planning = LIVE7_CEILING_USD - reserve
+    if planning <= 0:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    return planning
+
+
+def live7_billable_seconds(hourly: Decimal) -> Optional[int]:
+    """Whole running seconds inside the $1.50 ceiling after the scaled reserve.
+
+    A price above the authorized hourly cap, or a window too short for
+    provisioning, a 2400-second copy, load, inference, and upload, returns
+    no duration.
+    """
+    amount = Decimal(hourly)
+    if amount <= 0 or amount > LIVE7_MAX_HOURLY_USD:
+        return None
+    try:
+        planning = live7_planning_usd(amount)
+    except WorkerStageError:
+        return None
+    seconds = int((planning / amount) * Decimal(3600))
+    if seconds < LIVE7_MINIMUM_SESSION_SECONDS:
+        return None
+    cost = (amount * Decimal(seconds)) / Decimal(3600)
+    if cost > planning:
+        return None
+    return seconds
+
+
+def live7_transfer_room(allowed_seconds: int) -> int:
+    """Copy time that still leaves provisioning, load, inference, and upload."""
+    room = int(allowed_seconds) - LIVE7_PROVISION_SECONDS - LIVE7_TAIL_SECONDS
+    if room < LIVE7_TRANSFER_FLOOR_SECONDS:
+        return 0
+    return room
 
 
 def live6_planning_window(hourly: Decimal, required_seconds: float) -> dict:
@@ -158,6 +227,45 @@ def open_budget(
         ceiling_usd=LIVE6_CEILING_USD,
         reserve_usd=LIVE6_RESERVE_USD,
         planning_usd=LIVE6_PLANNING_USD,
+        hourly_usd=Decimal(hourly),
+        allowed_seconds=seconds,
+        billing_started_wall=wall,
+        billing_started_monotonic=mono,
+        spending_deadline_wall=wall + seconds,
+        spending_deadline_monotonic=mono + seconds,
+    )
+
+
+def open_live7_budget(
+    *,
+    execution_id: str,
+    grant_execution_id: str,
+    grant_ceiling: Decimal,
+    hourly: Decimal,
+    wall_now: float,
+    monotonic_now: float,
+    observed_starts: Optional[list] = None,
+) -> ExecutionBudget:
+    """Freeze a $1.50 deadline. Grant expiry is not an input and $0.50 is refused."""
+    if not execution_id or execution_id != grant_execution_id:
+        raise WorkerStageError("STALE_AUTHORIZATION")
+    if Decimal(grant_ceiling) != LIVE7_CEILING_USD:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    seconds = live7_billable_seconds(hourly)
+    if seconds is None or live7_transfer_room(seconds) < LIVE7_TRANSFER_FLOOR_SECONDS:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    candidates = [wall_now]
+    if observed_starts:
+        candidates.extend(observed_starts)
+    wall = conservative_billing_start(candidates)
+    shift = float(wall_now) - wall
+    mono = float(monotonic_now) - shift
+    reserve = termination_reserve_usd(hourly)
+    return ExecutionBudget(
+        execution_id=execution_id,
+        ceiling_usd=LIVE7_CEILING_USD,
+        reserve_usd=reserve,
+        planning_usd=LIVE7_CEILING_USD - reserve,
         hourly_usd=Decimal(hourly),
         allowed_seconds=seconds,
         billing_started_wall=wall,

@@ -64,14 +64,20 @@ def _operation_ceiling() -> Decimal:
         return OPERATION_BUDGET_USD
     if granted in AUTHORIZED_RUN_BUDGETS:
         return granted
+    if granted == Decimal("1.50"):
+        if os.environ.get("MEDIA_ENGINE_EXECUTION_PROFILE", "").strip() != "live7":
+            raise WorkerStageError("BUDGET_MISMATCH")
+        return granted
     return OPERATION_BUDGET_USD
 
 
 def active_operation_budget() -> Decimal:
     """The default cap stays $1. STUDIO_GPU_BUDGET_USD can only tighten it.
 
-    MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD must be exactly 3.00 or 0.50.
+    MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD must be exactly 3.00 or 0.50,
+    or 1.50 with MEDIA_ENGINE_EXECUTION_PROFILE=live7.
     0.50 is the cache-verification ceiling. 0.49, 0.51, and 9.00 stay at $1.
+    1.50 is not rewritten as $1 or $3.
     """
     ceiling = _operation_ceiling()
     raw = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
@@ -358,6 +364,11 @@ class VastImageProvider(GPUProvider):
         self.watchdog_pid = 0
         self._watchdog_popen = None
         self.attached_volume_id = VOLUME_ID
+        self.single_image_only = False
+        self.image_claimed = False
+        self.gpu_ram_mib = None
+        self.cuda_max_good = None
+        self.compute_cap = None
         self._owner = ""
         self._label = ""
         self._resource_id = ""
@@ -368,6 +379,10 @@ class VastImageProvider(GPUProvider):
         self._started_at: dict[str, float] = {}
         self.commands: list[str] = []
 
+    def _live7_bound(self) -> bool:
+        grant = self.execution_grant
+        return grant is not None and getattr(grant, "profile", "") == "live7"
+
     def bind_execution(self, grant, *, execution_id: str) -> None:
         """Attach one fresh grant. A second bind in this process is refused."""
         from media_engine.safety.spend_grant import SpendGrant
@@ -375,6 +390,9 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("STALE_AUTHORIZATION")
         if not isinstance(grant, SpendGrant) or grant.execution_id != execution_id:
             raise WorkerStageError("MISSING_AUTHORIZATION")
+        if getattr(grant, "profile", "live6") == "live7":
+            self._bind_live7(grant, execution_id)
+            return
         if grant.ceiling_usd != VERIFY_RUN_BUDGET_USD or grant.max_instances != 1:
             raise WorkerStageError("BUDGET_MISMATCH")
         if grant.machine_id != MACHINE_ID:
@@ -385,6 +403,33 @@ class VastImageProvider(GPUProvider):
         self.execution_id = execution_id
         self.authorization_expires_at = float(grant.expires_at)
         self.execution_budget = None
+
+    def _bind_live7(self, grant, execution_id: str) -> None:
+        """Pin the alternative GPU. The warm volume stays detached."""
+        from media_engine.providers.live7_contract import (
+            FORBIDDEN_VOLUME_ID,
+            LIVE7_DISK_GB,
+            LIVE7_MACHINE_ID,
+            accept_live7_grant,
+        )
+        accept_live7_grant(grant)
+        if float(self._now()) >= grant.expires_at:
+            raise WorkerStageError("EXPIRED_AUTHORIZATION")
+        if os.environ.get("MEDIA_ENGINE_ALLOW_COLD_STAGE", "").strip() != "1":
+            raise WorkerStageError("COLD_STAGE_FORBIDDEN")
+        if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
+            raise WorkerStageError("R2_FORBIDDEN")
+        self.execution_grant = grant
+        self.execution_id = execution_id
+        self.authorization_expires_at = float(grant.expires_at)
+        self.execution_budget = None
+        self.machine_id = str(LIVE7_MACHINE_ID)
+        self.disk_gb = LIVE7_DISK_GB
+        self.cache_source = "r2_cold_stage"
+        self.attached_volume_id = 0
+        self.single_image_only = True
+        if int(FORBIDDEN_VOLUME_ID) == int(getattr(self, "attached_volume_id", 0) or 0):
+            raise WorkerStageError("VOLUME_MISMATCH")
 
     def _reject_unverified_run(self) -> str:
         """The $0.50 path rents nothing until this execution's grant matches the offer."""
@@ -419,6 +464,52 @@ class VastImageProvider(GPUProvider):
             return "INSTANCE_LIMIT"
         if grant.ceiling_usd != VERIFY_RUN_BUDGET_USD:
             return "BUDGET_MISMATCH"
+        return ""
+
+    def _reject_live7_run(self) -> str:
+        """The $1.50 path rents one pinned machine and never attaches the warm volume."""
+        from media_engine.providers.live7_contract import (
+            FORBIDDEN_VOLUME_ID,
+            LIVE7_DISK_GB,
+            LIVE7_MACHINE_ID,
+            accept_offer,
+        )
+        from media_engine.safety.execution_budget import LIVE7_CEILING_USD
+        from media_engine.safety.spend_grant import evaluate_grant
+        if int(getattr(self, "attached_volume_id", 0) or 0) in {FORBIDDEN_VOLUME_ID, VOLUME_ID}:
+            return "VOLUME_MISMATCH"
+        if self.cache_source != "r2_cold_stage" or int(self.disk_gb) != LIVE7_DISK_GB:
+            return "VOLUME_MISMATCH"
+        if str(self.machine_id) != str(LIVE7_MACHINE_ID):
+            return "MACHINE_SCOPE"
+        if self.cuda_max_good is None or self.gpu_ram_mib is None or self.compute_cap is None:
+            return "CUDA_MISMATCH"
+        reason = accept_offer({
+            "machine_id": LIVE7_MACHINE_ID,
+            "gpu_name": self.gpu_model,
+            "gpu_ram": self.gpu_ram_mib,
+            "disk_space": LIVE7_DISK_GB,
+            "cuda_max_good": self.cuda_max_good,
+            "compute_cap": self.compute_cap,
+            "num_gpus": 1,
+            "rentable": True,
+        }, self.hourly_amount)
+        if reason:
+            return reason
+        owned = [
+            row for row in self._instances()
+            if str(row.get("label") or "").startswith("media-engine:")
+        ]
+        decision = evaluate_grant(
+            self.execution_grant,
+            now=float(self._now()),
+            execution_id=self.execution_id,
+            ceiling_usd=LIVE7_CEILING_USD,
+            instances=len(owned) + 1,
+            machine_id=LIVE7_MACHINE_ID,
+        )
+        if decision["action"] != "continue":
+            return str(decision["reason"])
         return ""
 
     def spending_stop(self, wall_now: float, monotonic_now: float) -> bool:
@@ -463,17 +554,22 @@ class VastImageProvider(GPUProvider):
                 return False
         else:
             studio = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
+            expected_studio = Decimal("1.50") if self._live7_bound() else VERIFY_RUN_BUDGET_USD
             if studio:
                 try:
                     studio_amount = Decimal(studio)
                 except Exception:
                     self.live6_stop = "BUDGET_MISMATCH"
                     return False
-                if studio_amount != VERIFY_RUN_BUDGET_USD:
+                if studio_amount != expected_studio:
                     self.live6_stop = "BUDGET_MISMATCH"
                     return False
             try:
-                budget = open_budget(
+                opener = open_budget
+                if self._live7_bound():
+                    from media_engine.safety.execution_budget import open_live7_budget
+                    opener = open_live7_budget
+                budget = opener(
                     execution_id=self.execution_id,
                     grant_execution_id=self.execution_grant.execution_id,
                     grant_ceiling=self.execution_grant.ceiling_usd,
@@ -485,9 +581,14 @@ class VastImageProvider(GPUProvider):
             except WorkerStageError as exc:
                 self.live6_stop = exc.code
                 return False
+            if self._live7_bound():
+                from media_engine.safety.execution_budget import LIVE7_TAIL_SECONDS
+                self.staging_deadline = budget.spending_deadline_wall
+                self.staging_reserve_seconds = float(LIVE7_TAIL_SECONDS)
+            pinned_machine = int(self.machine_id) if self._live7_bound() else MACHINE_ID
             spec = {
                 "mode": "local" if local else "provider",
-                "machine_id": MACHINE_ID,
+                "machine_id": pinned_machine,
                 "safe_seconds": budget.allowed_seconds,
                 "authorization_expires_at": self.authorization_expires_at,
                 "heartbeat": str(root / "watchdog.heartbeat"),
@@ -511,6 +612,8 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
         self._owner = owner
         self._label = ownership_label(owner)
+        if self._live7_bound():
+            return self._quote_live7(owner)
         if not self._volume_ready():
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
         chosen = self._select_offer()
@@ -529,13 +632,62 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("MODEL_CACHE_INVALID")
         return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
 
+    def _quote_live7(self, owner: str) -> Quote:
+        """Search only the pinned machine. Another machine in the response is ignored."""
+        from media_engine.providers.live7_contract import LIVE7_DISK_GB, LIVE7_MACHINE_ID, accept_offer
+        del owner
+        rows = self._bundle_offers({
+            "limit": 8,
+            "type": "on-demand",
+            "rentable": {"eq": True},
+            "num_gpus": {"eq": 1},
+            "machine_id": {"eq": LIVE7_MACHINE_ID},
+        })
+        accepted = []
+        for row in rows:
+            if int(row.get("machine_id") or 0) != LIVE7_MACHINE_ID:
+                continue
+            try:
+                hourly = _hourly(row, LIVE7_DISK_GB)
+            except WorkerStageError:
+                continue
+            if accept_offer(row, hourly):
+                continue
+            accepted.append((row, hourly))
+        if not accepted:
+            raise WorkerStageError("OFFER_REJECTED")
+        accepted.sort(key=lambda item: item[1])
+        row, hourly = accepted[0]
+        self.offer_id = str(row.get("id"))
+        self.gpu_model = str(row.get("gpu_name") or "")
+        self.machine_id = str(LIVE7_MACHINE_ID)
+        self.hourly_amount = hourly
+        self.cache_source = "r2_cold_stage"
+        self.disk_gb = LIVE7_DISK_GB
+        self.attached_volume_id = 0
+        self.gpu_ram_mib = float(row.get("gpu_ram") or 0)
+        self.cuda_max_good = float(row.get("cuda_max_good") or 0)
+        self.compute_cap = int(row.get("compute_cap") or 0)
+        self.projected_cost_usd = hourly
+        self.fits_operation_budget = True
+        return Quote(hourly_price_usd=hourly, provider="vast")
+
     def create(self, owner: str) -> CreateResult:
         if self._put_done:
             return CreateResult(outcome="definite_failure")
         self._put_done = True
         if not self.offer_id:
             self.quote(owner)
-        if self.execution_grant is not None or os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50":
+        if self._live7_bound():
+            reason = self._reject_live7_run()
+            if reason:
+                self.live6_stop = reason
+                return CreateResult(outcome="definite_failure")
+            if not self._arm_guard():
+                if not self.live6_stop:
+                    self.live6_stop = "WATCHDOG_NOT_ARMED"
+                return CreateResult(outcome="definite_failure")
+        elif self.execution_grant is not None or os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50":
             reason = self._reject_unverified_run()
             if reason:
                 self.live6_stop = reason
@@ -566,7 +718,11 @@ class VastImageProvider(GPUProvider):
                 "WORKER_PORT": "8080",
                 "-p 8080:8080": "1",
             }
-        if self.cache_source == "warm_cache":
+        if self._live7_bound():
+            if "volume_info" in body or int(getattr(self, "attached_volume_id", 0) or 0) == VOLUME_ID:
+                self.live6_stop = "VOLUME_MISMATCH"
+                return CreateResult(outcome="definite_failure")
+        elif self.cache_source == "warm_cache":
             body["volume_info"] = {
                 "mount_path": MOUNT_PATH, "create_new": False, "volume_id": int(self.attached_volume_id),
             }
@@ -1082,6 +1238,11 @@ class VastImageProvider(GPUProvider):
     def _watch_cache_sync(self) -> None:
         """Start the R2 copy, then keep it only while bytes keep moving."""
         watch = PhaseWatch.start("cache_staging", self._now())
+        if self._live7_bound() and self.execution_budget is not None:
+            remaining = float(self.execution_budget.spending_deadline_wall) - float(self._now())
+            if remaining <= float(self.staging_reserve_seconds or 0):
+                raise WorkerStageError("CACHE_TIMEOUT")
+            watch.max_seconds = remaining
         code, out, _err = self._remote(_R2_SYNC, 60, "CACHE_TIMEOUT")
         if code != 0 or "STARTED" not in out:
             raise WorkerStageError("MODEL_CACHE_INVALID")

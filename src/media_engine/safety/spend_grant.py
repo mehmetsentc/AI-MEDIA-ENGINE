@@ -13,6 +13,16 @@ class SpendGrant:
     issued_at: float
     expires_at: float
     machine_id: int | None = None
+    profile: str = "live6"
+    gpu_family: str = ""
+    min_vram_mib: int = 0
+    max_hourly_usd: Decimal | None = None
+    disk_gb: int | None = None
+    cold_stage: bool = False
+    max_transfer_seconds: int = 0
+    max_execution_seconds: int = 0
+    cuda_min: str = ""
+    forbidden_volume_id: int | None = None
 
 
 def evaluate_grant(

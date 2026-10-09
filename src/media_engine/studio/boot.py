@@ -59,11 +59,20 @@ def build_controller(root: Path, mode: Optional[str] = None,
         live_external_providers=True, max_gpu_workers=1, max_job_attempts=1,
     ))
     provider = VastImageProvider(api_key=key, limits=limits, now=clock.now, runtime=root)
-    from media_engine.providers.live6_prepare import claim_execution_id, grant_from_environ
-    grant = grant_from_environ(source)
-    if grant is not None:
-        claim_execution_id(root / "live6-executions", grant.execution_id)
+    profile = str(source.get("MEDIA_ENGINE_EXECUTION_PROFILE", "")).strip()
+    if profile == "live7":
+        from media_engine.providers.live7_prepare import claim_execution_id, grant_from_environ
+        grant = grant_from_environ(source)
+        claim_execution_id(root / "live7-executions", grant.execution_id)
         provider.bind_execution(grant, execution_id=grant.execution_id)
+    elif profile in {"", "live6"}:
+        from media_engine.providers.live6_prepare import claim_execution_id, grant_from_environ
+        grant = grant_from_environ(source)
+        if grant is not None:
+            claim_execution_id(root / "live6-executions", grant.execution_id)
+            provider.bind_execution(grant, execution_id=grant.execution_id)
+    else:
+        raise ValueError("MEDIA_ENGINE_EXECUTION_PROFILE")
     controller = MediaController(
         str(root / "studio.sqlite3"),
         str(root / "artifacts"),
