@@ -77,6 +77,15 @@ _DESTROY_ON = frozenset({
     "INSTANCE_NOT_RUNNING",
 })
 
+# An authorized verification run must release the GPU after these failures too.
+_GRANT_DESTROY = frozenset({
+    "GENERATION_FAILED",
+    "RESOLUTION_MISMATCH",
+    "ARTIFACT_UPLOAD_FAILED",
+    "ARTIFACT_TRANSFER_FAILED",
+    "SETTLEMENT_FAILED",
+})
+
 
 class WallClock:
     """Production clock. Tests keep ManualClock so idle checks stay deterministic."""
@@ -527,7 +536,7 @@ class MediaController:
             self._set_public(job, "model_loading")
             self._unlocked(lambda: self.provider.ensure_model(resource_id))
         except WorkerStageError as exc:
-            self._fail_worker(job, exc.code, resource_id, destroy=exc.code in _DESTROY_ON)
+            self._fail_worker(job, exc.code, resource_id, destroy=self._destroy_for(exc.code))
             return
         self.provider.begin_busy(resource_id)
         self._worker_idle_since = None
@@ -546,17 +555,16 @@ class MediaController:
                 raise ImageEngineError("RESOLUTION_MISMATCH")
         except WorkerStageError as exc:
             self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), exc.code)
-            self._fail_worker(job, exc.code, resource_id, destroy=exc.code in _DESTROY_ON)
+            self._fail_worker(job, exc.code, resource_id, destroy=self._destroy_for(exc.code))
             return
         except ImageEngineError as exc:
-            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "GENERATION_FAILED")
-            self._mark_idle(resource_id)
-            self._fail(job, exc.code or "GENERATION_FAILED")
+            code = exc.code or "GENERATION_FAILED"
+            self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), code)
+            self._fail_worker(job, code, resource_id, destroy=self._destroy_for(code))
             return
         except Exception:
             self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "GENERATION_FAILED")
-            self._mark_idle(resource_id)
-            self._fail(job, "GENERATION_FAILED")
+            self._fail_worker(job, "GENERATION_FAILED", resource_id, destroy=self._destroy_for("GENERATION_FAILED"))
             return
         self._set_public(job, "saving")
         try:
@@ -598,16 +606,21 @@ class MediaController:
                 ))
                 self._link_studio_artifact(placement, artifact_id)
                 uri = "r2://" + self.platform.bucket + "/" + meta.object_key
-            self._settle_job(job, success=True)
+            try:
+                self._settle_job(job, success=True)
+            except Exception:
+                if not self._bound_execution():
+                    raise
+                self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "SETTLEMENT_FAILED")
+                self._fail_worker(job, "SETTLEMENT_FAILED", resource_id, destroy=True)
+                return
         except PlatformBlocked as exc:
             self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), exc.code)
-            self._mark_idle(resource_id)
-            self._fail(job, exc.code)
+            self._fail_worker(job, exc.code, resource_id, destroy=self._destroy_for(exc.code))
             return
         except Exception:
             self.attempts.finish(attempt_id, AttemptStatus.FAILED, self.clock.iso(), "ARTIFACT_TRANSFER_FAILED")
-            self._mark_idle(resource_id)
-            self._fail(job, "ARTIFACT_TRANSFER_FAILED")
+            self._fail_worker(job, "ARTIFACT_TRANSFER_FAILED", resource_id, destroy=self._destroy_for("ARTIFACT_TRANSFER_FAILED"))
             return
         self.attempts.finish(attempt_id, AttemptStatus.SUCCEEDED, self.clock.iso())
         job.result_uri = uri
@@ -644,7 +657,13 @@ class MediaController:
         self.trace.append(f"{job.id}:public:{status}")
 
     def _expire_worker(self) -> None:
-        if self._worker_id is None or self._worker_created_at is None:
+        if self._worker_id is None:
+            return
+        deadline = getattr(self.provider, "execution_deadline", None)
+        if deadline is not None and self.clock.now() >= float(deadline):
+            self._terminate(self._worker_id, "EXECUTION_DEADLINE")
+            return
+        if self._worker_created_at is None:
             return
         if self.clock.now() - self._worker_created_at >= self.limits.max_worker_lifetime_seconds:
             self._terminate(self._worker_id, "MAX_WORKER_LIFETIME")
@@ -658,6 +677,14 @@ class MediaController:
             "machine_id": str(getattr(self.provider, "machine_id", "") or ""),
             "started_epoch": str(self._worker_created_at or self.clock.now()),
         }
+
+    def _bound_execution(self) -> bool:
+        return getattr(self.provider, "execution_grant", None) is not None
+
+    def _destroy_for(self, code: str) -> bool:
+        if code in _DESTROY_ON:
+            return True
+        return self._bound_execution() and code in _GRANT_DESTROY
 
     def _fail_worker(self, job: Job, code: str, resource_id: str, *, destroy: bool) -> None:
         if destroy:

@@ -45,6 +45,14 @@ def _supervise(controller, ceiling: Decimal) -> None:
         resource_id = controller._worker_id
         if not resource_id:
             continue
+        deadline = getattr(controller.provider, "execution_deadline", None)
+        if deadline is not None and time.time() >= float(deadline):
+            try:
+                controller.release_worker("EXECUTION_DEADLINE")
+            except Exception:
+                continue
+            print({"release": "EXECUTION_DEADLINE"}, flush=True)
+            return
         spent = _spent(controller, resource_id)
         finished = any(
             job.id in watched and getattr(job, "public_status", None) in {"completed", "failed"}

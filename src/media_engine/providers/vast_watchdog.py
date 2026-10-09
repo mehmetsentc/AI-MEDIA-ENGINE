@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -87,7 +88,16 @@ def arm_watchdog(spec_path: Path, *, popen=None) -> int:
     )
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.write_text(str(proc.pid), encoding="utf-8")
+    if hasattr(proc, "wait"):
+        threading.Thread(target=_reap_when_done, args=(proc,), daemon=True).start()
     return int(proc.pid)
+
+
+def _reap_when_done(proc) -> None:
+    try:
+        proc.wait()
+    except Exception:
+        return
 
 
 def _request(key: str, method: str, url: str) -> tuple[int, bytes]:
@@ -137,11 +147,13 @@ def run_until_stopped(spec: dict, *, fetch, delete, now, sleep) -> dict:
             armed = current
         rows = fetch()
         owned = matching_instances(rows, machine_id)
+        absolute = spec.get("deadline_epoch")
         if owned and seen is None:
             seen = current
-            deadline = min(seen + safe_seconds, armed + safe_seconds)
-        if not owned and current >= armed + safe_seconds:
-            return {"stopped": [], "deadline": deadline}
+            deadline = float(absolute) if absolute is not None else min(seen + safe_seconds, armed + safe_seconds)
+        window_end = float(absolute) if absolute is not None else armed + safe_seconds
+        if not owned and current >= window_end:
+            return {"stopped": [], "deadline": deadline, "termination_failures": []}
         heartbeat_age = None
         if owned and seen is not None and current - seen > stale_after:
             if heartbeat_path.is_file():
@@ -160,11 +172,18 @@ def run_until_stopped(spec: dict, *, fetch, delete, now, sleep) -> dict:
                 stale_after=stale_after,
             )
         if targets:
+            failures = []
             for instance_id in targets:
-                delete(instance_id)
-            return {"stopped": targets, "deadline": deadline}
+                status_code = delete(instance_id)
+                if status_code not in (None, 200, 202, 204, 404):
+                    failures.append({"id": instance_id, "status": status_code})
+            return {
+                "stopped": targets,
+                "deadline": deadline,
+                "termination_failures": failures,
+            }
         if stop_path.is_file():
-            return {"stopped": [], "deadline": deadline}
+            return {"stopped": [], "deadline": deadline, "termination_failures": []}
         sleep(float(spec.get("poll_seconds") or 15))
 
 
@@ -174,8 +193,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     spec_path = Path(args[0])
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    key = os.environ.get("VAST_API_KEY", "").strip()
     result_path = Path(spec["result"])
+    if spec.get("mode") == "local":
+        outcome = run_until_stopped(
+            spec,
+            fetch=lambda: _read_rows(Path(spec["instances_path"])),
+            delete=lambda instance_id: _local_delete(spec, instance_id),
+            now=time.time,
+            sleep=time.sleep,
+        )
+        result_path.write_text(json.dumps(outcome), encoding="utf-8")
+        return 0
+    key = os.environ.get("VAST_API_KEY", "").strip()
     if not key:
         result_path.write_text(json.dumps({"error": "KEY_MISSING"}), encoding="utf-8")
         return 2
@@ -183,12 +212,32 @@ def main(argv: list[str] | None = None) -> int:
     def fetch():
         return _fetch_instances(key)
 
-    def delete(instance_id: str) -> None:
-        _delete_instance(key, instance_id)
+    def delete(instance_id: str) -> int:
+        return _delete_instance(key, instance_id)
 
     outcome = run_until_stopped(spec, fetch=fetch, delete=delete, now=time.time, sleep=time.sleep)
     result_path.write_text(json.dumps(outcome), encoding="utf-8")
     return 0
+
+
+def _read_rows(path: Path) -> list:
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def _local_delete(spec: dict, instance_id: str) -> int:
+    """Record a local delete. This path never contacts a provider."""
+    status_code = 500 if spec.get("fail_delete") else 200
+    log = Path(spec["delete_log"])
+    rows = _read_rows(log)
+    rows.append({"id": instance_id, "status": status_code})
+    log.write_text(json.dumps(rows), encoding="utf-8")
+    return status_code
 
 
 if __name__ == "__main__":

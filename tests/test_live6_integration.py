@@ -109,10 +109,15 @@ class Live6IntegrationTests(unittest.TestCase):
         self.assertNotIn("put", missing.launch_trace)
 
         expired = self._provider()
-        self._bind(expired, expires_at=500)
-        expired._now = lambda: 500.0
-        self.assertEqual(expired.create("daidoi").outcome, "definite_failure")
-        self.assertEqual(expired.live6_stop, "EXPIRED_AUTHORIZATION")
+        with self.assertRaises(WorkerStageError) as already:
+            self._bind(expired, expires_at=500)
+        self.assertEqual(already.exception.code, "EXPIRED_AUTHORIZATION")
+        self.assertNotIn("PUT", self.calls)
+        later = self._provider()
+        self._bind(later, expires_at=1_500.0)
+        later._now = lambda: 1_500.0
+        self.assertEqual(later.create("daidoi").outcome, "definite_failure")
+        self.assertEqual(later.live6_stop, "EXPIRED_AUTHORIZATION")
 
         stale = self._provider()
         self._bind(stale)
@@ -302,15 +307,14 @@ class Live6IntegrationTests(unittest.TestCase):
         return provider
 
     def _bind(self, provider: VastImageProvider, *, expires_at: float = 2_000.0) -> None:
-        provider.execution_id = "live6-run"
-        provider.execution_grant = SpendGrant(
+        provider.bind_execution(SpendGrant(
             execution_id="live6-run",
             ceiling_usd=Decimal("0.50"),
             max_instances=1,
             issued_at=1_000.0,
             expires_at=expires_at,
             machine_id=MACHINE_ID,
-        )
+        ), execution_id="live6-run")
 
     def _ssh_provider(self, payload: str) -> VastImageProvider:
         provider = self._provider(instances=[{

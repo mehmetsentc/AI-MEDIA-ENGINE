@@ -343,6 +343,7 @@ class VastImageProvider(GPUProvider):
         self._put_done = False
         self.execution_grant = None
         self.execution_id = ""
+        self.execution_deadline: float | None = None
         self.live6_stop = ""
         self.launch_trace: list[str] = []
         self.watchdog_pid = 0
@@ -357,6 +358,23 @@ class VastImageProvider(GPUProvider):
         self._gone: set[str] = set()
         self._started_at: dict[str, float] = {}
         self.commands: list[str] = []
+
+    def bind_execution(self, grant, *, execution_id: str) -> None:
+        """Attach one fresh grant. A second bind in this process is refused."""
+        from media_engine.safety.spend_grant import SpendGrant
+        if self.execution_grant is not None:
+            raise WorkerStageError("STALE_AUTHORIZATION")
+        if not isinstance(grant, SpendGrant) or grant.execution_id != execution_id:
+            raise WorkerStageError("MISSING_AUTHORIZATION")
+        if grant.ceiling_usd != VERIFY_RUN_BUDGET_USD or grant.max_instances != 1:
+            raise WorkerStageError("BUDGET_MISMATCH")
+        if grant.machine_id != MACHINE_ID:
+            raise WorkerStageError("MACHINE_SCOPE")
+        if grant.expires_at <= grant.issued_at or float(self._now()) >= grant.expires_at:
+            raise WorkerStageError("EXPIRED_AUTHORIZATION")
+        self.execution_grant = grant
+        self.execution_id = execution_id
+        self.execution_deadline = float(grant.expires_at)
 
     def _reject_unverified_run(self) -> str:
         """The $0.50 path rents nothing until this execution's grant matches the offer."""
@@ -401,17 +419,26 @@ class VastImageProvider(GPUProvider):
                 return False
             import subprocess
             popen = subprocess.Popen
-        if self.execution_grant is None:
+        if self.execution_grant is None or self.execution_deadline is None:
             return False
         root = Path(self.runtime)
         root.mkdir(parents=True, exist_ok=True)
+        local = os.environ.get("MEDIA_ENGINE_WATCHDOG_LOCAL", "").strip() == "1"
+        try:
+            poll = float(os.environ.get("MEDIA_ENGINE_WATCHDOG_POLL_SECONDS", "15"))
+        except ValueError:
+            poll = 15.0
         spec = {
+            "mode": "local" if local else "provider",
             "machine_id": MACHINE_ID,
-            "safe_seconds": max(1.0, float(self.execution_grant.expires_at) - float(self._now())),
+            "safe_seconds": max(0.0, float(self.execution_deadline) - float(self._now())),
+            "deadline_epoch": float(self.execution_deadline),
             "heartbeat": str(root / "watchdog.heartbeat"),
             "stop": str(root / "watchdog.stop"),
             "result": str(root / "watchdog.result"),
-            "poll_seconds": 15,
+            "instances_path": str(root / "watchdog-instances.json"),
+            "delete_log": str(root / "watchdog-deletes.json"),
+            "poll_seconds": poll,
         }
         path = root / "watchdog.json"
         path.write_text(json.dumps(spec), encoding="utf-8")
@@ -450,7 +477,7 @@ class VastImageProvider(GPUProvider):
         self._put_done = True
         if not self.offer_id:
             self.quote(owner)
-        if os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50":
+        if self.execution_grant is not None or os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50":
             reason = self._reject_unverified_run()
             if reason:
                 self.live6_stop = reason

@@ -592,15 +592,14 @@ class PhaseClockTests(unittest.TestCase):
         from media_engine.safety.spend_grant import SpendGrant
         moment = 1_000.0
         allowed._now = lambda: moment
-        allowed.execution_id = "live6-test"
-        allowed.execution_grant = SpendGrant(
+        allowed.bind_execution(SpendGrant(
             execution_id="live6-test",
             ceiling_usd=Decimal("0.50"),
             max_instances=1,
             issued_at=moment,
             expires_at=moment + 500,
             machine_id=MACHINE_ID,
-        )
+        ), execution_id="live6-test")
         allowed.runtime = Path(os.environ.get("TMPDIR", "/tmp")) / "live6-watchdog-test"
 
         class _Proc:
