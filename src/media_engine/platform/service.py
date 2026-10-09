@@ -51,9 +51,12 @@ class MemoryMedia:
 
 
 class Platform:
-    def __init__(self, db_path: str, *, media: Optional[MemoryMedia] = None,
-                 now: Optional[Callable[[], datetime]] = None) -> None:
-        self.repo = SqliteRepository(db_path)
+    def __init__(self, db_path: str = "", *, media: Optional[MemoryMedia] = None,
+                 now: Optional[Callable[[], datetime]] = None, repository: object = None) -> None:
+        if repository is None:
+            self.repo = SqliteRepository(db_path)
+        else:
+            self.repo = repository
         self.media = media or MemoryMedia()
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.bucket = str(getattr(self.media, "bucket", "") or media_bucket())
@@ -135,9 +138,8 @@ class Platform:
         existing = self.repo.reservation_version(job_id)
         if existing:
             limit = int(self.entitlement(user_id, "max_concurrent_jobs", 1) or 1)
-            self.repo.enqueue(
-                user_id=user_id, job_id=job_id, idempotency_key=f"job:{job_id}",
-                pricing_version=existing, max_concurrent=limit, now=self.now_iso(),
+            self._reserve_and_enqueue(
+                user_id=user_id, amount=0, job_id=job_id, version=existing, limit=limit,
             )
             return existing
         rule = self.repo.price_at(service, model, self.now_iso())
@@ -149,51 +151,102 @@ class Platform:
         if self.balance(user_id) < estimate:
             raise PlatformBlocked("INSUFFICIENT_CREDIT")
         limit = int(self.entitlement(user_id, "max_concurrent_jobs", 1) or 1)
-        self.repo.reserve(
-            user_id=user_id, amount=estimate, job_id=job_id, version=version,
-            pools=self.pool_priority(), now=self.now_iso(),
+        self._reserve_and_enqueue(
+            user_id=user_id, amount=estimate, job_id=job_id, version=version, limit=limit,
         )
+        return version
+
+    def _reserve_and_enqueue(self, *, user_id: str, amount: int, job_id: str,
+                             version: str, limit: int) -> None:
+        reserve_and_enqueue = getattr(self.repo, "reserve_and_enqueue", None)
+        if reserve_and_enqueue is not None:
+            reserve_and_enqueue(
+                user_id=user_id, amount=amount, job_id=job_id, version=version,
+                pools=self.pool_priority(), now=self.now_iso(),
+                idempotency_key=f"job:{job_id}", max_concurrent=limit,
+            )
+            return
+        if amount:
+            self.repo.reserve(
+                user_id=user_id, amount=amount, job_id=job_id, version=version,
+                pools=self.pool_priority(), now=self.now_iso(),
+            )
         self.repo.enqueue(
             user_id=user_id, job_id=job_id, idempotency_key=f"job:{job_id}",
             pricing_version=version, max_concurrent=limit, now=self.now_iso(),
         )
-        return version
 
     def settle(self, user_id: str, job_id: str, actual: int) -> None:
         """Return the hold, then record the actual consumption once."""
+        entries = self._settlement_entries(
+            user_id, job_id, actual, release_type="release", consume_prefix="consume",
+        )
+        poster = getattr(self.repo, "post_many", None)
+        if poster is not None:
+            poster(job_id, entries, durable_status="completed", now=self.now_iso())
+            return
         if self.repo.settlement_exists(job_id):
             return
-        remaining = max(actual, 0)
-        for pool, reserved in self.repo.reserved_by_pool(job_id):
-            charge = min(remaining, reserved)
-            remaining -= charge
-            self.repo.post(
-                user_id=user_id, pool=pool, entry_type="release", amount=reserved,
-                idempotency_key=f"release:{job_id}:{pool}", now=self.now_iso(), job_id=job_id,
-            )
-            if charge:
-                self.repo.post(
-                    user_id=user_id, pool=pool, entry_type="consume", amount=-charge,
-                    idempotency_key=f"consume:{job_id}:{pool}", now=self.now_iso(), job_id=job_id,
-                )
+        for entry in entries:
+            self.repo.post(**entry)
 
     def settle_failure(self, user_id: str, job_id: str, legitimate_cost: int = 0) -> None:
         """Return the hold, then keep only the legitimate failure cost."""
+        entries = self._settlement_entries(
+            user_id, job_id, legitimate_cost, release_type="refund", consume_prefix="fail-consume",
+        )
+        poster = getattr(self.repo, "post_many", None)
+        if poster is not None:
+            poster(job_id, entries, durable_status="cancelled", now=self.now_iso())
+            return
         if self.repo.settlement_exists(job_id):
             return
-        remaining = max(legitimate_cost, 0)
+        for entry in entries:
+            self.repo.post(**entry)
+
+    def _settlement_entries(self, user_id: str, job_id: str, actual: int, *,
+                            release_type: str, consume_prefix: str) -> list[dict]:
+        remaining = max(actual, 0)
+        entries: list[dict] = []
+        now = self.now_iso()
         for pool, reserved in self.repo.reserved_by_pool(job_id):
             charge = min(remaining, reserved)
             remaining -= charge
-            self.repo.post(
-                user_id=user_id, pool=pool, entry_type="refund", amount=reserved,
-                idempotency_key=f"refund:{job_id}:{pool}", now=self.now_iso(), job_id=job_id,
-            )
+            entries.append({
+                "user_id": user_id, "pool": pool, "entry_type": release_type, "amount": reserved,
+                "idempotency_key": f"{release_type}:{job_id}:{pool}", "now": now, "job_id": job_id,
+            })
             if charge:
-                self.repo.post(
-                    user_id=user_id, pool=pool, entry_type="consume", amount=-charge,
-                    idempotency_key=f"fail-consume:{job_id}:{pool}", now=self.now_iso(), job_id=job_id,
-                )
+                entries.append({
+                    "user_id": user_id, "pool": pool, "entry_type": "consume", "amount": -charge,
+                    "idempotency_key": f"{consume_prefix}:{job_id}:{pool}", "now": now, "job_id": job_id,
+                })
+        return entries
+
+    def transaction_history(self, user_id: str, *, limit: int = 50) -> list[dict]:
+        history = getattr(self.repo, "ledger_history", None)
+        if history is None:
+            return []
+        return history(user_id, limit)
+
+    def pending_jobs(self, user_id: str) -> list[dict]:
+        pending = getattr(self.repo, "pending_jobs", None)
+        if pending is None:
+            return []
+        return pending(user_id)
+
+    def recover_paid(self, user_id: str, job_id: str) -> str:
+        """Finish a reserved job from durable records. This does not start a GPU."""
+        if self.repo.settlement_exists(job_id):
+            return "settled"
+        artifact = getattr(self.repo, "artifact_for_job", lambda _job: None)(job_id)
+        if artifact is not None:
+            self.settle(user_id, job_id, self.repo.reserved_amount(job_id))
+            return "settled_from_artifact"
+        if self.repo.reservation_version(job_id):
+            self.settle_failure(user_id, job_id, legitimate_cost=0)
+            return "refunded"
+        return "absent"
 
     def record_meter(self, job_id: str, service: str, meter_type: str, amount: int, pricing_version: str) -> None:
         if meter_type not in METER_TYPES:

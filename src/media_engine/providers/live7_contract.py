@@ -178,20 +178,21 @@ def static_compatibility(root: Path | None = None) -> dict:
 
 
 def persistence_audit() -> dict:
-    """What the committed studio path actually stores. Neon is not wired here."""
+    """Paid production selects PostgreSQL. Development and unconfigured real mode stay on SQLite."""
     boot = Path(__file__).resolve().parents[1] / "studio" / "boot.py"
     text = boot.read_text(encoding="utf-8")
-    uses_sqlite = 'platform.sqlite3' in text and "postgres" not in text.casefold()
+    explicit = "open_production_stores" in text and "platform.sqlite3" in text
     return {
-        "job_ledger": "sqlite",
+        "job_ledger": "postgresql for production and live7; sqlite otherwise",
         "credit_reservation": "Platform.authorize_paid",
         "credit_settlement": "Platform.settle",
         "credit_refund": "Platform.settle_failure",
-        "studio_platform": "sqlite" if uses_sqlite else "unknown",
-        "neon_integrated": False,
+        "studio_platform": "explicit" if explicit else "sqlite",
+        "neon_integrated": explicit,
+        "sqlite_production_fallback": False,
         "r2_media": "open_media_store or UnavailableMedia",
         "model_bucket": "ai-media-engine-models",
         "media_bucket": "daidoi-media",
-        "e2e_blocker": "NEON_PATH_MISSING",
+        "e2e_blocker": "GPU_NOT_AUTHORIZED" if explicit else "NEON_PATH_MISSING",
         "real_inference_is_full_e2e": False,
     }

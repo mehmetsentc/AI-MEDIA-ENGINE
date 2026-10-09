@@ -121,23 +121,34 @@ class MediaController:
                  image_engine: Optional[ImageEngine] = None,
                  text_engine: Optional[TextEngine] = None,
                  clients: Optional[ClientDirectory] = None,
-                 idle_wait: Optional[Callable[[threading.Condition], None]] = None) -> None:
+                 idle_wait: Optional[Callable[[threading.Condition], None]] = None,
+                 stores: object = None) -> None:
         self.clock = clock or ManualClock()
         self.limits = limits or SafetyLimits()
         self.clients = clients or ClientDirectory()
-        self.jobs = JobStore(db_path)
-        self.attempts = AttemptStore(db_path, max_attempts=self.limits.max_job_attempts)
-        self.ledger = ResourceLedger(db_path)
         self.queue = JobQueue()
+        self.studio = None
+        if stores is None:
+            self.jobs = JobStore(db_path)
+            self.attempts = AttemptStore(db_path, max_attempts=self.limits.max_job_attempts)
+            self.ledger = ResourceLedger(db_path)
+            self.usage = UsageStore(db_path)
+            self.artifacts = ArtifactStore(db_path)
+            self.platform = None
+        else:
+            self.jobs = stores.jobs
+            self.attempts = stores.attempts
+            self.ledger = stores.ledger
+            self.usage = stores.usage
+            self.artifacts = stores.artifacts
+            self.studio = stores.studio
+            self.platform = stores.platform
         self.provider = provider or FakeGPUProvider(
             self.clock.now, max_workers=self.limits.max_gpu_workers,
         )
         self.image_engine = image_engine or FakeImageEngine()
         self.text_engine = text_engine or FakeTextEngine()
-        self.usage = UsageStore(db_path)
         self.storage = LocalStorage(storage_root)
-        self.artifacts = ArtifactStore(db_path)
-        self.platform = None
         self.trace: list[str] = []
         self.last_shutdown_reason: Optional[str] = None
         self.phase_log: list[str] = []
@@ -231,7 +242,7 @@ class MediaController:
         return job
 
     def submit_image(self, prompt: str, *, width: int = 1024, height: int = 1024,
-                     seed: Optional[int] = None) -> Job:
+                     seed: Optional[int] = None, idempotency_key: Optional[str] = None) -> Job:
         if width != 1024 or height != 1024 or isinstance(width, bool) or isinstance(height, bool):
             raise JobError("RESOLUTION_UNSUPPORTED")
         if seed is None:
@@ -261,12 +272,23 @@ class MediaController:
             )
             if not job.prompt or len(job.prompt) > 4000:
                 raise JobError("PROMPT_REQUIRED")
+            if idempotency_key:
+                finder = getattr(self.jobs, "find_by_idempotency", None)
+                if finder is not None:
+                    existing = finder(idempotency_key)
+                    if existing is not None:
+                        return existing
             if getattr(self.provider, "single_image_only", False):
                 if getattr(self.provider, "image_claimed", False):
                     raise JobError("SINGLE_IMAGE_ONLY")
                 self.provider.image_claimed = True
             self.clients.require(job.client_id)
-            self.jobs.insert(job)
+            if idempotency_key and hasattr(self.jobs, "insert_idempotent"):
+                stored = self.jobs.insert_idempotent(job, idempotency_key)
+                if stored.id != job.id:
+                    return stored
+            else:
+                self.jobs.insert(job)
             self.queue.enqueue(job.id)
             self.trace.append(f"{job.id}:QUEUED")
             self._settled.clear()
@@ -708,10 +730,29 @@ class MediaController:
         if self.platform is not None:
             try:
                 self.platform.authorize_paid(job.client_id, job.id)
+                repo = getattr(self.platform, "repo", None)
+                slot = getattr(repo, "claim_execution_slot", None) if repo is not None else None
+                if slot is not None and not slot(job.id, self.clock.iso()):
+                    outcome = self.platform.recover_paid(job.client_id, job.id)
+                    if outcome == "settled_from_artifact":
+                        self._ledger(
+                            provisional, job.client_id, ResourceState.FAILED, quote, now,
+                            "RECOVERED_ARTIFACT",
+                        )
+                        return None
+                    self._fail(job, "DUPLICATE_EXECUTION")
+                    return None
             except Exception as exc:
                 code = getattr(exc, "code", "BILLING_UNAVAILABLE")
                 self._ledger(provisional, job.client_id, ResourceState.FAILED, quote, now, code)
-                self._fail(job, code)
+                try:
+                    self._fail(job, code)
+                except Exception:
+                    job.error_code = code
+                    try:
+                        self.jobs.save(job)
+                    except Exception:
+                        pass
                 return None
         try:
             result: CreateResult = self.provider.create(job.client_id)

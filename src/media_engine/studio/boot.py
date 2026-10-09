@@ -50,6 +50,17 @@ def build_controller(root: Path, mode: Optional[str] = None,
     if selected != "real":
         raise ValueError("STUDIO_MODE")
     source = os.environ if environ is None else environ
+    profile = str(source.get("MEDIA_ENGINE_EXECUTION_PROFILE", "")).strip()
+    paid_postgres = (
+        str(source.get("STUDIO_MODE", "")).strip().casefold() == "production"
+        or profile == "live7"
+    )
+    stores = None
+    if paid_postgres:
+        from media_engine.platform.postgres_app import open_production_stores
+        stores = open_production_stores(source, limits=limits_from_env(SafetyLimits(
+            live_external_providers=True, max_gpu_workers=1, max_job_attempts=1,
+        )))
     key = str(source.get("VAST_API_KEY", "")).strip()
     if not key:
         raise ValueError("VAST_API_KEY")
@@ -59,7 +70,6 @@ def build_controller(root: Path, mode: Optional[str] = None,
         live_external_providers=True, max_gpu_workers=1, max_job_attempts=1,
     ))
     provider = VastImageProvider(api_key=key, limits=limits, now=clock.now, runtime=root)
-    profile = str(source.get("MEDIA_ENGINE_EXECUTION_PROFILE", "")).strip()
     if profile == "live7":
         from media_engine.providers.live7_prepare import claim_execution_id, grant_from_environ
         grant = grant_from_environ(source)
@@ -80,13 +90,15 @@ def build_controller(root: Path, mode: Optional[str] = None,
         limits=limits,
         provider=provider,
         image_engine=RealProviderRequired(),
+        stores=stores,
     )
-    from media_engine.storage.r2_media import UnavailableMedia, open_media_store
-    try:
-        media = open_media_store()
-    except Exception:
-        media = UnavailableMedia()
-    controller.platform = Platform(str(root / "platform.sqlite3"), media=media)
+    if stores is None:
+        from media_engine.storage.r2_media import UnavailableMedia, open_media_store
+        try:
+            media = open_media_store()
+        except Exception:
+            media = UnavailableMedia()
+        controller.platform = Platform(str(root / "platform.sqlite3"), media=media)
     return controller
 
 
