@@ -65,7 +65,8 @@ def _operation_ceiling() -> Decimal:
     if granted in AUTHORIZED_RUN_BUDGETS:
         return granted
     if granted == Decimal("1.50"):
-        if os.environ.get("MEDIA_ENGINE_EXECUTION_PROFILE", "").strip() != "live7":
+        profile = os.environ.get("MEDIA_ENGINE_EXECUTION_PROFILE", "").strip()
+        if profile not in {"live7", "live8"}:
             raise WorkerStageError("BUDGET_MISMATCH")
         return granted
     return OPERATION_BUDGET_USD
@@ -355,6 +356,7 @@ class VastImageProvider(GPUProvider):
         self.last_instance_id = ""
         self._put_done = False
         self.execution_grant = None
+        self.execution_authorization = None
         self.execution_id = ""
         self.execution_budget = None
         self.authorization_expires_at: float | None = None
@@ -383,6 +385,24 @@ class VastImageProvider(GPUProvider):
         grant = self.execution_grant
         return grant is not None and getattr(grant, "profile", "") == "live7"
 
+    def _live8_bound(self) -> bool:
+        return self.execution_authorization is not None
+
+    def bind_authorization(self, authorization, *, code_sha: str) -> None:
+        """Attach one authorization. The machine is chosen later from its allowed set."""
+        from media_engine.providers.execution_authorization import accept_record
+        if self.execution_authorization is not None or self.execution_grant is not None:
+            raise WorkerStageError("STALE_AUTHORIZATION")
+        accept_record(authorization, now=float(self._now()), code_sha=code_sha)
+        if os.environ.get("MEDIA_ENGINE_ALLOW_COLD_STAGE", "").strip() != "1":
+            raise WorkerStageError("COLD_STAGE_FORBIDDEN")
+        if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
+            raise WorkerStageError("R2_FORBIDDEN")
+        self.execution_authorization = authorization
+        self.execution_id = authorization.execution_id
+        self.authorization_expires_at = float(authorization.expires_at)
+        self.execution_budget = None
+
     def bind_execution(self, grant, *, execution_id: str) -> None:
         """Attach one fresh grant. A second bind in this process is refused."""
         from media_engine.safety.spend_grant import SpendGrant
@@ -390,6 +410,9 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("STALE_AUTHORIZATION")
         if not isinstance(grant, SpendGrant) or grant.execution_id != execution_id:
             raise WorkerStageError("MISSING_AUTHORIZATION")
+        if getattr(grant, "profile", "live6") == "live8":
+            self._bind_live8(grant, execution_id)
+            return
         if getattr(grant, "profile", "live6") == "live7":
             self._bind_live7(grant, execution_id)
             return
@@ -430,6 +453,36 @@ class VastImageProvider(GPUProvider):
         self.single_image_only = True
         if int(FORBIDDEN_VOLUME_ID) == int(getattr(self, "attached_volume_id", 0) or 0):
             raise WorkerStageError("VOLUME_MISMATCH")
+
+    def _bind_live8(self, grant, execution_id: str) -> None:
+        """Bind the grant to the offer this authorization just selected."""
+        authorization = self.execution_authorization
+        if authorization is None or execution_id != authorization.execution_id:
+            raise WorkerStageError("STALE_AUTHORIZATION")
+        if grant.execution_id != authorization.execution_id or grant.profile != "live8":
+            raise WorkerStageError("STALE_AUTHORIZATION")
+        if grant.ceiling_usd != authorization.max_total_usd or grant.max_instances != 1:
+            raise WorkerStageError("BUDGET_MISMATCH")
+        if int(grant.machine_id or 0) not in authorization.allowed_machine_ids:
+            raise WorkerStageError("MACHINE_SCOPE")
+        if int(grant.offer_id or 0) not in authorization.allowed_offer_ids:
+            raise WorkerStageError("OFFER_REJECTED")
+        if float(self._now()) >= grant.expires_at or grant.expires_at != authorization.expires_at:
+            raise WorkerStageError("EXPIRED_AUTHORIZATION")
+        if grant.forbidden_volume_id != VOLUME_ID or grant.cold_stage is not True:
+            raise WorkerStageError("VOLUME_MISMATCH")
+        if int(self.machine_id or 0) != int(grant.machine_id or 0):
+            raise WorkerStageError("MACHINE_SCOPE")
+        if int(self.offer_id or 0) != int(grant.offer_id or 0):
+            raise WorkerStageError("OFFER_REJECTED")
+        self.execution_grant = grant
+        self.execution_id = execution_id
+        self.authorization_expires_at = float(grant.expires_at)
+        self.execution_budget = None
+        self.disk_gb = int(grant.disk_gb or 0)
+        self.cache_source = "r2_cold_stage"
+        self.attached_volume_id = 0
+        self.single_image_only = True
 
     def _reject_unverified_run(self) -> str:
         """The $0.50 path rents nothing until this execution's grant matches the offer."""
@@ -563,7 +616,12 @@ class VastImageProvider(GPUProvider):
                 return False
         else:
             studio = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
-            expected_studio = Decimal("1.50") if self._live7_bound() else VERIFY_RUN_BUDGET_USD
+            if self._live8_bound():
+                expected_studio = self.execution_authorization.max_total_usd
+            elif self._live7_bound():
+                expected_studio = Decimal("1.50")
+            else:
+                expected_studio = VERIFY_RUN_BUDGET_USD
             if studio:
                 try:
                     studio_amount = Decimal(studio)
@@ -575,7 +633,10 @@ class VastImageProvider(GPUProvider):
                     return False
             try:
                 opener = open_budget
-                if self._live7_bound():
+                if self._live8_bound():
+                    from media_engine.safety.execution_budget import open_authorized_budget
+                    opener = open_authorized_budget
+                elif self._live7_bound():
                     from media_engine.safety.execution_budget import open_live7_budget
                     opener = open_live7_budget
                 budget = opener(
@@ -590,11 +651,11 @@ class VastImageProvider(GPUProvider):
             except WorkerStageError as exc:
                 self.live6_stop = exc.code
                 return False
-            if self._live7_bound():
+            if self._live7_bound() or self._live8_bound():
                 from media_engine.safety.execution_budget import LIVE7_TAIL_SECONDS
                 self.staging_deadline = budget.spending_deadline_wall
                 self.staging_reserve_seconds = float(LIVE7_TAIL_SECONDS)
-            pinned_machine = int(self.machine_id) if self._live7_bound() else MACHINE_ID
+            pinned_machine = int(self.machine_id) if (self._live7_bound() or self._live8_bound()) else MACHINE_ID
             spec = {
                 "mode": "local" if local else "provider",
                 "machine_id": pinned_machine,
@@ -622,6 +683,9 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
         self._owner = owner
         self._label = ownership_label(owner)
+        if self._live8_bound():
+            self._refresh_live8(bind_grant=False)
+            return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
         if self._live7_bound():
             return self._quote_live7(owner)
         if not self._volume_ready():
@@ -682,11 +746,192 @@ class VastImageProvider(GPUProvider):
         self.fits_operation_budget = True
         return Quote(hourly_price_usd=hourly, provider="vast")
 
+    def _search_live8(self) -> list:
+        """Current rentable offers. A failed search is not an empty market."""
+        from media_engine.providers.live7_contract import LIVE7_DISK_GB, LIVE7_MIN_VRAM_MIB
+        status, raw = self._request("POST", BUNDLES, {
+            "limit": 200,
+            "type": "on-demand",
+            "rentable": {"eq": True},
+            "num_gpus": {"eq": 1},
+            "gpu_ram": {"gte": LIVE7_MIN_VRAM_MIB},
+            "disk_space": {"gte": LIVE7_DISK_GB},
+        })
+        if status != 200:
+            raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE") from exc
+        offers = payload.get("offers") if isinstance(payload, dict) else None
+        if not isinstance(offers, list):
+            raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
+        return offers
+
+    def _refresh_live8(self, *, bind_grant: bool = True) -> None:
+        """Re-read inventory and keep only an offer inside this authorization."""
+        from media_engine.providers.execution_authorization import make_live8_grant, select_for_authorization
+        from media_engine.providers.gpu_discovery import assess_offers
+        authorization = self.execution_authorization
+        if authorization is None:
+            raise WorkerStageError("MISSING_AUTHORIZATION")
+        if float(self._now()) >= authorization.expires_at:
+            raise WorkerStageError("EXPIRED_AUTHORIZATION")
+        candidates = assess_offers(
+            self._search_live8(),
+            observed_at=float(self._now()),
+            max_hourly=authorization.max_hourly_usd,
+            ceiling=authorization.max_total_usd,
+        )
+        chosen, reason = select_for_authorization(authorization, candidates, now=float(self._now()))
+        if chosen is None:
+            raise WorkerStageError(reason or "OFFER_UNAVAILABLE")
+        if self.execution_grant is not None:
+            if int(self.execution_grant.machine_id or 0) != chosen.machine_id:
+                raise WorkerStageError("OFFER_UNAVAILABLE")
+            if int(self.execution_grant.offer_id or 0) != chosen.offer_id:
+                raise WorkerStageError("OFFER_UNAVAILABLE")
+        self.offer_id = str(chosen.offer_id)
+        self.machine_id = str(chosen.machine_id)
+        self.gpu_model = chosen.gpu_name
+        self.hourly_amount = chosen.hourly_usd
+        self.disk_gb = authorization.max_disk_gb
+        self.cache_source = "r2_cold_stage"
+        self.attached_volume_id = 0
+        self.gpu_ram_mib = float(chosen.vram_mib)
+        self.cuda_max_good = float(chosen.cuda or 0)
+        self.compute_cap = chosen.compute_cap
+        self.projected_cost_usd = chosen.session_cost_usd
+        self.fits_operation_budget = True
+        if bind_grant and self.execution_grant is None:
+            grant = make_live8_grant(authorization, chosen)
+            self.bind_execution(grant, execution_id=authorization.execution_id)
+
+    def _reject_live8_run(self) -> str:
+        """Safety gates for the selected offer. A failed list blocks the rental."""
+        authorization = self.execution_authorization
+        if authorization is None or self.execution_grant is None:
+            return "MISSING_AUTHORIZATION"
+        if float(self._now()) >= authorization.expires_at:
+            return "EXPIRED_AUTHORIZATION"
+        if int(self.machine_id or 0) not in authorization.allowed_machine_ids:
+            return "MACHINE_SCOPE"
+        if int(self.offer_id or 0) not in authorization.allowed_offer_ids:
+            return "OFFER_REJECTED"
+        if self.hourly_amount > authorization.max_hourly_usd:
+            return "PRICE_CHANGED"
+        if int(self.disk_gb) != authorization.max_disk_gb:
+            return "DISK_INSUFFICIENT"
+        if self.cache_source != "r2_cold_stage" or int(self.attached_volume_id or 0) == VOLUME_ID:
+            return "VOLUME_MISMATCH"
+        if int(self.execution_grant.machine_id or 0) != int(self.machine_id):
+            return "MACHINE_SCOPE"
+        if int(self.execution_grant.offer_id or 0) != int(self.offer_id):
+            return "OFFER_REJECTED"
+        try:
+            listed = self._instances()
+        except WorkerStageError as exc:
+            return exc.code
+        for row in listed:
+            if str(row.get("label") or "").startswith("media-engine:"):
+                if int(row.get("machine_id") or 0) == int(self.machine_id):
+                    return "INSTANCE_LIMIT"
+        return ""
+
+    def _intent_path(self) -> Path:
+        return Path(self.runtime) / "create-intent.json"
+
+    def _write_create_intent(self, label: str) -> None:
+        authorization = self.execution_authorization
+        deadline = None if self.execution_budget is None else self.execution_budget.spending_deadline_wall
+        payload = {
+            "state": "create_request",
+            "authorization_id": authorization.authorization_id,
+            "execution_id": self.execution_id,
+            "code_sha": authorization.code_sha,
+            "machine_id": int(self.machine_id),
+            "offer_id": int(self.offer_id),
+            "label": label,
+            "deadline_wall": deadline,
+        }
+        self._intent_path().write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    def _mark_intent(self, state: str, instance_id: str = "") -> None:
+        path = self._intent_path()
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        payload["state"] = state
+        if instance_id:
+            payload["instance_id"] = instance_id
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    def _reconcile_create_intent(self) -> str:
+        """Adopt the labeled instance, or stop. This never sends a second create."""
+        path = self._intent_path()
+        if not path.is_file():
+            return "absent"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.live6_stop = "UNRESOLVED_BILLING"
+            return "unresolved"
+        authorization = self.execution_authorization
+        if not isinstance(payload, dict) or payload.get("authorization_id") != authorization.authorization_id:
+            self.live6_stop = "UNRESOLVED_BILLING"
+            return "unresolved"
+        label = str(payload.get("label") or "")
+        machine_id = int(payload.get("machine_id") or 0)
+        saved = str(payload.get("instance_id") or "")
+        if payload.get("state") == "created" and saved.isdigit():
+            return saved
+        try:
+            listed = self._instances()
+        except WorkerStageError as exc:
+            self.live6_stop = exc.code
+            return "unresolved"
+        found = [
+            str(row.get("id"))
+            for row in listed
+            if str(row.get("label") or "") == label and int(row.get("machine_id") or 0) == machine_id
+        ]
+        if len(found) == 1 and str(found[0]).isdigit():
+            return str(found[0])
+        self.live6_stop = "UNRESOLVED_BILLING"
+        return "unresolved"
+
     def create(self, owner: str) -> CreateResult:
         if self._put_done:
             return CreateResult(outcome="definite_failure")
         self._put_done = True
-        if not self.offer_id:
+        if self._live8_bound():
+            prior = self._reconcile_create_intent()
+            if prior == "unresolved":
+                return CreateResult(outcome="ambiguous")
+            if prior.isdigit():
+                self._resource_id = prior
+                self.last_instance_id = prior
+                self._remember_instance(prior)
+                return CreateResult(outcome="created", resource_id=prior)
+            try:
+                self._refresh_live8()
+            except WorkerStageError as exc:
+                self.live6_stop = exc.code
+                return CreateResult(outcome="definite_failure")
+            reason = self._reject_live8_run()
+            if reason:
+                self.live6_stop = reason
+                return CreateResult(outcome="definite_failure")
+            if not self._arm_guard():
+                if not self.live6_stop:
+                    self.live6_stop = "WATCHDOG_NOT_ARMED"
+                return CreateResult(outcome="definite_failure")
+        elif not self.offer_id:
             self.quote(owner)
         if self._live7_bound():
             reason = self._reject_live7_run()
@@ -697,7 +942,10 @@ class VastImageProvider(GPUProvider):
                 if not self.live6_stop:
                     self.live6_stop = "WATCHDOG_NOT_ARMED"
                 return CreateResult(outcome="definite_failure")
-        elif self.execution_grant is not None or os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50":
+        elif not self._live8_bound() and (
+            self.execution_grant is not None
+            or os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50"
+        ):
             reason = self._reject_unverified_run()
             if reason:
                 self.live6_stop = reason
@@ -706,7 +954,7 @@ class VastImageProvider(GPUProvider):
                 if not self.live6_stop:
                     self.live6_stop = "WATCHDOG_NOT_ARMED"
                 return CreateResult(outcome="definite_failure")
-        label = ownership_label(owner)
+        label = ownership_label(self.execution_id if self._live8_bound() else owner)
         image = worker_image()
         body = {
             "label": label,
@@ -728,7 +976,7 @@ class VastImageProvider(GPUProvider):
                 "WORKER_PORT": "8080",
                 "-p 8080:8080": "1",
             }
-        if self._live7_bound():
+        if self._live7_bound() or self._live8_bound():
             if "volume_info" in body or int(getattr(self, "attached_volume_id", 0) or 0) == VOLUME_ID:
                 self.live6_stop = "VOLUME_MISMATCH"
                 return CreateResult(outcome="definite_failure")
@@ -736,6 +984,8 @@ class VastImageProvider(GPUProvider):
             body["volume_info"] = {
                 "mount_path": MOUNT_PATH, "create_new": False, "volume_id": int(self.attached_volume_id),
             }
+        if self._live8_bound():
+            self._write_create_intent(label)
         self.launch_trace.append("put")
         status, raw = self._request("PUT", f"https://console.vast.ai/api/v0/asks/{self.offer_id}/", body)
         if status <= 0:
@@ -746,6 +996,10 @@ class VastImageProvider(GPUProvider):
             found = self._await_owned(label)
             if len(found) == 1:
                 outcome, instance_id = "created", found[0]
+            elif self._live8_bound():
+                self._mark_intent("unresolved")
+                if not self.live6_stop:
+                    self.live6_stop = "UNRESOLVED_BILLING"
         if outcome == "created" and instance_id:
             self._resource_id = instance_id
             self.last_instance_id = instance_id
@@ -753,6 +1007,8 @@ class VastImageProvider(GPUProvider):
             self._label = label
             self._started_at[instance_id] = self._now()
             self._remember_instance(instance_id)
+            if self._live8_bound():
+                self._mark_intent("created", instance_id)
             return CreateResult(outcome="created", resource_id=instance_id)
         if outcome == "definite_failure":
             return CreateResult(outcome="definite_failure")

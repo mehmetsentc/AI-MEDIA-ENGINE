@@ -23,6 +23,7 @@ class SpendGrant:
     max_execution_seconds: int = 0
     cuda_min: str = ""
     forbidden_volume_id: int | None = None
+    offer_id: int | None = None
 
 
 def evaluate_grant(

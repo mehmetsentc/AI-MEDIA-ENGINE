@@ -53,7 +53,7 @@ def build_controller(root: Path, mode: Optional[str] = None,
     profile = str(source.get("MEDIA_ENGINE_EXECUTION_PROFILE", "")).strip()
     paid_postgres = (
         str(source.get("STUDIO_MODE", "")).strip().casefold() == "production"
-        or profile == "live7"
+        or profile in {"live7", "live8"}
     )
     stores = None
     if paid_postgres:
@@ -75,6 +75,9 @@ def build_controller(root: Path, mode: Optional[str] = None,
         grant = grant_from_environ(source)
         claim_execution_id(root / "live7-executions", grant.execution_id)
         provider.bind_execution(grant, execution_id=grant.execution_id)
+    elif profile == "live8":
+        from media_engine.providers.live8_prepare import bind_from_environ, head_sha
+        bind_from_environ(provider, source, runtime=root, code_sha=head_sha())
     elif profile in {"", "live6"}:
         from media_engine.providers.live6_prepare import claim_execution_id, grant_from_environ
         grant = grant_from_environ(source)

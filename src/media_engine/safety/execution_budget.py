@@ -275,6 +275,67 @@ def open_live7_budget(
     )
 
 
+def authorized_billable_seconds(hourly: Decimal, ceiling: Decimal) -> Optional[int]:
+    """Seconds that fit one authorization. The ceiling cannot rise above $1.50."""
+    amount = Decimal(hourly)
+    cap = Decimal(ceiling)
+    if amount <= 0 or amount > LIVE7_MAX_HOURLY_USD:
+        return None
+    if cap <= 0 or cap > LIVE7_CEILING_USD or cap == LIVE6_CEILING_USD:
+        return None
+    reserve = termination_reserve_usd(amount)
+    planning = cap - reserve
+    if planning <= 0:
+        return None
+    seconds = int((planning / amount) * Decimal(3600))
+    if seconds < LIVE7_MINIMUM_SESSION_SECONDS:
+        return None
+    cost = (amount * Decimal(seconds)) / Decimal(3600)
+    if cost > planning:
+        return None
+    return seconds
+
+
+def open_authorized_budget(
+    *,
+    execution_id: str,
+    grant_execution_id: str,
+    grant_ceiling: Decimal,
+    hourly: Decimal,
+    wall_now: float,
+    monotonic_now: float,
+    observed_starts: Optional[list] = None,
+) -> ExecutionBudget:
+    """Freeze the authorization ceiling. A later stage cannot extend it."""
+    if not execution_id or execution_id != grant_execution_id:
+        raise WorkerStageError("STALE_AUTHORIZATION")
+    cap = Decimal(grant_ceiling)
+    if cap <= 0 or cap > LIVE7_CEILING_USD:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    seconds = authorized_billable_seconds(hourly, cap)
+    if seconds is None or live7_transfer_room(seconds) < LIVE7_TRANSFER_FLOOR_SECONDS:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    candidates = [wall_now]
+    if observed_starts:
+        candidates.extend(observed_starts)
+    wall = conservative_billing_start(candidates)
+    shift = float(wall_now) - wall
+    mono = float(monotonic_now) - shift
+    reserve = termination_reserve_usd(hourly)
+    return ExecutionBudget(
+        execution_id=execution_id,
+        ceiling_usd=cap,
+        reserve_usd=reserve,
+        planning_usd=cap - reserve,
+        hourly_usd=Decimal(hourly),
+        allowed_seconds=seconds,
+        billing_started_wall=wall,
+        billing_started_monotonic=mono,
+        spending_deadline_wall=wall + seconds,
+        spending_deadline_monotonic=mono + seconds,
+    )
+
+
 def retain_deadline(stored: dict, proposed_wall: float, proposed_execution_id: str) -> float:
     """A restart keeps the stored deadline. A later proposal cannot extend it."""
     if str(stored.get("execution_id") or "") != proposed_execution_id:
