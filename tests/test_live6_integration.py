@@ -267,6 +267,7 @@ class Live6IntegrationTests(unittest.TestCase):
     def _provider(self, instances: list | None = None) -> VastImageProvider:
         listed = list(instances or [])
         created = {"done": False}
+        removed: set[str] = set()
         self.put_body = b""
 
         def transport(method, url, body, headers):
@@ -277,18 +278,19 @@ class Live6IntegrationTests(unittest.TestCase):
                 self.put_body = body
                 return 200, b'{"success": true, "new_contract": 9}'
             if method == "DELETE":
-                return 200, b"{}"
+                removed.add(url.rstrip("/").rsplit("/", 1)[-1])
+                return 200, b'{"success": true}'
             if "volumes" in url:
                 return 200, json.dumps({"volumes": [{"id": VOLUME_ID, "machine_id": MACHINE_ID}]}).encode()
             if "instances" in url:
-                rows = list(listed)
-                if created["done"]:
+                rows = [row for row in listed if str(row.get("id")) not in removed]
+                if created["done"] and "9" not in removed:
                     rows.append({
                         "id": 9,
                         "machine_id": MACHINE_ID,
                         "label": "media-engine:nahaber",
                     })
-                return 200, json.dumps({"instances": rows}).encode()
+                return 200, json.dumps({"instances": rows, "next_token": None}).encode()
             return 200, b'{"offers": []}'
 
         provider = VastImageProvider(

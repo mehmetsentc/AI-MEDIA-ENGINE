@@ -35,7 +35,7 @@ from media_engine.providers.base import (
 )
 from media_engine.providers.phase2d import INSTANCE_IMAGE
 from media_engine.providers.phase_clock import PHASE_LIMITS, PhaseWatch, note_transfer_text
-from media_engine.providers.vast_lifecycle import classify_create_response, instances_list_url, ownership_label
+from media_engine.providers.vast_lifecycle import classify_create_response, ownership_label
 from media_engine.safety.limits import SafetyLimits
 
 MACHINE_ID = 47281
@@ -437,8 +437,12 @@ class VastImageProvider(GPUProvider):
             return "VOLUME_MISMATCH"
         if not half_dollar_offer_allowed(self):
             return "OFFER_REJECTED"
+        try:
+            listed = self._instances()
+        except WorkerStageError as exc:
+            return exc.code
         owned = []
-        for row in self._instances():
+        for row in listed:
             if not str(row.get("label") or "").startswith("media-engine:"):
                 continue
             if str(row.get("machine_id") or "") != str(MACHINE_ID):
@@ -497,8 +501,12 @@ class VastImageProvider(GPUProvider):
         }, self.hourly_amount)
         if reason:
             return reason
+        try:
+            listed = self._instances()
+        except WorkerStageError as exc:
+            return exc.code
         owned = [
-            row for row in self._instances()
+            row for row in listed
             if str(row.get("label") or "").startswith("media-engine:")
         ]
         decision = evaluate_grant(
@@ -597,6 +605,7 @@ class VastImageProvider(GPUProvider):
                 "result": str(root / "watchdog.result"),
                 "instances_path": str(root / "watchdog-instances.json"),
                 "delete_log": str(root / "watchdog-deletes.json"),
+                "instance_file": str(root / "watchdog.instance"),
                 "poll_seconds": poll,
             }
             spec.update(budget.as_mapping())
@@ -743,6 +752,7 @@ class VastImageProvider(GPUProvider):
             self._owner = owner
             self._label = label
             self._started_at[instance_id] = self._now()
+            self._remember_instance(instance_id)
             return CreateResult(outcome="created", resource_id=instance_id)
         if outcome == "definite_failure":
             return CreateResult(outcome="definite_failure")
@@ -764,31 +774,59 @@ class VastImageProvider(GPUProvider):
         self._busy.discard(resource_id)
 
     def observe(self, resource_id: str, owner: str) -> str:
-        row = self._instance_row(resource_id)
+        try:
+            row = self._instance_row(resource_id)
+        except WorkerStageError:
+            return OBSERVE_UNKNOWN
         if row is None:
-            return OBSERVE_GONE if resource_id not in self._gone else OBSERVE_GONE
+            return OBSERVE_GONE
         label = str(row.get("label") or "")
         if label != ownership_label(owner) or not self._same_machine(row):
             return OBSERVE_FOREIGN
         return OBSERVE_PRESENT
 
     def terminate(self, resource_id: str) -> None:
-        row = self._instance_row(resource_id)
+        """Delete one exact id. Gone is recorded only after a later list omits it."""
+        if not str(resource_id).isdigit():
+            raise WorkerStageError("OWNERSHIP_MISMATCH")
+        try:
+            row = self._instance_row(resource_id)
+        except WorkerStageError:
+            row = "unlisted"
         if row is None:
-            self._gone.add(resource_id)
-            self._put_done = False
+            self._mark_gone(resource_id)
             return
-        label = str(row.get("label") or "")
-        if not label.startswith("media-engine:") or not self._same_machine(row):
-            raise WorkerStageError("OWNERSHIP_MISMATCH")
-        if str(row.get("id")) != str(resource_id):
-            raise WorkerStageError("OWNERSHIP_MISMATCH")
+        if row != "unlisted":
+            label = str(row.get("label") or "")
+            if not label.startswith("media-engine:") or not self._same_machine(row):
+                raise WorkerStageError("OWNERSHIP_MISMATCH")
+            if str(row.get("id")) != str(resource_id):
+                raise WorkerStageError("OWNERSHIP_MISMATCH")
         self._request("DELETE", f"https://console.vast.ai/api/v0/instances/{resource_id}/", None)
+        self._confirm_absent(resource_id)
+
+    def _mark_gone(self, resource_id: str) -> None:
         self._gone.add(resource_id)
         self._busy.discard(resource_id)
         if self._resource_id == resource_id:
             self._resource_id = ""
         self._put_done = False
+
+    def _confirm_absent(self, resource_id: str) -> None:
+        try:
+            rows = self._instances()
+        except WorkerStageError as exc:
+            raise WorkerStageError("DELETE_UNCONFIRMED") from exc
+        if any(str(row.get("id")) == str(resource_id) for row in rows):
+            raise WorkerStageError("DELETE_UNCONFIRMED")
+        self._mark_gone(resource_id)
+
+    def _remember_instance(self, instance_id: str) -> None:
+        if not str(instance_id).isdigit():
+            return
+        path = Path(self.runtime) / "watchdog.instance"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(instance_id), encoding="utf-8")
 
     def list_owned(self) -> list[dict]:
         rows = []
@@ -1045,17 +1083,15 @@ class VastImageProvider(GPUProvider):
         self.transfer_seconds = round(time.perf_counter() - started, 3)
 
     def _instances(self) -> list[dict]:
-        status, raw = self._request("GET", instances_list_url(), None)
-        if status != 200:
-            return []
+        from media_engine.providers.vast_lifecycle import InstanceListError, collect_instance_pages
+
+        def request(url: str) -> tuple[int, bytes]:
+            return self._request("GET", url, None)
+
         try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            return []
-        rows = payload.get("instances") if isinstance(payload, dict) else None
-        if not isinstance(rows, list):
-            return []
-        return [row for row in rows if isinstance(row, dict)]
+            return collect_instance_pages(request)
+        except InstanceListError as exc:
+            raise WorkerStageError(exc.code) from exc
 
     def _instance_row(self, resource_id: str) -> Optional[dict]:
         for row in self._instances():
@@ -1064,12 +1100,20 @@ class VastImageProvider(GPUProvider):
         return None
 
     def _await_owned(self, label: str) -> list[str]:
-        found = self._owned_ids(label)
+        try:
+            found = self._owned_ids(label)
+        except WorkerStageError as exc:
+            self.live6_stop = exc.code
+            return []
         if found or self._sleep is not time.sleep:
             return found
         for _ in range(8):
             self._sleep(3)
-            found = self._owned_ids(label)
+            try:
+                found = self._owned_ids(label)
+            except WorkerStageError as exc:
+                self.live6_stop = exc.code
+                return []
             if found:
                 return found
         return found

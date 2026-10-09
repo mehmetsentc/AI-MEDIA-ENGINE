@@ -69,6 +69,73 @@ def _not_armed(method: str, url: str, body: bytes, headers: dict[str, str]) -> b
     raise VastMutationBlocked("VAST_MUTATION_BLOCKED")
 
 
+class InstanceListError(Exception):
+    """A list call did not produce a trustworthy inventory. This is never an empty fleet."""
+
+    def __init__(self, code: str, status: int = 0) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status = int(status)
+
+
+def list_failure_code(status: int) -> str:
+    """Map a failed list response to an explicit code. None of these mean zero instances."""
+    if status == 410:
+        return "LIST_DEPRECATED"
+    if status in (401, 403):
+        return "LIST_UNAUTHORIZED"
+    if status == 429:
+        return "LIST_RATE_LIMIT"
+    if status >= 500:
+        return "LIST_SERVER"
+    if status <= 0:
+        return "LIST_NETWORK"
+    return "LIST_REJECTED"
+
+
+def parse_instance_page(raw: bytes) -> tuple[list[dict], Optional[str]]:
+    """Accept one documented v1 page. `instances` plus an optional `next_token`."""
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise InstanceListError("LIST_INVALID") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("instances"), list):
+        raise InstanceListError("LIST_SCHEMA")
+    if "success" in payload and payload.get("success") is not True:
+        raise InstanceListError("LIST_SCHEMA")
+    rows: list[dict] = []
+    for row in payload["instances"]:
+        if not isinstance(row, dict) or _DIGITS.fullmatch(str(row.get("id") or "")) is None:
+            raise InstanceListError("LIST_SCHEMA")
+        rows.append(row)
+    nxt = payload.get("next_token", None)
+    if nxt in (None, ""):
+        return rows, None
+    if not isinstance(nxt, str) or any(char.isspace() for char in nxt):
+        raise InstanceListError("LIST_SCHEMA")
+    return rows, nxt
+
+
+def collect_instance_pages(request, *, page_limit: int = _MAX_INSTANCE_PAGES) -> list[dict]:
+    """Follow v1 pages. `request` returns `(status, body)` and must not hide errors as `[]`."""
+    rows: list[dict] = []
+    token: Optional[str] = None
+    seen: set[str] = set()
+    for _ in range(page_limit):
+        status, raw = request(instances_list_url(token))
+        if int(status) != 200:
+            raise InstanceListError(list_failure_code(int(status)), int(status))
+        page, nxt = parse_instance_page(raw)
+        rows.extend(page)
+        if nxt is None:
+            return rows
+        if nxt in seen:
+            raise InstanceListError("LIST_SCHEMA")
+        seen.add(nxt)
+        token = nxt
+    raise InstanceListError("LIST_SCHEMA")
+
+
 def instances_list_url(after_token: Optional[str] = None) -> str:
     """Read-only list URL used by the current Vast CLI."""
     pairs = [
@@ -247,8 +314,12 @@ class VastLifecycle:
         if _DIGITS.fullmatch(resource_id) is None:
             return OBSERVE_UNKNOWN
         wanted = ownership_label(owner)
+        try:
+            listed = self._instances(api_key)
+        except InstanceListError:
+            return OBSERVE_UNKNOWN
         found = None
-        for row in self._instances(api_key):
+        for row in listed:
             if str(row.get("id")) == resource_id:
                 found = row
                 break
@@ -262,27 +333,14 @@ class VastLifecycle:
         return OBSERVE_UNKNOWN
 
     def _instances(self, api_key: str) -> list[dict]:
-        rows: list[dict] = []
-        token: Optional[str] = None
-        seen: set[str] = set()
-        for _ in range(_MAX_INSTANCE_PAGES):
-            raw = self._transport("GET", instances_list_url(token), b"", self._headers(api_key))
+        def request(url: str) -> tuple[int, bytes]:
             try:
-                payload = json.loads(raw.decode("utf-8"))
-            except (UnicodeError, json.JSONDecodeError):
-                return []
-            page = payload.get("instances") if isinstance(payload, dict) else None
-            if not isinstance(page, list):
-                return []
-            rows.extend(row for row in page if isinstance(row, dict))
-            nxt = payload.get("next_token") if isinstance(payload, dict) else None
-            if nxt in (None, ""):
-                return rows
-            if not isinstance(nxt, str) or nxt in seen:
-                return []
-            seen.add(nxt)
-            token = nxt
-        return []
+                raw = self._transport("GET", url, b"", self._headers(api_key))
+            except VastCallError as exc:
+                raise InstanceListError(list_failure_code(exc.status), exc.status) from exc
+            return 200, raw
+
+        return collect_instance_pages(request)
 
     def _headers(self, api_key: str) -> dict[str, str]:
         return {

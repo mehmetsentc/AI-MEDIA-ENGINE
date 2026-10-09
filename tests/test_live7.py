@@ -34,7 +34,8 @@ from media_engine.providers.live7_contract import (
 )
 from media_engine.providers.live7_prepare import grant_from_environ
 from media_engine.providers.vast_image import MACHINE_ID, VOLUME_ID, VastImageProvider
-from media_engine.providers.vast_watchdog import run_until_stopped
+from media_engine.providers.vast_lifecycle import InstanceListError, collect_instance_pages
+from media_engine.providers.vast_watchdog import matching_instances, persisted_instance_id, run_until_stopped
 from media_engine.safety.execution_budget import (
     LIVE6_RESERVE_USD,
     LIVE7_CEILING_USD,
@@ -261,6 +262,8 @@ class Live7GrantTests(unittest.TestCase):
         self.assertNotEqual(spec["spending_deadline_wall"], spec["authorization_expires_at"])
         self.assertEqual(spec["spending_deadline_wall"], 5_000.0 + spec["allowed_seconds"])
         self.assertEqual(spec["deadline_epoch"], spec["spending_deadline_wall"])
+        self.assertEqual((Path(self.tmp.name) / "watchdog.instance").read_text(encoding="utf-8"), "77")
+        self.assertTrue(str(spec["instance_file"]).endswith("watchdog.instance"))
         again = provider.create("daidoi")
         self.assertEqual(again.outcome, "definite_failure")
         self.assertEqual(len(provider.puts), 1)
@@ -618,7 +621,217 @@ class WatchdogParentTests(unittest.TestCase):
             time.sleep(0.05)
         outcome = json.loads(Path(spec["result"]).read_text(encoding="utf-8"))
         self.assertEqual(outcome["stopped"], ["local-7"])
+        self.assertEqual(outcome["confirmed_absent"], ["local-7"])
         self.assertEqual(outcome["deadline"], 9_000_000_000.0)
+
+
+class InstanceVisibilityTests(unittest.TestCase):
+    def test_v1_page_schema_accepts_an_empty_fleet_only_on_success(self) -> None:
+        seen = []
+
+        def request(url: str):
+            seen.append(url)
+            return 200, b'{"instances": [], "next_token": null}'
+
+        self.assertEqual(collect_instance_pages(request), [])
+        self.assertIn("/api/v1/instances/", seen[0])
+        self.assertNotIn("/api/v0/instances/", seen[0])
+
+    def test_deprecated_auth_and_malformed_lists_are_not_empty(self) -> None:
+        cases = (
+            (410, b'{"success": false, "error": "deprecated_endpoint"}', "LIST_DEPRECATED"),
+            (401, b'{"success": false}', "LIST_UNAUTHORIZED"),
+            (403, b'{"success": false}', "LIST_UNAUTHORIZED"),
+            (429, b'{"success": false}', "LIST_RATE_LIMIT"),
+            (500, b"", "LIST_SERVER"),
+            (200, b"not-json", "LIST_INVALID"),
+            (200, b'{"instances": {"id": 1}}', "LIST_SCHEMA"),
+            (200, b'{"instances": [{"label": "media-engine:x"}]}', "LIST_SCHEMA"),
+            (200, b'{"success": false, "instances": []}', "LIST_SCHEMA"),
+        )
+        for status, body, code in cases:
+            with self.assertRaises(InstanceListError) as caught:
+                collect_instance_pages(lambda _url, status=status, body=body: (status, body))
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotEqual(caught.exception.code, "")
+
+    def test_matching_uses_the_authorized_id_and_ignores_other_machines(self) -> None:
+        rows = [
+            {"id": 77, "machine_id": LIVE7_MACHINE_ID, "label": "media-engine:live7"},
+            {"id": 88, "machine_id": 47281, "label": "media-engine:other"},
+            {"id": 99, "machine_id": LIVE7_MACHINE_ID, "label": "customer"},
+        ]
+        self.assertEqual(matching_instances(rows, LIVE7_MACHINE_ID), ["77"])
+
+    def test_list_failure_does_not_delete_before_the_deadline(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        (root / "watchdog.instance").write_text("4242", encoding="utf-8")
+        deleted: list[str] = []
+        state = {"now": 0.0}
+
+        def fetch():
+            raise InstanceListError("LIST_DEPRECATED", 410)
+
+        def delete(instance_id: str) -> int:
+            deleted.append(instance_id)
+            return 200
+
+        spec = {
+            "machine_id": LIVE7_MACHINE_ID,
+            "safe_seconds": 100,
+            "spending_deadline_wall": 50.0,
+            "deadline_epoch": 50.0,
+            "heartbeat": str(root / "beat"),
+            "stop": str(root / "stop"),
+            "instance_file": str(root / "watchdog.instance"),
+            "stale_after": 1000,
+            "poll_seconds": 1,
+        }
+        (root / "beat").write_text("fresh", encoding="utf-8")
+        outcome = run_until_stopped(
+            spec,
+            fetch=fetch,
+            delete=delete,
+            now=lambda: state["now"],
+            sleep=lambda _seconds: state.__setitem__("now", state["now"] + 10),
+        )
+        self.assertEqual(deleted, ["4242"])
+        self.assertEqual(outcome["stopped"], ["4242"])
+        self.assertEqual(outcome["confirmed_absent"], [])
+        self.assertEqual(outcome["error"], "LIST_DEPRECATED")
+        self.assertEqual(outcome["termination_failures"][0]["status"], "UNCONFIRMED")
+        self.assertGreaterEqual(state["now"], 50.0)
+        self.assertEqual(persisted_instance_id(spec), "4242")
+
+    def test_blind_cleanup_deletes_only_the_persisted_id_and_confirms_absence(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        (root / "watchdog.instance").write_text("4242", encoding="utf-8")
+        deleted: list[str] = []
+        state = {"now": 50.0, "gone": False}
+
+        def fetch():
+            if not state["gone"]:
+                raise InstanceListError("LIST_NETWORK", 0)
+            return []
+
+        def delete(instance_id: str) -> int:
+            deleted.append(instance_id)
+            state["gone"] = True
+            return 200
+
+        outcome = run_until_stopped(
+            {
+                "machine_id": LIVE7_MACHINE_ID,
+                "safe_seconds": 10,
+                "spending_deadline_wall": 50.0,
+                "heartbeat": str(root / "beat"),
+                "stop": str(root / "stop"),
+                "instance_file": str(root / "watchdog.instance"),
+                "stale_after": 1000,
+                "poll_seconds": 1,
+            },
+            fetch=fetch,
+            delete=delete,
+            now=lambda: state["now"],
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(deleted, ["4242"])
+        self.assertEqual(outcome["confirmed_absent"], ["4242"])
+        self.assertEqual(outcome["termination_failures"], [])
+
+    def test_a_non_numeric_persisted_value_is_not_deleted(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        (root / "watchdog.instance").write_text("not-an-id", encoding="utf-8")
+        deleted: list[str] = []
+        outcome = run_until_stopped(
+            {
+                "machine_id": LIVE7_MACHINE_ID,
+                "safe_seconds": 1,
+                "spending_deadline_wall": 1.0,
+                "heartbeat": str(root / "beat"),
+                "stop": str(root / "stop"),
+                "instance_file": str(root / "watchdog.instance"),
+                "stale_after": 1000,
+                "poll_seconds": 1,
+            },
+            fetch=lambda: (_ for _ in ()).throw(InstanceListError("LIST_TIMEOUT", 0)),
+            delete=deleted.append,
+            now=lambda: 5.0,
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(deleted, [])
+        self.assertEqual(outcome["error"], "LIST_TIMEOUT")
+        self.assertEqual(outcome["confirmed_absent"], [])
+
+    def test_watchdog_visibility_failure_blocks_create(self) -> None:
+        previous = {name: os.environ.get(name) for name in (
+            "MEDIA_ENGINE_ALLOW_COLD_STAGE",
+            "MEDIA_ENGINE_FORBID_R2_STAGE",
+            "MEDIA_ENGINE_WATCHDOG_LAUNCH",
+            "STUDIO_GPU_BUDGET_USD",
+        )}
+
+        def restore() -> None:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.addCleanup(restore)
+        os.environ["MEDIA_ENGINE_ALLOW_COLD_STAGE"] = "1"
+        os.environ.pop("MEDIA_ENGINE_FORBID_R2_STAGE", None)
+        os.environ["MEDIA_ENGINE_WATCHDOG_LAUNCH"] = "1"
+        os.environ["STUDIO_GPU_BUDGET_USD"] = "1.50"
+        puts = []
+
+        def transport(method, url, body, headers):
+            del headers
+            if method == "PUT":
+                puts.append(url)
+                return 200, b'{"success": true, "new_contract": 77}'
+            if method == "GET" and "/instances/" in url:
+                return 410, b'{"success": false, "error": "deprecated_endpoint"}'
+            return 200, b'{"instances": []}'
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider._monotonic = lambda: 10.0
+        grant = make_live7_grant(execution_id="blind", issued_at=1_000, expires_at=20_000)
+        provider.bind_execution(grant, execution_id="blind")
+        provider.offer_id = str(LIVE7_OFFER_ID)
+        provider.gpu_model = "RTX 6000 Ada"
+        provider.gpu_ram_mib = 49140
+        provider.cuda_max_good = 13.2
+        provider.compute_cap = 890
+        provider.hourly_amount = Decimal("0.74")
+        created = provider.create("daidoi")
+        self.assertEqual(created.outcome, "definite_failure")
+        self.assertEqual(provider.live6_stop, "LIST_DEPRECATED")
+        self.assertEqual(puts, [])
+
+    def test_accepted_delete_stays_unconfirmed_while_the_instance_is_listed(self) -> None:
+        calls = []
+
+        def transport(method, url, body, headers):
+            del url, body, headers
+            calls.append(method)
+            if method == "DELETE":
+                return 200, b'{"success": true}'
+            return 200, json.dumps({
+                "instances": [{"id": 77, "machine_id": LIVE7_MACHINE_ID, "label": "media-engine:daidoi"}],
+                "next_token": None,
+            }).encode()
+
+        provider = VastImageProvider(api_key="fixture-key", transport=transport, now=lambda: 1.0)
+        provider.machine_id = str(LIVE7_MACHINE_ID)
+        with self.assertRaises(WorkerStageError) as caught:
+            provider.terminate("77")
+        self.assertEqual(caught.exception.code, "DELETE_UNCONFIRMED")
+        self.assertIn("DELETE", calls)
+        self.assertNotIn("77", provider._gone)
 
 
 def _alive(pid: int) -> bool:

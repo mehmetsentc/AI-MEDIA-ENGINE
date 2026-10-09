@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -11,9 +12,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from media_engine.providers.vast_lifecycle import (
+    InstanceListError,
+    collect_instance_pages,
+    list_failure_code,
+)
+
 LABEL_PREFIX = "media-engine:"
 HEARTBEAT_STALE_SECONDS = 300.0
-INSTANCES_URL = "https://console.vast.ai/api/v0/instances/?owner=me"
+_INSTANCE_ID = re.compile(r"^[0-9]+$")
+# Destroy stays on the documented per-instance route. Only the collection route moved to v1.
+DELETE_URL = "https://console.vast.ai/api/v0/instances/%s/"
 
 
 def matching_instances(rows, machine_id: int) -> list[str]:
@@ -114,25 +123,82 @@ def _request(key: str, method: str, url: str) -> tuple[int, bytes]:
         return exc.code, exc.read()
 
 
+def list_instances(key: str) -> list[dict]:
+    """Authenticated v1 inventory. HTTP failures, timeouts, and bad pages raise."""
+
+    def request(url: str) -> tuple[int, bytes]:
+        try:
+            status, raw = _request(key, "GET", url)
+        except TimeoutError as exc:
+            raise InstanceListError("LIST_TIMEOUT", 0) from exc
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            code = "LIST_TIMEOUT" if isinstance(reason, TimeoutError) else "LIST_NETWORK"
+            raise InstanceListError(code, 0) from exc
+        if status != 200:
+            raise InstanceListError(list_failure_code(status), status)
+        return status, raw
+
+    return collect_instance_pages(request)
+
+
 def _fetch_instances(key: str) -> list:
-    status, raw = _request(key, "GET", INSTANCES_URL)
-    if status != 200:
-        return []
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
-        return []
-    rows = payload.get("instances") if isinstance(payload, dict) else None
-    return rows if isinstance(rows, list) else []
+    return list_instances(key)
 
 
 def _delete_instance(key: str, instance_id: str) -> int:
-    status, _raw = _request(key, "DELETE", "https://console.vast.ai/api/v0/instances/%s/" % instance_id)
+    if _INSTANCE_ID.fullmatch(str(instance_id)) is None:
+        return 400
+    status, _raw = _request(key, "DELETE", DELETE_URL % instance_id)
     return status
 
 
+def persisted_instance_id(spec: dict) -> str:
+    """The one id the parent recorded. Anything else is ignored."""
+    path = spec.get("instance_file")
+    if not path:
+        return ""
+    try:
+        value = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if _INSTANCE_ID.fullmatch(value) is None:
+        return ""
+    return value
+
+
+def _cleanup_ids(known: list[str], persisted: str, foreign: set[str]) -> list[str]:
+    chosen: list[str] = []
+    for instance_id in known:
+        if instance_id and instance_id not in chosen:
+            chosen.append(instance_id)
+    if persisted and persisted not in foreign and persisted not in chosen:
+        chosen.append(persisted)
+    return chosen
+
+
+def _finish(stopped: list[str], deadline, failures: list[dict], confirmed: list[str], error: str = "") -> dict:
+    result = {
+        "stopped": stopped,
+        "deadline": deadline,
+        "termination_failures": failures,
+        "confirmed_absent": confirmed,
+    }
+    if error:
+        result["error"] = error
+    return result
+
+
+def _absent(rows: list[dict], instance_id: str) -> bool:
+    return all(str(row.get("id") or "") != str(instance_id) for row in rows if isinstance(row, dict))
+
+
 def run_until_stopped(spec: dict, *, fetch, delete, now, sleep) -> dict:
-    """One control loop used by the detached process and by tests."""
+    """One control loop used by the detached process and by tests.
+
+    A failed inventory is not an empty fleet. Cleanup then deletes only ids
+    already matched on a good list, plus the single id the parent persisted.
+    """
     machine_id = int(spec["machine_id"])
     safe_seconds = float(spec["safe_seconds"])
     heartbeat_path = Path(spec["heartbeat"])
@@ -141,56 +207,101 @@ def run_until_stopped(spec: dict, *, fetch, delete, now, sleep) -> dict:
     seen: float | None = None
     deadline: float | None = None
     armed: float | None = None
+    known: list[str] = []
+    foreign: set[str] = set()
     locked = spec.get("spending_deadline_wall")
     while True:
         current = float(now())
         if armed is None:
             armed = current
-        rows = fetch()
-        owned = matching_instances(rows, machine_id)
-        if owned and seen is None:
-            seen = current
+        persisted = persisted_instance_id(spec)
+        list_error = ""
+        try:
+            rows = fetch()
+        except InstanceListError as exc:
+            rows = None
+            list_error = exc.code
         if locked is not None:
             deadline = float(locked)
             window_end = deadline
         else:
             absolute = spec.get("deadline_epoch")
-            if owned and seen is not None and deadline is None:
-                deadline = float(absolute) if absolute is not None else min(seen + safe_seconds, armed + safe_seconds)
             window_end = float(absolute) if absolute is not None else armed + safe_seconds
-        if not owned and current >= window_end:
-            return {"stopped": [], "deadline": deadline, "termination_failures": []}
-        heartbeat_age = None
-        if owned and seen is not None and current - seen > stale_after:
+        if rows is not None:
+            owned = matching_instances(rows, machine_id)
+            for instance_id in owned:
+                if instance_id not in known:
+                    known.append(instance_id)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                identity = str(row.get("id") or "")
+                label = str(row.get("label") or "")
+                if identity and not label.startswith(LABEL_PREFIX):
+                    foreign.add(identity)
+            if owned and seen is None:
+                seen = current
+            if not locked:
+                if owned and seen is not None and deadline is None:
+                    deadline = float(absolute) if absolute is not None else min(seen + safe_seconds, armed + safe_seconds)
+                if absolute is None:
+                    window_end = deadline if deadline is not None else armed + safe_seconds
+            if not owned and current >= window_end:
+                return _finish([], deadline, [], [])
+            heartbeat_age = None
+            if owned and seen is not None and current - seen > stale_after:
+                if heartbeat_path.is_file():
+                    heartbeat_age = current - heartbeat_path.stat().st_mtime
+                else:
+                    heartbeat_age = current - seen
+            if stop_path.is_file():
+                targets = owned
+            else:
+                targets = instances_to_stop(
+                    rows,
+                    machine_id=machine_id,
+                    now=current,
+                    deadline=deadline,
+                    heartbeat_age=heartbeat_age,
+                    stale_after=stale_after,
+                )
+            if targets:
+                return _delete_targets(targets, fetch, delete, deadline, "")
+            if stop_path.is_file():
+                return _finish([], deadline, [], [])
+        else:
+            heartbeat_age = current - armed
             if heartbeat_path.is_file():
                 heartbeat_age = current - heartbeat_path.stat().st_mtime
-            else:
-                heartbeat_age = current - seen
-        if stop_path.is_file():
-            targets = owned
-        else:
-            targets = instances_to_stop(
-                rows,
-                machine_id=machine_id,
-                now=current,
-                deadline=deadline,
-                heartbeat_age=heartbeat_age,
-                stale_after=stale_after,
-            )
-        if targets:
-            failures = []
-            for instance_id in targets:
-                status_code = delete(instance_id)
-                if status_code not in (None, 200, 202, 204, 404):
-                    failures.append({"id": instance_id, "status": status_code})
-            return {
-                "stopped": targets,
-                "deadline": deadline,
-                "termination_failures": failures,
-            }
-        if stop_path.is_file():
-            return {"stopped": [], "deadline": deadline, "termination_failures": []}
+            cleanup = stop_path.is_file() or current >= window_end or heartbeat_age > stale_after
+            if cleanup:
+                targets = _cleanup_ids(known, persisted, foreign)
+                if not targets:
+                    return _finish([], deadline, [], [], list_error or "LIST_UNAVAILABLE")
+                return _delete_targets(targets, fetch, delete, deadline, list_error)
         sleep(float(spec.get("poll_seconds") or 15))
+
+
+def _delete_targets(targets: list[str], fetch, delete, deadline, list_error: str) -> dict:
+    """Ask for deletion, then believe it only when a later good list omits the id."""
+    failures = []
+    confirmed: list[str] = []
+    for instance_id in targets:
+        status_code = delete(instance_id)
+        if status_code not in (None, 200, 202, 204, 404):
+            failures.append({"id": instance_id, "status": status_code})
+            continue
+        try:
+            rows = fetch()
+        except InstanceListError as exc:
+            failures.append({"id": instance_id, "status": "UNCONFIRMED", "error": exc.code})
+            continue
+        if isinstance(rows, list) and _absent(rows, instance_id):
+            confirmed.append(instance_id)
+        else:
+            failures.append({"id": instance_id, "status": "STILL_PRESENT"})
+    unresolved = set(targets) != set(confirmed)
+    return _finish(targets, deadline, failures, confirmed, list_error if unresolved else "")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -223,6 +334,8 @@ def main(argv: list[str] | None = None) -> int:
 
     outcome = run_until_stopped(spec, fetch=fetch, delete=delete, now=time.time, sleep=time.sleep)
     result_path.write_text(json.dumps(outcome), encoding="utf-8")
+    if outcome.get("error"):
+        return 1
     return 0
 
 
@@ -243,6 +356,15 @@ def _local_delete(spec: dict, instance_id: str) -> int:
     rows = _read_rows(log)
     rows.append({"id": instance_id, "status": status_code})
     log.write_text(json.dumps(rows), encoding="utf-8")
+    inventory = spec.get("instances_path")
+    if status_code == 200 and inventory:
+        path = Path(inventory)
+        if path.is_file():
+            kept = [
+                row for row in _read_rows(path)
+                if not isinstance(row, dict) or str(row.get("id")) != str(instance_id)
+            ]
+            path.write_text(json.dumps(kept), encoding="utf-8")
     return status_code
 
 

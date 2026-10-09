@@ -18,6 +18,7 @@ from media_engine.providers.planner import (
 )
 from media_engine.providers.vast import SEARCH_URL, VastDiscovery, VastMutationBlocked
 from media_engine.providers.vast_lifecycle import (
+    InstanceListError,
     ProvisionBlocked,
     VastCallError,
     VastLifecycle,
@@ -407,6 +408,20 @@ class Phase2BTests(unittest.TestCase):
             live_transport("PUT", instances_list_url(), b"{}", {})
         with self.assertRaises(VastMutationBlocked):
             live_transport("DELETE", "https://console.vast.ai/api/v1/instances/7/", b"", {})
+
+    def test_invalid_instance_page_is_not_an_empty_fleet(self) -> None:
+        def transport(method, url, body, headers):
+            del method, url, body, headers
+            return b'{"error": "deprecated_endpoint"}'
+
+        lifecycle = VastLifecycle(
+            self.db_path,
+            limits=SafetyLimits(live_external_providers=True),
+            transport=transport,
+        )
+        with self.assertRaises(InstanceListError) as caught:
+            lifecycle.list_owned("film-studio", api_key="unit-test-vast-secret", provision=True)
+        self.assertEqual(caught.exception.code, "LIST_SCHEMA")
 
     def test_instance_list_failure_does_not_reveal_secret(self) -> None:
         secret = "unit-test-vast-secret"
