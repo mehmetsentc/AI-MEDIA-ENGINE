@@ -46,20 +46,63 @@ WARM_DISK_GB = 40
 COLD_DISK_GB = 140
 MIN_VRAM_MIB = 44 * 1024
 OPERATION_BUDGET_USD = Decimal("1.00")
+# Explicit process ceilings. Any other value leaves the $1 cap in place.
+AUTHORIZED_RUN_BUDGET_USD = Decimal("3.00")
+VERIFY_RUN_BUDGET_USD = Decimal("0.50")
+AUTHORIZED_RUN_BUDGETS = frozenset({AUTHORIZED_RUN_BUDGET_USD, VERIFY_RUN_BUDGET_USD})
+# Previously observed warm hourly for machine 47281 with the 40 GB instance disk.
+VERIFY_MAX_HOURLY_USD = Decimal("0.375")
 
 
-def active_operation_budget() -> Decimal:
-    """The approved image test can tighten the planner with STUDIO_GPU_BUDGET_USD."""
-    raw = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
+def _operation_ceiling() -> Decimal:
+    raw = os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip()
     if not raw:
         return OPERATION_BUDGET_USD
     try:
-        amount = Decimal(raw)
+        granted = Decimal(raw)
     except Exception:
         return OPERATION_BUDGET_USD
+    if granted in AUTHORIZED_RUN_BUDGETS:
+        return granted
+    return OPERATION_BUDGET_USD
+
+
+def active_operation_budget() -> Decimal:
+    """The default cap stays $1. STUDIO_GPU_BUDGET_USD can only tighten it.
+
+    MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD must be exactly 3.00 or 0.50.
+    0.50 is the cache-verification ceiling. 0.49, 0.51, and 9.00 stay at $1.
+    """
+    ceiling = _operation_ceiling()
+    raw = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
+    if not raw:
+        return ceiling
+    try:
+        amount = Decimal(raw)
+    except Exception:
+        return ceiling
     if amount <= 0:
-        return OPERATION_BUDGET_USD
-    return min(amount, OPERATION_BUDGET_USD)
+        return ceiling
+    return min(amount, ceiling)
+
+
+def safe_runtime_seconds(
+    hourly: Decimal,
+    *,
+    network_ceiling: Decimal,
+    reserve: Decimal,
+    ceiling: Decimal,
+) -> Optional[int]:
+    """Seconds of GPU time that stay inside the ceiling after network and reserve."""
+    if hourly <= 0 or ceiling <= 0:
+        return None
+    try:
+        spendable = ceiling - network_ceiling - reserve
+    except Exception:
+        return None
+    if spendable <= 0:
+        return None
+    return int((spendable / hourly) * Decimal(3600))
 
 
 def decide_staging_budget(
@@ -133,8 +176,83 @@ def decide_staging_budget(
     decision["reason"] = "within_budget"
     return decision
 
+
+def session_fits(
+    safe_seconds: Optional[int],
+    *,
+    transfer_seconds: float,
+    model_load_seconds: float,
+    inference_seconds: float,
+) -> bool:
+    if safe_seconds is None:
+        return False
+    return safe_seconds >= transfer_seconds + model_load_seconds + inference_seconds
+
+
 OVERHEAD_SECONDS = 600
 GENERATE_ALLOWANCE_SECONDS = 180
+WARM_CACHE_INSPECT_SECONDS = 120.0
+
+
+def warm_session_seconds() -> float:
+    """Provisioning, cache inspection, runtime, load, inference, and cleanup."""
+    return (
+        float(PHASE_LIMITS["worker_ready"][0])
+        + WARM_CACHE_INSPECT_SECONDS
+        + float(PHASE_LIMITS["runtime_preparing"][0])
+        + float(PHASE_LIMITS["model_loading"][0])
+        + float(PHASE_LIMITS["generating"][0])
+        + float(GENERATE_ALLOWANCE_SECONDS)
+    )
+
+
+def warm_verify_window(hourly: Decimal, ceiling: Decimal) -> dict:
+    """Warm-cache session window. Network transfer is not part of this budget."""
+    required = warm_session_seconds()
+    reserve = (ceiling * Decimal("0.20")).quantize(Decimal("0.01"))
+    safe = safe_runtime_seconds(
+        hourly,
+        network_ceiling=Decimal("0"),
+        reserve=reserve,
+        ceiling=ceiling,
+    )
+    work = (hourly * Decimal(str(required)) / Decimal(3600)).quantize(Decimal("0.000001"))
+    fits = (
+        safe is not None
+        and safe >= required
+        and work + reserve <= ceiling
+    )
+    return {
+        "safe_seconds": safe,
+        "reserve_usd": reserve,
+        "required_seconds": required,
+        "work_cost": work,
+        "fits": fits,
+        "ceiling": ceiling,
+        "network_usd": Decimal("0"),
+    }
+
+
+def half_dollar_offer_allowed(provider: "VastImageProvider") -> bool:
+    """The $0.50 process may rent only the warm verified GPU with the existing volume."""
+    if os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() != "0.50":
+        return False
+    if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() != "1":
+        return False
+    if provider.cache_source != "warm_cache":
+        return False
+    if str(provider.machine_id) != str(MACHINE_ID):
+        return False
+    compact = str(provider.gpu_model).casefold().replace(" ", "").replace("_", "")
+    if "a6000" not in compact or "ada" in compact:
+        return False
+    if provider.disk_gb != WARM_DISK_GB:
+        return False
+    if provider.hourly_amount > VERIFY_MAX_HOURLY_USD:
+        return False
+    return bool(warm_verify_window(provider.hourly_amount, VERIFY_RUN_BUDGET_USD)["fits"])
+
+
 # The first progress report is not a sustained rate. LIVE-5 stopped on
 # 0.37 MB/s after 199,078 bytes. These bounds require later samples.
 STAGING_WARMUP_SAMPLES = 4
@@ -214,6 +332,8 @@ class VastImageProvider(GPUProvider):
         self.staging_deadline: Optional[float] = None
         self.staging_reserve_seconds = 0.0
         self.staging_stop_reason = ""
+        self.verified_manifest: Optional[dict] = None
+        self.cache_validation = ""
         self.runtime_ready = False
         self.worker_state = ""
         self.health_transport = ""
@@ -221,6 +341,13 @@ class VastImageProvider(GPUProvider):
         self.cost_before_generation_usd = Decimal("0")
         self.last_instance_id = ""
         self._put_done = False
+        self.execution_grant = None
+        self.execution_id = ""
+        self.live6_stop = ""
+        self.launch_trace: list[str] = []
+        self.watchdog_pid = 0
+        self._watchdog_popen = None
+        self.attached_volume_id = VOLUME_ID
         self._owner = ""
         self._label = ""
         self._resource_id = ""
@@ -230,6 +357,69 @@ class VastImageProvider(GPUProvider):
         self._gone: set[str] = set()
         self._started_at: dict[str, float] = {}
         self.commands: list[str] = []
+
+    def _reject_unverified_run(self) -> str:
+        """The $0.50 path rents nothing until this execution's grant matches the offer."""
+        if int(self.attached_volume_id) != VOLUME_ID:
+            return "VOLUME_MISMATCH"
+        if not half_dollar_offer_allowed(self):
+            return "OFFER_REJECTED"
+        owned = []
+        for row in self._instances():
+            if not str(row.get("label") or "").startswith("media-engine:"):
+                continue
+            if str(row.get("machine_id") or "") != str(MACHINE_ID):
+                continue
+            owned.append(row)
+        from media_engine.safety.spend_grant import evaluate_grant
+        try:
+            machine = int(self.machine_id)
+        except (TypeError, ValueError):
+            machine = None
+        decision = evaluate_grant(
+            self.execution_grant,
+            now=float(self._now()),
+            execution_id=self.execution_id,
+            ceiling_usd=VERIFY_RUN_BUDGET_USD,
+            instances=len(owned) + 1,
+            machine_id=machine,
+        )
+        if decision["action"] != "continue":
+            return str(decision["reason"])
+        grant = self.execution_grant
+        if grant is None or grant.max_instances != 1:
+            return "INSTANCE_LIMIT"
+        if grant.ceiling_usd != VERIFY_RUN_BUDGET_USD:
+            return "BUDGET_MISMATCH"
+        return ""
+
+    def _arm_guard(self) -> bool:
+        """Start the detached watchdog before any instance request."""
+        popen = self._watchdog_popen
+        if popen is None:
+            if os.environ.get("MEDIA_ENGINE_WATCHDOG_LAUNCH") != "1":
+                return False
+            import subprocess
+            popen = subprocess.Popen
+        if self.execution_grant is None:
+            return False
+        root = Path(self.runtime)
+        root.mkdir(parents=True, exist_ok=True)
+        spec = {
+            "machine_id": MACHINE_ID,
+            "safe_seconds": max(1.0, float(self.execution_grant.expires_at) - float(self._now())),
+            "heartbeat": str(root / "watchdog.heartbeat"),
+            "stop": str(root / "watchdog.stop"),
+            "result": str(root / "watchdog.result"),
+            "poll_seconds": 15,
+        }
+        path = root / "watchdog.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        from media_engine.providers.vast_watchdog import arm_watchdog
+        self.launch_trace.append("watchdog")
+        pid = arm_watchdog(path, popen=popen)
+        self.watchdog_pid = int(pid)
+        return pid > 0
 
     def quote(self, owner: str) -> Quote:
         if not owner:
@@ -249,7 +439,7 @@ class VastImageProvider(GPUProvider):
         self.disk_gb = chosen.disk_gb
         self.projected_cost_usd = chosen.projected_cost
         self.cost_before_generation_usd = chosen.cost_before_generation
-        self.fits_operation_budget = chosen.projected_cost <= OPERATION_BUDGET_USD
+        self.fits_operation_budget = chosen.projected_cost <= active_operation_budget()
         if chosen.source == "r2_cold_stage" and not _r2_configured():
             raise WorkerStageError("MODEL_CACHE_INVALID")
         return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
@@ -260,6 +450,14 @@ class VastImageProvider(GPUProvider):
         self._put_done = True
         if not self.offer_id:
             self.quote(owner)
+        if os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50":
+            reason = self._reject_unverified_run()
+            if reason:
+                self.live6_stop = reason
+                return CreateResult(outcome="definite_failure")
+            if not self._arm_guard():
+                self.live6_stop = "WATCHDOG_NOT_ARMED"
+                return CreateResult(outcome="definite_failure")
         label = ownership_label(owner)
         image = worker_image()
         body = {
@@ -284,8 +482,9 @@ class VastImageProvider(GPUProvider):
             }
         if self.cache_source == "warm_cache":
             body["volume_info"] = {
-                "mount_path": MOUNT_PATH, "create_new": False, "volume_id": VOLUME_ID,
+                "mount_path": MOUNT_PATH, "create_new": False, "volume_id": int(self.attached_volume_id),
             }
+        self.launch_trace.append("put")
         status, raw = self._request("PUT", f"https://console.vast.ai/api/v0/asks/{self.offer_id}/", body)
         if status <= 0:
             outcome, instance_id = "ambiguous", None
@@ -373,10 +572,29 @@ class VastImageProvider(GPUProvider):
 
     def confirm_cache(self, resource_id: str) -> None:
         if self.cache_source == "r2_cold_stage":
+            if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
+                self.cache_validation = "R2_FORBIDDEN"
+                raise WorkerStageError("MODEL_CACHE_INVALID")
             self._stage_r2()
-        code, out, _err = self._remote(_CACHE_CHECK, 120)
+        else:
+            worker = getattr(self, "_worker_ssh", None)
+            if worker is not None and self._host and self._port:
+                worker.stage(self._host, self._port)
+        code, out, _err = self._remote(_CACHE_CHECK, 180)
         if code != 0 or not _cache_ok(out, require_mount=self.cache_source != "r2_cold_stage"):
+            self.cache_validation = self.cache_validation or "CACHE_INCOMPLETE"
             raise WorkerStageError("MODEL_CACHE_INVALID")
+        expected = getattr(self, "verified_manifest", None)
+        if isinstance(expected, dict):
+            matched, reason = inventory_matches(out, expected)
+            if not matched:
+                self.cache_validation = reason
+                raise WorkerStageError("MODEL_CACHE_INVALID")
+            code, resolved, _err = self._remote(_CACHE_RESOLVE, 180, "MODEL_LOAD_FAILED")
+            if code != 0 or not _resolved_locally(resolved):
+                self.cache_validation = "RESOLVE_FAILED"
+                raise WorkerStageError("MODEL_CACHE_INVALID")
+        self.cache_validation = "COMPLETE"
 
     def prepare_runtime(self, resource_id: str) -> None:
         if self.runtime_ready:
@@ -402,7 +620,10 @@ class VastImageProvider(GPUProvider):
         python = "python3" if getattr(self, "runtime_ready", False) else PYTHON
         command = _generate_command(prompt, width, height, seed, python=python)
         self.commands.append(command)
-        code, out, _err = self._remote(command, 900)
+        code, out, _err = self._remote(
+            command,
+            int(PHASE_LIMITS["model_loading"][0] + PHASE_LIMITS["generating"][0]),
+        )
         if code != 0 or "PNG_READY" not in out:
             if "LOAD_FAILED" in out:
                 raise WorkerStageError("MODEL_LOAD_FAILED")
@@ -489,8 +710,28 @@ class VastImageProvider(GPUProvider):
     def _select_offer(self) -> Optional["ImageChoice"]:
         # 1. An already-running worker is reused by the controller.
         # 2. A rentable GPU on the warm-cache machine.
-        # 3. Another provider can be added later.
-        # 4. R2 cold stage only when MEDIA_ENGINE_ALLOW_COLD_STAGE is set.
+        # 3. An explicitly selected other machine cold-starts from R2.
+        # 4. A broad cold search only when MEDIA_ENGINE_ALLOW_COLD_STAGE is set.
+        verification = os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip() == "0.50"
+        selected = explicit_machine_id()
+        if verification and selected not in (None, MACHINE_ID):
+            return None
+        if selected is not None and selected != MACHINE_ID:
+            return choose_offer(
+                self._bundle_offers({
+                    "limit": 16,
+                    "type": "on-demand",
+                    "rentable": {"eq": True},
+                    "num_gpus": {"eq": 1},
+                    "machine_id": {"eq": selected},
+                    "gpu_ram": {"gte": MIN_VRAM_MIB},
+                }),
+                volume_machine=MACHINE_ID,
+                volume_ready=False,
+                max_hourly=self.limits.max_hourly_price_usd,
+                operation_budget=active_operation_budget(),
+                allow_cold_stage=True,
+            )
         warm = choose_offer(
             self._bundle_offers({
                 "limit": 16,
@@ -505,7 +746,7 @@ class VastImageProvider(GPUProvider):
             operation_budget=active_operation_budget(),
             allow_cold_stage=False,
         )
-        if warm is not None or not cold_stage_allowed():
+        if verification or warm is not None or not cold_stage_allowed():
             return warm
         return choose_offer(
             self._bundle_offers({
@@ -535,6 +776,9 @@ class VastImageProvider(GPUProvider):
         return offers if isinstance(offers, list) else []
 
     def _stage_r2(self) -> None:
+        if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
+            self.cache_validation = "R2_FORBIDDEN"
+            raise WorkerStageError("MODEL_CACHE_INVALID")
         from media_engine.engines.image import model_cache, qwen_remote, r2_cache
         from media_engine.providers.phase2d import r2_worker_env
         from media_engine.providers.vast_ssh import WorkerSSH
@@ -847,6 +1091,15 @@ def supports_bf16(name: str) -> bool:
     return any(token in compact for token in allowed)
 
 
+def explicit_machine_id() -> Optional[int]:
+    """An operator-selected machine. Empty keeps the warm-cache machine preferred."""
+    raw = os.environ.get("MEDIA_ENGINE_MACHINE_ID", "").strip()
+    if not raw.isdigit():
+        return None
+    machine = int(raw)
+    return machine if machine > 0 else None
+
+
 def cold_stage_allowed() -> bool:
     """Cold copy is off unless an operator sets MEDIA_ENGINE_ALLOW_COLD_STAGE."""
     value = os.environ.get("MEDIA_ENGINE_ALLOW_COLD_STAGE", "").strip().casefold()
@@ -1087,9 +1340,7 @@ def choose_offer(
         inet = 0.0
         transfer = 0.0
         before = Decimal("0")
-        if on_warm:
-            seconds = float(OVERHEAD_SECONDS)
-        else:
+        if not on_warm:
             try:
                 free = float(row.get("disk_space") or 0)
                 inet = float(row.get("inet_down") or 0)
@@ -1103,7 +1354,10 @@ def choose_offer(
         except (WorkerStageError, TypeError, ValueError):
             continue
         if on_warm:
-            projected = (hourly * Decimal(str(seconds)) / Decimal(3600)).quantize(Decimal("0.000001"))
+            window = warm_verify_window(hourly, operation_budget)
+            if not window["fits"]:
+                continue
+            projected = window["work_cost"]
             before = projected
         else:
             planned = plan_cold_stage(hourly, inet)
@@ -1164,6 +1418,23 @@ def _hourly(row: dict, disk_gb: int) -> Decimal:
     return amount
 
 
+def inventory_matches(text: str, expected: dict) -> tuple[bool, str]:
+    """Compare a read-only worker inventory with the offline cache validator."""
+    payload = last_json_object(text)
+    if not isinstance(payload, dict):
+        return False, "CACHE_INCOMPLETE"
+    from media_engine.engines.image.cache_validation import assess_inventory
+    report = assess_inventory(payload, expected)
+    return report["reason"] == "COMPLETE", report["reason"]
+
+
+def _resolved_locally(text: str) -> bool:
+    payload = last_json_object(text)
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("resolved") is True and payload.get("wrote") is False
+
+
 def _cache_ok(text: str, *, require_mount: bool = True) -> bool:
     line = ""
     for item in text.splitlines():
@@ -1188,11 +1459,31 @@ def _cache_ok(text: str, *, require_mount: bool = True) -> bool:
 _CACHE_CHECK = r"""python3 - << 'PY'
 import json, os, sys
 sys.path.insert(0, "/workspace")
-manifest = json.load(open("/models/%s"))
+manifest_path = "/models/%s"
+try:
+    manifest = json.load(open(manifest_path))
+except Exception:
+    print(json.dumps({"state": "MISSING", "mount": os.path.ismount("/models"), "entries": []}))
+    raise SystemExit(0)
 state = manifest.get("state")
+entries = []
 try:
     import model_cache
     state = model_cache.assess_cache(model_cache.Path("/models"))
+    revision = str(manifest.get("revision") or "")
+    snapshot = model_cache.snapshot_dir(model_cache.Path("/models"), revision)
+    files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        relative = str(entry.get("path") or "")
+        target = snapshot / relative
+        item = {"path": relative, "exists": target.exists()}
+        if target.exists():
+            item["size"] = target.stat().st_size
+            if target.is_symlink():
+                item["link"] = os.readlink(target)
+        entries.append(item)
 except Exception:
     pass
 print(json.dumps({
@@ -1202,8 +1493,26 @@ print(json.dumps({
     "files": manifest.get("expected_file_count"),
     "bytes": manifest.get("expected_total_bytes"),
     "mount": os.path.ismount("/models"),
+    "entries": entries,
 }))
 PY""" % MANIFEST_NAME
+
+_CACHE_RESOLVE = r"""python3 - << 'PY'
+import json, os, sys
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HOME"] = "/models/hf-cache"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "/models/hf-cache"
+sys.path.insert(0, "/workspace")
+from pathlib import Path
+before = Path("/models/phase2d-cache.json").stat().st_mtime_ns
+from huggingface_hub import snapshot_download
+import model_cache
+local = model_cache.prepare_generation(Path("/models"), snapshot_download)
+after = Path("/models/phase2d-cache.json").stat().st_mtime_ns
+print(json.dumps({"resolved": True, "local": local, "wrote": before != after}))
+PY"""
 
 _R2_SYNC = r"""
 set -eu
@@ -1213,10 +1522,13 @@ set -a
 set +a
 printf '%s\n' '{"cache_mount":"/models"}' > /workspace/phase2d_job.json
 rm -f /workspace/cache-sync.exit /workspace/r2-sync-progress.json
-nohup sh -c 'PHASE2D_CACHE_SYNC_SECONDS=5000 python3 /workspace/qwen_remote.py cache-sync > /workspace/cache-sync.log 2>&1; echo $? > /workspace/cache-sync.exit' >/dev/null 2>&1 &
+nohup sh -c 'PHASE2D_CACHE_SYNC_SECONDS=__CACHE_SYNC_SECONDS__ python3 /workspace/qwen_remote.py cache-sync > /workspace/cache-sync.log 2>&1; echo $? > /workspace/cache-sync.exit' >/dev/null 2>&1 &
 echo $! > /workspace/cache-sync.pid
 echo STARTED
 """
+_R2_SYNC = _R2_SYNC.replace(
+    "__CACHE_SYNC_SECONDS__", str(int(PHASE_LIMITS["cache_staging"][0])),
+)
 
 _CACHE_PROGRESS = "cat /workspace/r2-sync-progress.json 2>/dev/null || true"
 _CACHE_EXIT = "if [ -f /workspace/cache-sync.exit ]; then cat /workspace/cache-sync.exit; else echo RUNNING; fi"

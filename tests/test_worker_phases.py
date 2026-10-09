@@ -14,21 +14,30 @@ from media_engine.providers.phase_clock import PHASE_LIMITS, PhaseWatch, note_tr
 from media_engine.providers.vast_image import (
     MACHINE_ID,
     VOLUME_ID,
+    _R2_SYNC,
     _generate_command,
     LOCAL_HEALTH_COMMAND,
     PORT_MAP_GRACE_SECONDS,
+    active_operation_budget,
+    decide_staging_budget,
+    half_dollar_offer_allowed,
+    inventory_matches,
     choose_offer,
     classify_connect_failure,
     classify_readiness,
     cold_stage_allowed,
+    explicit_machine_id,
     parse_health_output,
     pinned_worker_reference,
     plan_cold_stage,
+    safe_runtime_seconds,
+    session_fits,
+    warm_verify_window,
     worker_http_endpoint,
     worker_image,
-    decide_staging_budget,
     VastImageProvider,
 )
+from media_engine.providers.vast_watchdog import arm_watchdog, instances_to_stop, run_until_stopped
 
 
 class StagingBudgetTests(unittest.TestCase):
@@ -452,6 +461,323 @@ class PhaseClockTests(unittest.TestCase):
         self.assertIsNotNone(last["remaining_seconds"])
         self.assertNotIn("VAST_API_KEY", json.dumps(last))
 
+    def test_one_dollar_cap_stays_unless_this_run_is_authorized(self) -> None:
+        previous_auth = os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD")
+        previous_studio = os.environ.get("STUDIO_GPU_BUDGET_USD")
+        os.environ.pop("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", None)
+        os.environ.pop("STUDIO_GPU_BUDGET_USD", None)
+
+        def restore() -> None:
+            if previous_auth is None:
+                os.environ.pop("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", None)
+            else:
+                os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = previous_auth
+            if previous_studio is None:
+                os.environ.pop("STUDIO_GPU_BUDGET_USD", None)
+            else:
+                os.environ["STUDIO_GPU_BUDGET_USD"] = previous_studio
+
+        self.addCleanup(restore)
+        self.assertEqual(active_operation_budget(), Decimal("1.00"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "9.00"
+        self.assertEqual(active_operation_budget(), Decimal("1.00"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "3.00"
+        self.assertEqual(active_operation_budget(), Decimal("3.00"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "0.50"
+        self.assertEqual(active_operation_budget(), Decimal("0.50"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "0.49"
+        self.assertEqual(active_operation_budget(), Decimal("1.00"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "0.51"
+        self.assertEqual(active_operation_budget(), Decimal("1.00"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "0.50"
+        os.environ["STUDIO_GPU_BUDGET_USD"] = "0.40"
+        self.assertEqual(active_operation_budget(), Decimal("0.40"))
+        os.environ.pop("STUDIO_GPU_BUDGET_USD", None)
+        window = warm_verify_window(Decimal("0.375"), Decimal("0.50"))
+        self.assertTrue(window["fits"])
+        self.assertEqual(window["network_usd"], Decimal("0"))
+        self.assertLessEqual(window["work_cost"] + window["reserve_usd"], Decimal("0.50"))
+        self.assertGreaterEqual(window["safe_seconds"], window["required_seconds"])
+        self.assertFalse(warm_verify_window(Decimal("2.00"), Decimal("0.50"))["fits"])
+        self.assertIsNone(choose_offer(
+            [_offer(8, MACHINE_ID, inet_down=100, dph_base="2.00")],
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=Decimal("3.00"),
+            operation_budget=Decimal("0.50"),
+        ))
+        accepted = choose_offer(
+            [_offer(8, MACHINE_ID, inet_down=100, dph_base="0.36")],
+            volume_machine=MACHINE_ID,
+            volume_ready=True,
+            max_hourly=Decimal("0.375"),
+            operation_budget=active_operation_budget(),
+        )
+        self.assertIsNotNone(accepted)
+        assert accepted is not None
+        self.assertEqual(accepted.source, "warm_cache")
+        self.assertLessEqual(accepted.hourly, Decimal("0.375"))
+        same = warm_verify_window(accepted.hourly, Decimal("0.50"))
+        row = {"id": 77, "machine_id": MACHINE_ID, "label": "media-engine:daidoi-live6"}
+        self.assertEqual(
+            instances_to_stop(
+                [row], machine_id=MACHINE_ID, now=same["safe_seconds"],
+                deadline=same["safe_seconds"], heartbeat_age=0,
+            ),
+            ["77"],
+        )
+        self.assertEqual(
+            instances_to_stop(
+                [row], machine_id=MACHINE_ID, now=same["safe_seconds"] - 1,
+                deadline=same["safe_seconds"], heartbeat_age=0,
+            ),
+            [],
+        )
+        short = safe_runtime_seconds(
+            Decimal("0.5193"),
+            network_ceiling=Decimal("0.15"),
+            reserve=Decimal("0.50"),
+            ceiling=Decimal("1.00"),
+        )
+        viable = dict(transfer_seconds=13698, model_load_seconds=600, inference_seconds=600)
+        self.assertFalse(session_fits(short, **viable))
+        covered = safe_runtime_seconds(
+            Decimal("0.5193"),
+            network_ceiling=Decimal("0.15"),
+            reserve=Decimal("0.50"),
+            ceiling=Decimal("3.00"),
+        )
+        self.assertTrue(session_fits(covered, **viable))
+
+    def test_half_dollar_create_attaches_only_the_warm_volume(self) -> None:
+        names = ("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "MEDIA_ENGINE_FORBID_R2_STAGE")
+        previous = {name: os.environ.get(name) for name in names}
+
+        def restore() -> None:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.addCleanup(restore)
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "0.50"
+        os.environ["MEDIA_ENGINE_FORBID_R2_STAGE"] = "1"
+        puts: list[dict] = []
+
+        def transport(method, url, body, headers):
+            if method == "PUT":
+                puts.append(json.loads(body.decode("utf-8")))
+                return 200, b'{"success": true, "new_contract": 9}'
+            return 200, b'{"instances": []}'
+
+        refused = VastImageProvider(api_key="fixture-key", transport=transport)
+        refused.offer_id = "1"
+        refused.cache_source = "r2_cold_stage"
+        refused.machine_id = "56199"
+        refused.gpu_model = "NVIDIA L40"
+        refused.hourly_amount = Decimal("0.30")
+        refused.disk_gb = 140
+        self.assertEqual(refused.create("daidoi-live6").outcome, "definite_failure")
+        self.assertEqual(puts, [])
+        self.assertFalse(half_dollar_offer_allowed(refused))
+
+        allowed = VastImageProvider(api_key="fixture-key", transport=transport)
+        allowed.offer_id = "30565040"
+        allowed.cache_source = "warm_cache"
+        allowed.machine_id = str(MACHINE_ID)
+        allowed.gpu_model = "RTX A6000"
+        allowed.hourly_amount = Decimal("0.374")
+        allowed.disk_gb = 40
+        from media_engine.safety.spend_grant import SpendGrant
+        moment = 1_000.0
+        allowed._now = lambda: moment
+        allowed.execution_id = "live6-test"
+        allowed.execution_grant = SpendGrant(
+            execution_id="live6-test",
+            ceiling_usd=Decimal("0.50"),
+            max_instances=1,
+            issued_at=moment,
+            expires_at=moment + 500,
+            machine_id=MACHINE_ID,
+        )
+        allowed.runtime = Path(os.environ.get("TMPDIR", "/tmp")) / "live6-watchdog-test"
+
+        class _Proc:
+            pid = 91
+
+        allowed._watchdog_popen = lambda *_args, **_kwargs: _Proc()
+        created = allowed.create("daidoi-live6")
+        self.assertEqual(created.outcome, "created")
+        self.assertEqual(allowed.launch_trace, ["watchdog", "put"])
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0]["disk"], 40)
+        self.assertEqual(puts[0]["volume_info"], {
+            "mount_path": "/models", "create_new": False, "volume_id": VOLUME_ID,
+        })
+        self.assertNotIn("r2", json.dumps(puts[0]).casefold())
+
+        costly = VastImageProvider(api_key="fixture-key", transport=transport)
+        costly.offer_id = "30565040"
+        costly.cache_source = "warm_cache"
+        costly.machine_id = str(MACHINE_ID)
+        costly.gpu_model = "RTX A6000"
+        costly.hourly_amount = Decimal("0.376")
+        costly.disk_gb = 40
+        self.assertEqual(costly.create("daidoi-live6").outcome, "definite_failure")
+        self.assertEqual(len(puts), 1)
+
+    def test_verified_inventory_rejects_a_size_or_hash_mismatch(self) -> None:
+        from media_engine.engines.image.model_cache import QWEN_CACHE_MIN_BYTES, QWEN_FILE_COUNT
+        from media_engine.providers.vast_image import REVISION, REPO_ID
+        size = QWEN_CACHE_MIN_BYTES // QWEN_FILE_COUNT
+        last = QWEN_CACHE_MIN_BYTES - size * (QWEN_FILE_COUNT - 1)
+        files = []
+        entries = []
+        for index in range(QWEN_FILE_COUNT):
+            name = "model_index.json" if index == 0 else f"weights/shard-{index}.safetensors"
+            nbytes = last if index == QWEN_FILE_COUNT - 1 else size
+            digest = f"{index:064x}"
+            files.append({"path": name, "bytes": nbytes, "sha256": digest})
+            entries.append({
+                "path": name, "exists": True, "size": nbytes, "link": "../../blobs/" + digest,
+            })
+        expected = {
+            "revision": REVISION,
+            "repo_id": REPO_ID,
+            "expected_file_count": QWEN_FILE_COUNT,
+            "expected_total_bytes": QWEN_CACHE_MIN_BYTES,
+            "files": files,
+        }
+        payload = {"state": "COMPLETE", "mount": True, "revision": REVISION, "entries": entries}
+        self.assertEqual(inventory_matches(json.dumps(payload), expected), (True, "COMPLETE"))
+        entries[2]["size"] = int(entries[2]["size"]) + 1
+        self.assertEqual(inventory_matches(json.dumps(payload), expected)[1], "SIZE_MISMATCH")
+        entries[2]["size"] = int(entries[2]["size"]) - 1
+        entries[2]["link"] = "../../blobs/" + ("f" * 64)
+        self.assertEqual(inventory_matches(json.dumps(payload), expected)[1], "HASH_MISMATCH")
+        entries[2]["link"] = "../../blobs/" + f"{2:064x}"
+        entries[4]["exists"] = False
+        self.assertEqual(inventory_matches(json.dumps(payload), expected)[1], "CACHE_INCOMPLETE")
+
+    def test_watchdog_stops_at_the_deadline_and_on_a_second_instance(self) -> None:
+        rows = [{
+            "id": 77,
+            "machine_id": 56199,
+            "label": "media-engine:daidoi-live4",
+        }, {
+            "id": 88,
+            "machine_id": 47281,
+            "label": "media-engine:other",
+        }]
+        self.assertEqual(
+            instances_to_stop(rows, machine_id=56199, now=100, deadline=200, heartbeat_age=1),
+            [],
+        )
+        self.assertEqual(
+            instances_to_stop(rows, machine_id=56199, now=200, deadline=200, heartbeat_age=1),
+            ["77"],
+        )
+        self.assertEqual(
+            instances_to_stop(rows, machine_id=56199, now=50, deadline=200, heartbeat_age=301),
+            ["77"],
+        )
+        duplicate = rows + [{
+            "id": 78,
+            "machine_id": 56199,
+            "label": "media-engine:daidoi-live4",
+        }]
+        self.assertEqual(
+            instances_to_stop(duplicate, machine_id=56199, now=1, deadline=9999, heartbeat_age=0),
+            ["77", "78"],
+        )
+        stopped = []
+        spec_dir = Path(self.id().replace(".", "_"))
+        root = Path("runtime") / "watchdog-test" / spec_dir.name
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: None)
+        heartbeat = root / "heartbeat"
+        stop = root / "stop"
+        heartbeat.write_text("1", encoding="utf-8")
+        state = {"now": 1_000.0, "rows": [rows[0]]}
+
+        def fetch():
+            return state["rows"]
+
+        outcome = run_until_stopped(
+            {
+                "machine_id": 56199,
+                "safe_seconds": 10,
+                "heartbeat": str(heartbeat),
+                "stop": str(stop),
+                "stale_after": 300,
+                "poll_seconds": 1,
+            },
+            fetch=fetch,
+            delete=stopped.append,
+            now=lambda: state["now"],
+            sleep=lambda _seconds: state.__setitem__("now", state["now"] + 10),
+        )
+        self.assertEqual(stopped, ["77"])
+        self.assertEqual(outcome["stopped"], ["77"])
+
+    def test_a_second_watchdog_does_not_start(self) -> None:
+        spec = Path("runtime") / "watchdog-test" / "single.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("{}", encoding="utf-8")
+        lock = spec.with_name(spec.name + ".lock")
+        lock.unlink(missing_ok=True)
+        calls = []
+
+        class _Proc:
+            pid = 4242
+
+        def popen(*args, **kwargs):
+            calls.append(kwargs)
+            return _Proc()
+
+        from media_engine.providers import vast_watchdog
+        previous = vast_watchdog._alive
+        vast_watchdog._alive = lambda pid: pid == 4242
+        self.addCleanup(lambda: setattr(vast_watchdog, "_alive", previous))
+        first = arm_watchdog(spec, popen=popen)
+        second = arm_watchdog(spec, popen=popen)
+        self.assertEqual(first, 4242)
+        self.assertEqual(second, 4242)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["start_new_session"])
+
+    def test_second_create_does_not_rent_another_gpu(self) -> None:
+        previous = os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD")
+        os.environ.pop("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", None)
+
+        def restore() -> None:
+            if previous is None:
+                os.environ.pop("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", None)
+            else:
+                os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = previous
+
+        self.addCleanup(restore)
+        puts = []
+
+        def transport(method, url, body, headers):
+            if method == "PUT":
+                puts.append(json.loads(body.decode("utf-8")))
+                return 200, b'{"success": true, "new_contract": 9}'
+            return 200, b'{"instances": []}'
+
+        provider = VastImageProvider(api_key="fixture-key", transport=transport)
+        provider.offer_id = "555"
+        provider.disk_gb = 140
+        provider.cache_source = "r2_cold_stage"
+        provider.machine_id = "56199"
+        first = provider.create("daidoi-live4")
+        second = provider.create("daidoi-live4")
+        self.assertEqual(first.outcome, "created")
+        self.assertEqual(second.outcome, "definite_failure")
+        self.assertEqual(len(puts), 1)
+        self.assertNotIn("volume_info", puts[0])
+
     def test_runtime_ready_image_skips_pip(self) -> None:
         seen: list[str] = []
 
@@ -521,6 +847,46 @@ class PhaseClockTests(unittest.TestCase):
         assert choice is not None
         self.assertEqual(choice.source, "warm_cache")
         self.assertEqual(choice.machine_id, MACHINE_ID)
+
+    def test_explicit_machine_cold_starts_without_the_warm_volume(self) -> None:
+        self.assertIsNone(explicit_machine_id())
+        names = (
+            "MEDIA_ENGINE_MACHINE_ID", "R2_ENDPOINT", "R2_BUCKET",
+            "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+        )
+        previous = {name: os.environ.get(name) for name in names}
+        self.addCleanup(_restore_env, previous)
+        os.environ["MEDIA_ENGINE_MACHINE_ID"] = "151326"
+        for name in names[1:]:
+            os.environ[name] = "unit"
+        sent: list[dict] = []
+
+        def transport(method, url, body, headers):
+            if method == "GET" and "volumes" in url:
+                payload = {"volumes": [{"id": VOLUME_ID, "machine_id": MACHINE_ID}]}
+                return 200, json.dumps(payload).encode()
+            if method == "POST" and url.endswith("/bundles/"):
+                query = json.loads(body.decode("utf-8"))
+                self.assertEqual(query["machine_id"], {"eq": 151326})
+                return 200, json.dumps({"offers": [
+                    _offer(21, 151326, inet_down=8000, dph_base="0.20"),
+                ]}).encode()
+            sent.append(json.loads(body.decode("utf-8")))
+            return 200, b'{"success": true, "new_contract": 9}'
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, now=Clock().now, sleep=lambda _s: None,
+            ssh_run=lambda *args: (_ for _ in ()).throw(AssertionError("ssh")),
+        )
+        provider.quote("nahaber")
+        self.assertEqual(provider.machine_id, "151326")
+        self.assertEqual(provider.cache_source, "r2_cold_stage")
+        self.assertEqual(provider.disk_gb, 140)
+        provider.create("nahaber")
+        self.assertNotIn("volume_info", sent[0])
+        self.assertEqual(sent[0]["disk"], 140)
+
+    def test_template_has_no_weights(self) -> None:
         root = Path(__file__).resolve().parents[1]
         docker = (root / "deploy/worker/Dockerfile").read_text(encoding="utf-8")
         template = json.loads((root / "deploy/worker/vast_template.json").read_text(encoding="utf-8"))
@@ -1238,7 +1604,6 @@ class PortableWorkerTests(unittest.TestCase):
                 self.assertEqual(provider.terminated, ["42"])
                 self.assertEqual(len(books.reserves), 1)
                 self.assertEqual(books.settlements, books.reserves)
-
 
     def test_loading_instance_keeps_the_port_grace(self) -> None:
         clock = Clock()

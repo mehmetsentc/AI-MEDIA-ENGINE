@@ -148,6 +148,68 @@ def validate_cache(mount: Path, expected: dict | None = None) -> dict:
     return report
 
 
+def assess_inventory(payload: dict, expected: dict) -> dict:
+    """Compare a worker inventory with a manifest. This does not read or download files."""
+    if not isinstance(payload, dict) or not isinstance(expected, dict):
+        return _inventory("CACHE_INCOMPLETE", "CACHE_INCOMPLETE")
+    if payload.get("mount") is not True:
+        return _inventory("CACHE_PATH_MISSING", "MOUNT_MISSING")
+    if str(payload.get("revision") or "") != REVISION or str(expected.get("revision") or "") != REVISION:
+        return _inventory("CACHE_REVISION_MISMATCH", "REVISION_MISMATCH")
+    if payload.get("state") != "COMPLETE":
+        return _inventory("CACHE_INCOMPLETE", "CACHE_INCOMPLETE")
+    if expected.get("repo_id") not in (None, "Qwen/Qwen-Image"):
+        return _inventory("CACHE_MANIFEST_INVALID", "CACHE_INCOMPLETE")
+    files = expected.get("files")
+    from media_engine.engines.image.model_cache import QWEN_CACHE_MIN_BYTES, QWEN_FILE_COUNT
+    if (
+        expected.get("expected_file_count") != QWEN_FILE_COUNT
+        or expected.get("expected_total_bytes") != QWEN_CACHE_MIN_BYTES
+        or not isinstance(files, list)
+        or len(files) != QWEN_FILE_COUNT
+    ):
+        return _inventory("CACHE_MANIFEST_INVALID", "CACHE_INCOMPLETE")
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        return _inventory("CACHE_INCOMPLETE", "CACHE_INCOMPLETE")
+    entries = {
+        str(item.get("path")): item
+        for item in raw_entries
+        if isinstance(item, dict) and item.get("path")
+    }
+    if len(entries) != QWEN_FILE_COUNT:
+        return _inventory("CACHE_INCOMPLETE", "CACHE_INCOMPLETE")
+    total = 0
+    for item in files:
+        if not isinstance(item, dict):
+            return _inventory("CACHE_MANIFEST_INVALID", "CACHE_INCOMPLETE")
+        path = str(item.get("path") or "")
+        got = entries.get(path)
+        if got is None or got.get("exists") is not True:
+            return _inventory("CACHE_INCOMPLETE", "CACHE_INCOMPLETE")
+        size = got.get("size")
+        if size != item.get("bytes"):
+            return _inventory("CACHE_INCOMPLETE", "SIZE_MISMATCH")
+        total += int(size)
+        digest = item.get("sha256") or item.get("blob_sha256")
+        if isinstance(digest, str) and digest:
+            link = str(got.get("link") or "")
+            if digest not in link:
+                return _inventory("CACHE_INCOMPLETE", "HASH_MISMATCH")
+    if total != QWEN_CACHE_MIN_BYTES:
+        return _inventory("CACHE_INCOMPLETE", "SIZE_MISMATCH")
+    names = set(entries)
+    if "model_index.json" not in names:
+        return _inventory("CACHE_INCOMPLETE", "CACHE_INCOMPLETE")
+    if not any(name.endswith(".safetensors") or name.endswith(".safetensors.index.json") for name in names):
+        return _inventory("CACHE_INCOMPLETE", "CACHE_INCOMPLETE")
+    return _inventory("CACHE_COMPLETE", "COMPLETE", complete=True)
+
+
+def _inventory(status: str, reason: str, *, complete: bool = False) -> dict:
+    return {"status": status, "reason": reason, "complete": complete, "mutated": False}
+
+
 def qwen_contract(manifest: dict) -> bool:
     """True when a manifest document matches the known Qwen revision and size."""
     files = manifest.get("files")
