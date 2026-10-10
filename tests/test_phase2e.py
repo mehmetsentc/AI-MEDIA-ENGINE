@@ -25,7 +25,6 @@ from media_engine.providers.vast_image import (
     MACHINE_ID,
     VOLUME_ID,
     _R2_SYNC,
-    _RUNTIME_INSTALL,
     _generate_command,
     choose_offer,
     cold_stage_allowed,
@@ -382,13 +381,14 @@ class Phase2ETests(unittest.TestCase):
         with self.assertRaises(WorkerStageError) as caught:
             provider.quote("nahaber")
         self.assertEqual(caught.exception.code, "PROVIDER_CAPACITY_UNAVAILABLE")
-        command = _generate_command("A terrace", 1024, 1024, 5)
+        from media_engine.providers.runtime_python import RUNTIME_SELECT_COMMAND
+        command = _generate_command("A terrace", 1024, 1024, 5, python="python3")
         self.assertIn("HF_HUB_OFFLINE=1", command)
         self.assertNotIn("R2_", command)
         self.assertNotIn("huggingface.co", command)
-        self.assertIn("/workspace/phase2d-venv/bin/python -m pip", _RUNTIME_INSTALL)
-        self.assertNotIn("python3 -m pip", _RUNTIME_INSTALL)
-        self.assertNotIn("--break-system-packages", _RUNTIME_INSTALL)
+        self.assertNotIn("pip install", RUNTIME_SELECT_COMMAND)
+        self.assertNotIn("python3 -m venv", RUNTIME_SELECT_COMMAND)
+        self.assertNotIn("--break-system-packages", RUNTIME_SELECT_COMMAND)
 
     def test_cache_must_be_complete_before_runtime(self) -> None:
         def ssh(host, port, command, timeout):

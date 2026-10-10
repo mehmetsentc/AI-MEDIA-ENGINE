@@ -779,12 +779,13 @@ class PhaseClockTests(unittest.TestCase):
         self.assertNotIn("volume_info", puts[0])
 
     def test_runtime_ready_image_skips_pip(self) -> None:
+        from media_engine.providers.runtime_python import pinned_image_selection
         seen: list[str] = []
 
         def ssh(host, port, command, timeout):
             seen.append(command)
-            if "runtime-ready" in command:
-                return 0, "RUNTIME_READY\n", ""
+            if "RUNTIME_PYTHON_SELECT" in command:
+                return 0, json.dumps(pinned_image_selection()) + "\n", ""
             return 0, "", ""
 
         provider = VastImageProvider(
@@ -793,13 +794,17 @@ class PhaseClockTests(unittest.TestCase):
             now=Clock().now,
             sleep=lambda _s: None,
             ssh_run=ssh,
+            runtime=Path(tempfile.mkdtemp()),
         )
         provider._host = "worker"
         provider._port = "22"
+        provider.runtime_ready = True
         provider.prepare_runtime("1")
+        self.assertEqual(provider.python_executable, "python3")
         self.assertTrue(provider.runtime_ready)
         self.assertFalse(any("pip install" in command for command in seen))
-        command = _generate_command("a terrace", 1024, 1024, 3, python="python3")
+        self.assertFalse(any("python3 -m venv" in command for command in seen))
+        command = _generate_command("a terrace", 1024, 1024, 3, python=provider.python_executable)
         self.assertIn("python3 -u /workspace/qwen_remote.py generate", command)
         self.assertNotIn("phase2d-venv", command)
 
@@ -1196,11 +1201,24 @@ class PortableWorkerTests(unittest.TestCase):
         provider.boot("7")
         self.assertEqual(provider.worker_state, "worker_ready")
         self.assertTrue(provider.runtime_ready)
+        self.assertEqual(provider.python_executable, "")
         self.assertEqual(ssh_calls["n"], 0)
         self.assertIn("http://203.0.113.10:18080/health", seen_urls)
         self.assertFalse(any(url.endswith(":8080/health") for url in seen_urls))
+        provider._host = "203.0.113.10"
+        provider._port = "22"
+
+        def ssh(host, port, command, timeout):
+            ssh_calls["n"] += 1
+            if "RUNTIME_PYTHON_SELECT" in command:
+                from media_engine.providers.runtime_python import pinned_image_selection
+                return 0, json.dumps(pinned_image_selection()) + "\n", ""
+            return 0, "", ""
+
+        provider._ssh_run = ssh
         provider.prepare_runtime("7")
-        self.assertEqual(ssh_calls["n"], 0)
+        self.assertEqual(ssh_calls["n"], 1)
+        self.assertEqual(provider.python_executable, "python3")
 
     def test_readiness_timeout_does_not_use_ssh(self) -> None:
         clock = Clock()

@@ -339,6 +339,9 @@ class Live6IntegrationTests(unittest.TestCase):
             return 0, json.dumps(_inventory(_manifest())) + "\n", ""
         if "snapshot_download" in command:
             return 0, json.dumps({"resolved": True, "wrote": False}) + "\n", ""
+        if "RUNTIME_PYTHON_SELECT" in command:
+            from media_engine.providers.runtime_python import pinned_image_selection
+            return 0, json.dumps(pinned_image_selection()) + "\n", ""
         if "QwenImagePipeline" in command:
             return 0, "QwenImagePipeline\n", ""
         if "qwen_remote.py generate" in command:

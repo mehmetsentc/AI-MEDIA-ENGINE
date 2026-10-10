@@ -26,6 +26,15 @@ def _write_report(report: dict) -> None:
     Path("/workspace/phase2d_report.json").write_text(json.dumps(report), encoding="utf-8")
 
 
+def _record_exception(report: dict, error: str, exc: BaseException) -> None:
+    """Keep the exception class. The message is one short line for the host log."""
+    report["error"] = error
+    report["detail"] = type(exc).__name__
+    report["exception"] = type(exc).__name__
+    report["exception_detail"] = " ".join(str(exc).split())[:180]
+    _write_report(report)
+
+
 def main() -> int:
     phase = sys.argv[1] if len(sys.argv) > 1 else "all"
     job = json.loads(Path("/workspace/phase2d_job.json").read_text(encoding="utf-8"))
@@ -72,9 +81,7 @@ def main() -> int:
         import diffusers
         import transformers
     except Exception as exc:
-        report["error"] = "IMPORT_FAILED"
-        report["detail"] = type(exc).__name__
-        _write_report(report)
+        _record_exception(report, "IMPORT_FAILED", exc)
         return 1
     report["torch"] = torch.__version__
     report["cuda"] = torch.version.cuda
@@ -109,12 +116,11 @@ def main() -> int:
         if time.perf_counter() - load_started > load_limit:
             report["error"] = "LOAD_FAILED"
             report["detail"] = "MODEL_LOAD_DEADLINE"
+            report["exception"] = "MODEL_LOAD_DEADLINE"
             _write_report(report)
             return 1
     except Exception as exc:
-        report["error"] = "LOAD_FAILED"
-        report["detail"] = type(exc).__name__
-        _write_report(report)
+        _record_exception(report, "LOAD_FAILED", exc)
         return 1
     report["load_seconds"] = round(time.perf_counter() - load_started, 3)
     report["peak_rss_kb"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)

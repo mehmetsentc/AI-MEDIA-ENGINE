@@ -277,8 +277,6 @@ STAGING_WARMUP_SECONDS = 60.0
 LINE_FRACTION = 0.25
 BUNDLES = "https://console.vast.ai/api/v0/bundles/"
 VOLUMES = "https://console.vast.ai/api/v0/volumes/?owner=me"
-VENV = "/workspace/phase2d-venv"
-PYTHON = VENV + "/bin/python"
 
 Transport = Callable[[str, str, bytes, dict[str, str]], tuple[int, bytes]]
 SSHRun = Callable[[str, str, str, int], tuple[int, str, str]]
@@ -349,6 +347,9 @@ class VastImageProvider(GPUProvider):
         self.verified_manifest: Optional[dict] = None
         self.cache_validation = ""
         self.runtime_ready = False
+        self.python_executable = ""
+        self.runtime_python_version = ""
+        self.runtime_dependencies: list = []
         self.worker_state = ""
         self.health_transport = ""
         self.health_error = ""
@@ -869,6 +870,52 @@ class VastImageProvider(GPUProvider):
         reason = assess_manifest_body(body)
         return reason or True
 
+    def _select_runtime_python(self) -> None:
+        from media_engine.providers.runtime_python import (
+            RUNTIME_SELECT_COMMAND,
+            accepted_executable,
+            parse_runtime_selection,
+        )
+        code, out, err = self._remote(RUNTIME_SELECT_COMMAND, 60, "RUNTIME_TIMEOUT")
+        document = parse_runtime_selection(out)
+        self.runtime_dependencies = list(document.get("candidates") or [])
+        self.runtime_python_version = str(document.get("version") or "")
+        selected = accepted_executable(document)
+        if code != 0 or not selected:
+            self._preserve_runtime_evidence(
+                import_exit=str(code),
+                stderr=err,
+                exception=str(document.get("failure") or "NO_INTERPRETER"),
+            )
+            raise WorkerStageError("RUNTIME_PREPARE_FAILED")
+        self.python_executable = selected
+        self.runtime_ready = True
+
+    def _preserve_runtime_evidence(self, *, import_exit: str, stderr: str, exception: str) -> None:
+        from media_engine.providers.phase2d import _runtime_secrets
+        from media_engine.providers.stage_evidence import CAPTURE_TIMEOUT_SECONDS, preserve_runtime_evidence
+        preserve_runtime_evidence(
+            destination=Path(self.runtime) / "runtime-evidence.json",
+            fetch=self._fetch_runtime_text,
+            secrets=_runtime_secrets(self._api_key),
+            python_executable=self.python_executable,
+            python_version=self.runtime_python_version,
+            dependencies=self.runtime_dependencies,
+            import_exit_code=import_exit,
+            stderr=stderr,
+            model_load_exception=exception,
+            timeout_seconds=CAPTURE_TIMEOUT_SECONDS,
+        )
+
+    def _fetch_runtime_text(self) -> tuple[str, str]:
+        from media_engine.providers.stage_evidence import CAPTURE_TIMEOUT_SECONDS, REMOTE_RUNTIME_EVIDENCE
+        if self._ssh_run is None or not self._host or not self._port:
+            raise WorkerStageError("WORKER_BOOT_FAILED")
+        _code, out, err = self._ssh_run(
+            self._host, self._port, REMOTE_RUNTIME_EVIDENCE, int(CAPTURE_TIMEOUT_SECONDS),
+        )
+        return out, err
+
     def _preserve_stage_evidence(self, exit_code: str) -> None:
         from media_engine.providers.phase2d import _runtime_secrets
         from media_engine.providers.stage_evidence import CAPTURE_TIMEOUT_SECONDS, preserve_stage_evidence
@@ -1194,35 +1241,42 @@ class VastImageProvider(GPUProvider):
         self.cache_validation = "COMPLETE"
 
     def prepare_runtime(self, resource_id: str) -> None:
-        if self.runtime_ready:
+        # Health can set runtime_ready before any interpreter is known.
+        # That flag must not skip selection or imply the virtualenv exists.
+        if self.python_executable:
             return
         worker = getattr(self, "_worker_ssh", None)
         if worker is not None and self._host and self._port:
             worker.stage(self._host, self._port)
-        code, out, _err = self._remote(_RUNTIME_READY, 60, "RUNTIME_TIMEOUT")
-        if code == 0 and "RUNTIME_READY" in out:
-            self.runtime_ready = True
-            return
-        limit = int(PHASE_LIMITS["runtime_preparing"][0])
-        code, _out, _err = self._remote(_RUNTIME_INSTALL, limit, "RUNTIME_TIMEOUT")
-        if code != 0:
-            raise WorkerStageError("RUNTIME_PREPARE_FAILED")
+        self._select_runtime_python()
 
     def ensure_model(self, resource_id: str) -> None:
-        code, out, _err = self._remote(_IMPORT_CHECK, 120)
+        if not self.python_executable:
+            self._select_runtime_python()
+        from media_engine.providers.runtime_python import import_probe_command
+        command = import_probe_command(self.python_executable)
+        code, out, err = self._remote(command, 120)
         if code != 0 or "QwenImagePipeline" not in out:
+            self._preserve_runtime_evidence(import_exit=str(code), stderr=err, exception="IMPORT_FAILED")
             raise WorkerStageError("MODEL_LOAD_FAILED")
 
     def generate(self, *, prompt: str, width: int, height: int, seed: int) -> bytes:
-        python = "python3" if getattr(self, "runtime_ready", False) else PYTHON
+        python = self.python_executable
+        if not python:
+            raise WorkerStageError("RUNTIME_PREPARE_FAILED")
         command = _generate_command(prompt, width, height, seed, python=python)
         self.commands.append(command)
-        code, out, _err = self._remote(
+        code, out, err = self._remote(
             command,
             int(PHASE_LIMITS["model_loading"][0] + PHASE_LIMITS["generating"][0]),
         )
         if code != 0 or "PNG_READY" not in out:
-            if "LOAD_FAILED" in out:
+            if "LOAD_FAILED" in out or "IMPORT_FAILED" in out:
+                self._preserve_runtime_evidence(
+                    import_exit=str(code),
+                    stderr=err,
+                    exception="LOAD_FAILED" if "LOAD_FAILED" in out else "IMPORT_FAILED",
+                )
                 raise WorkerStageError("MODEL_LOAD_FAILED")
             raise WorkerStageError("GENERATION_FAILED")
         return self._fetch_png()
@@ -2130,6 +2184,8 @@ after = Path("/models/phase2d-cache.json").stat().st_mtime_ns
 print(json.dumps({"resolved": True, "local": local, "wrote": before != after}))
 PY"""
 
+# The copy runs on the image python. It does not import torch.
+# prepare_runtime selects the interpreter used for import, load, and inference.
 _R2_SYNC = r"""
 set -eu
 mkdir -p /models /workspace
@@ -2150,42 +2206,9 @@ _CACHE_PROGRESS = "cat /workspace/r2-sync-progress.json 2>/dev/null || true"
 _CACHE_EXIT = "if [ -f /workspace/cache-sync.exit ]; then cat /workspace/cache-sync.exit; else echo RUNNING; fi"
 _CACHE_KILL = "if [ -f /workspace/cache-sync.pid ]; then kill $(cat /workspace/cache-sync.pid) >/dev/null 2>&1 || true; fi"
 
-_RUNTIME_READY = (
-    "python3 -c \""
-    "import pathlib; "
-    "p=pathlib.Path('/opt/ai-media-engine/runtime-ready'); "
-    "import torch,diffusers,transformers,accelerate,safetensors; "
-    "print('RUNTIME_READY' if p.is_file() else 'MISSING')\""
-)
-
-_RUNTIME_INSTALL = f"""
-set -eu
-if ! {PYTHON} -c 'import torch,diffusers' >/dev/null 2>&1; then
-  if [ ! -x {PYTHON} ]; then
-    if ! python3 -m venv --system-site-packages {VENV}; then
-      rm -rf {VENV}
-      apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv
-      python3 -m venv --system-site-packages {VENV}
-    fi
-  fi
-  if ! {PYTHON} -c 'import torch' >/dev/null 2>&1; then
-    if [ -x /opt/conda/bin/python ] && /opt/conda/bin/python -c 'import torch' >/dev/null 2>&1; then
-      rm -rf {VENV}
-      /opt/conda/bin/python -m venv --system-site-packages {VENV}
-    fi
-  fi
-  {PYTHON} -m pip install --disable-pip-version-check 'diffusers>=0.35' transformers accelerate safetensors pillow
-fi
-{PYTHON} -c 'import torch,diffusers,transformers,accelerate,safetensors'
-"""
-
-_IMPORT_CHECK = (
-    f"{PYTHON} -c 'from diffusers import QwenImagePipeline; print(QwenImagePipeline.__name__)'"
-)
-
-
-def _generate_command(prompt: str, width: int, height: int, seed: int, python: str = PYTHON) -> str:
+def _generate_command(prompt: str, width: int, height: int, seed: int, python: str) -> str:
+    if not python or python != python.strip() or any(char in python for char in "\n\r\x00"):
+        raise WorkerStageError("RUNTIME_PREPARE_FAILED")
     if width != FIRST_WIDTH or height != FIRST_HEIGHT:
         raise WorkerStageError("GENERATION_FAILED")
     job = json.dumps({
@@ -2204,8 +2227,8 @@ def _generate_command(prompt: str, width: int, height: int, seed: int, python: s
         "HF_HOME=/models/hf-cache HUGGINGFACE_HUB_CACHE=/models/hf-cache "
         "PHASE2D_MODEL_LOAD_SECONDS=1200 PHASE2D_GENERATION_SECONDS=600 && "
         f"if [ ! -f /workspace/qwen_remote.py ]; then echo MISSING_REMOTE; exit 3; fi && "
-        f"{python} -u /workspace/qwen_remote.py generate && "
-        "python3 -c 'import struct; d=open(\"/workspace/phase2d_output.png\",\"rb\").read(); "
+        f"{shlex.quote(python)} -u /workspace/qwen_remote.py generate && "
+        f"{shlex.quote(python)} -c 'import struct; d=open(\"/workspace/phase2d_output.png\",\"rb\").read(); "
         "assert d[:8]==b\"\\x89PNG\\r\\n\\x1a\\n\" and len(d)>0; "
         "w,h=struct.unpack(\">II\", d[16:24]); assert (w,h)==(1024,1024); print(\"PNG_READY\", len(d))'"
     )
