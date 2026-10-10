@@ -19,6 +19,33 @@ from media_engine.platform.repository import PlatformBlocked
 from media_engine.platform.service import Platform
 
 
+def grant_test_credits(
+    platform: Platform,
+    *,
+    admin_id: str,
+    user_id: str,
+    credits: int,
+    idempotency_key: str,
+) -> str:
+    """Add test credits. Jobs still reserve and settle at the existing price."""
+    if os.environ.get("MEDIA_ENGINE_ALLOW_TEST_CREDITS") != "1":
+        raise PlatformBlocked("TEST_CREDITS_DISABLED")
+    admin = os.environ.get("MEDIA_ENGINE_TEST_CREDIT_ADMIN", "")
+    if not admin or admin != admin_id:
+        raise PlatformBlocked("ADMIN_REQUIRED")
+    target = str(getattr(platform.repo, "db_path", ""))
+    production = type(platform.repo).__name__ != "SqliteRepository" or "postgres" in target.lower()
+    if production and os.environ.get("MEDIA_ENGINE_TEST_CREDIT_PRODUCTION") != "approve":
+        raise PlatformBlocked("TEST_GRANT_REFUSES_PRODUCTION_DSN")
+    if credits < 1 or credits > 100:
+        raise ValueError("test grant")
+    if not idempotency_key.startswith("test-grant:") or "/" in idempotency_key:
+        raise ValueError("test grant")
+    return platform.grant(
+        user_id, "topup", credits, "admin_adjustment", idempotency_key=idempotency_key,
+    )
+
+
 def prepare_test_grant(
     platform: Platform,
     *,

@@ -384,6 +384,9 @@ class VastImageProvider(GPUProvider):
         self.attached_volume_id = VOLUME_ID
         self.single_image_only = False
         self.image_claimed = False
+        self.session_limit = 0
+        self._session_booted = False
+        self._session_results: dict[tuple, bytes] = {}
         self.gpu_ram_mib = None
         self.cuda_max_good = None
         self.compute_cap = None
@@ -545,6 +548,7 @@ class VastImageProvider(GPUProvider):
         self.cache_source = "r2_cold_stage"
         self.attached_volume_id = 0
         self.single_image_only = True
+        self.arm_live_session()
 
     def _reject_unverified_run(self) -> str:
         """The $0.50 path rents nothing until this execution's grant matches the offer."""
@@ -1585,7 +1589,17 @@ class VastImageProvider(GPUProvider):
             self._preserve_runtime_evidence(import_exit=str(code), stderr=err, exception="IMPORT_FAILED")
             raise WorkerStageError("MODEL_LOAD_FAILED")
 
+    def arm_live_session(self) -> None:
+        """Three images, one load. This does not create an instance or attach the volume."""
+        self.session_limit = 3
+        self.single_image_only = False
+        self.attached_volume_id = 0
+        self._session_booted = False
+        self._session_results = {}
+
     def generate(self, *, prompt: str, width: int, height: int, seed: int) -> bytes:
+        if int(getattr(self, "session_limit", 0) or 0) > 1:
+            return self._session_generate(prompt=prompt, width=width, height=height, seed=seed)
         python = self.python_executable
         if not python:
             raise WorkerStageError("RUNTIME_PREPARE_FAILED")
@@ -1605,6 +1619,55 @@ class VastImageProvider(GPUProvider):
                 raise WorkerStageError("MODEL_LOAD_FAILED")
             raise WorkerStageError("GENERATION_FAILED")
         return self._fetch_png()
+
+    def _session_generate(self, *, prompt: str, width: int, height: int, seed: int) -> bytes:
+        """Submit one image to the resident worker. A repeated job does not infer again."""
+        if self.authorization_expires_at is not None and float(self._now()) >= float(self.authorization_expires_at):
+            raise WorkerStageError("EXPIRED_AUTHORIZATION")
+        python = self.python_executable
+        if not python:
+            raise WorkerStageError("RUNTIME_PREPARE_FAILED")
+        if width != FIRST_WIDTH or height != FIRST_HEIGHT:
+            raise WorkerStageError("GENERATION_FAILED")
+        key = (prompt, width, height, seed)
+        cached = self._session_results.get(key)
+        if cached is not None:
+            return cached
+        if len(self._session_results) >= int(self.session_limit):
+            raise WorkerStageError("SESSION_IMAGE_LIMIT")
+        if not self._session_booted:
+            code, out, _err = self._remote(_session_boot_command(python), 1200)
+            if code != 0 or "SESSION_READY" not in out:
+                raise WorkerStageError("MODEL_LOAD_FAILED")
+            self._session_booted = True
+        image_id = "s" + str(len(self._session_results) + 1)
+        code, out, _err = self._remote(
+            _session_job_command(image_id, prompt, width, height, seed),
+            int(PHASE_LIMITS["generating"][0]),
+        )
+        if code != 0 or "SESSION_IMAGE" not in out:
+            raise WorkerStageError("GENERATION_FAILED")
+        data = self._fetch_session_png(image_id)
+        self._session_results[key] = data
+        self.commands.append("session:" + image_id)
+        return data
+
+    def _fetch_session_png(self, image_id: str) -> bytes:
+        if not image_id.startswith("s") or not image_id[1:].isdigit():
+            raise WorkerStageError("ARTIFACT_TRANSFER_FAILED")
+        code, out, _err = self._remote("base64 /workspace/session-out/" + image_id + ".png", 120)
+        if code != 0 or not out.strip():
+            raise WorkerStageError("ARTIFACT_TRANSFER_FAILED")
+        import base64
+        alphabet = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n")
+        cleaned = "".join(char for char in out if char in alphabet)
+        try:
+            data = base64.b64decode(cleaned.encode("ascii"), validate=False)
+        except Exception as exc:
+            raise WorkerStageError("ARTIFACT_TRANSFER_FAILED") from exc
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise WorkerStageError("ARTIFACT_TRANSFER_FAILED")
+        return data
 
     def _remote(
         self,
@@ -2539,6 +2602,45 @@ _R2_SYNC = _R2_SYNC.replace(
 _CACHE_PROGRESS = "cat /workspace/r2-sync-progress.json 2>/dev/null || true"
 _CACHE_EXIT = "if [ -f /workspace/cache-sync.exit ]; then cat /workspace/cache-sync.exit; else echo RUNNING; fi"
 _CACHE_KILL = "if [ -f /workspace/cache-sync.pid ]; then kill $(cat /workspace/cache-sync.pid) >/dev/null 2>&1 || true; fi"
+
+def _session_boot_command(python: str) -> str:
+    quoted = shlex.quote(python)
+    return (
+        "mkdir -p /workspace/session-inbox /workspace/session-out && "
+        f"if [ ! -f /workspace/qwen_remote.py ]; then echo MISSING_REMOTE; exit 3; fi && "
+        "if [ ! -f /workspace/session.ready ]; then "
+        f"nohup {quoted} -u /workspace/qwen_remote.py serve >> /workspace/session.log 2>&1 & "
+        "echo $! > /workspace/session.pid; fi && "
+        "ready=0; i=0; while [ \"$i\" -lt 600 ]; do "
+        "if [ -f /workspace/session.ready ]; then ready=1; break; fi; "
+        "i=$((i+1)); sleep 2; done; "
+        "if [ \"$ready\" -ne 1 ]; then echo SESSION_NOT_READY; exit 4; fi; "
+        "echo SESSION_READY"
+    )
+
+
+def _session_job_command(image_id: str, prompt: str, width: int, height: int, seed: int) -> str:
+    if not image_id.startswith("s") or not image_id[1:].isdigit():
+        raise WorkerStageError("GENERATION_FAILED")
+    job = json.dumps({
+        "id": image_id,
+        "prompt": prompt,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "steps": INFERENCE_STEPS,
+        "cache_mount": MOUNT_PATH,
+    }, separators=(",", ":"))
+    quoted = shlex.quote(job)
+    return (
+        f"printf %s {quoted} > /workspace/session-inbox/{image_id}.json && "
+        "ready=0; i=0; while [ \"$i\" -lt 300 ]; do "
+        f"if [ -f /workspace/session-out/{image_id}.png ]; then ready=1; break; fi; "
+        "i=$((i+1)); sleep 2; done; "
+        "if [ \"$ready\" -ne 1 ]; then echo SESSION_IMAGE_MISSING; exit 5; fi; "
+        "echo SESSION_IMAGE"
+    )
+
 
 def _generate_command(prompt: str, width: int, height: int, seed: int, python: str) -> str:
     if not python or python != python.strip() or any(char in python for char in "\n\r\x00"):

@@ -59,6 +59,42 @@ def cache_is_ready(mount: Path, *, min_bytes: int | None = None) -> bool:
     return str(manifest.get("revision") or "") == PINNED_QWEN_REVISION
 
 
+class SessionServer:
+    """One process. The model is loaded on the first job and kept for the rest."""
+
+    def __init__(self, mount: Path, *, cache_ready, sync, load, generate, limit: int = 3) -> None:
+        self.mount = mount
+        self.cache_ready = cache_ready
+        self.sync = sync
+        self.load = load
+        self.generate = generate
+        self.limit = int(limit)
+        self.pipe = None
+        self.downloads = 0
+        self.loads = 0
+        self.done: dict[str, object] = {}
+
+    def submit(self, job: dict):
+        identity = str(job.get("id") or "")
+        if not identity:
+            raise RuntimeError("JOB_ID_REQUIRED")
+        if identity in self.done:
+            return self.done[identity]
+        if len(self.done) >= self.limit:
+            raise RuntimeError("SESSION_IMAGE_LIMIT")
+        if self.pipe is None:
+            if not self.cache_ready(self.mount):
+                self.sync(self.mount)
+                self.downloads = 1
+                if not self.cache_ready(self.mount):
+                    raise RuntimeError("MODEL_CACHE_NOT_READY")
+            self.pipe = self.load(self.mount)
+            self.loads = 1
+        image = self.generate(self.pipe, job)
+        self.done[identity] = image
+        return image
+
+
 def run_session(jobs: list[dict], *, mount: Path, cache_ready, sync, load, generate) -> dict:
     """One load for every job. Download only when the worker cache is not ready."""
     if not jobs:
@@ -76,6 +112,8 @@ def run_session(jobs: list[dict], *, mount: Path, cache_ready, sync, load, gener
 
 def main() -> int:
     phase = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if phase == "serve":
+        return _serve()
     job = json.loads(Path("/workspace/phase2d_job.json").read_text(encoding="utf-8"))
     report: dict[str, object] = {
         "model_id": "Qwen/Qwen-Image",
@@ -224,6 +262,56 @@ def _load_workspace_module(name: str, path: str):
         sys.modules.pop(name, None)
         raise
     return module
+
+
+def _serve() -> int:
+    """Stay up, load Qwen once, and write one PNG per inbox job. Not the one-shot command."""
+    mount = resolve_worker_mount(None, WORKER_MOUNT)
+    os.environ["HF_HOME"] = str(mount / "hf-cache")
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(mount / "hf-cache")
+    inbox = Path("/workspace/session-inbox")
+    output = Path("/workspace/session-out")
+    inbox.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("MODEL_CACHE_PROVIDER") == "r2" and not cache_is_ready(mount):
+        _sync_r2(mount, deadline_seconds=_phase_seconds("PHASE2D_CACHE_SYNC_SECONDS", 1200))
+    import torch
+    from diffusers import QwenImagePipeline
+    from huggingface_hub import snapshot_download
+    prepare_generation, _cache_error, _mount = _cache_api()
+    local = prepare_generation(mount, snapshot_download)
+    pipe = QwenImagePipeline.from_pretrained(local, torch_dtype=torch.bfloat16, local_files_only=True)
+    pipe.enable_model_cpu_offload()
+    Path("/workspace/session.ready").write_text("ready\n", encoding="utf-8")
+    seen: set[str] = set()
+    completed = 0
+    while completed < 3 and not Path("/workspace/session.stop").exists():
+        progressed = False
+        for path in sorted(inbox.glob("*.json")):
+            if path.name in seen:
+                continue
+            job = json.loads(path.read_text(encoding="utf-8"))
+            identity = str(job.get("id") or path.stem)
+            if (output / (identity + ".png")).is_file():
+                seen.add(path.name)
+                continue
+            generator = torch.Generator(device="cpu").manual_seed(int(job["seed"]))
+            image = pipe(
+                prompt=job["prompt"],
+                width=int(job["width"]),
+                height=int(job["height"]),
+                num_inference_steps=int(job.get("steps") or 30),
+                generator=generator,
+            ).images[0]
+            image.save(output / (identity + ".png"), format="PNG")
+            seen.add(path.name)
+            completed += 1
+            progressed = True
+            if completed >= 3:
+                break
+        if not progressed:
+            time.sleep(1)
+    return 0
 
 
 def _worker_cache_api():
