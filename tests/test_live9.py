@@ -6,9 +6,13 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
+from media_engine.engines.image.qwen import MODEL_ID
 from media_engine.engines.image.qwen_remote import PINNED_QWEN_REVISION, SessionServer, cache_is_ready
+from media_engine.providers.execution_authorization import issue_authorization
+from media_engine.providers.live7_contract import REVISION
 from media_engine.infra.manager import GpuManager
 from media_engine.infra.store import ManagerStore
 from media_engine.platform.repository import PlatformBlocked
@@ -84,7 +88,32 @@ class SessionTests(unittest.TestCase):
             api_key="fixture-key", transport=lambda *args: (_ for _ in ()).throw(AssertionError("transport")),
             now=_Clock(100), runtime=Path(tempfile.mkdtemp()),
         )
+        provider.execution_authorization = issue_authorization(
+            authorization_id="live9-auth-session",
+            execution_id="live9-run-session",
+            code_sha="f15f654b0fb5b295b2fcbf785d275b1c772b7ed5",
+            allowed_machine_ids=(501,),
+            allowed_offer_ids=(1001,),
+            allowed_pairs=((501, 1001),),
+            selection_policy="just_in_time",
+            max_hourly_usd=Decimal("0.95"),
+            max_total_usd=Decimal("5.00"),
+            max_instances=1,
+            max_creates=1,
+            max_gpu_instances=1,
+            max_inference_attempts=3,
+            max_image_count=3,
+            max_model_stages=1,
+            max_model_loads=1,
+            max_disk_gb=140,
+            model=MODEL_ID,
+            revision=REVISION,
+            issued_at=1_000,
+            expires_at=20_000,
+        )
         provider.arm_live_session()
+        self.assertEqual(provider.session_limit, 3)
+        self.assertFalse(provider.single_image_only)
         provider.python_executable = "/usr/bin/python3"
         provider._ssh_run = ssh
         provider._host = "worker"

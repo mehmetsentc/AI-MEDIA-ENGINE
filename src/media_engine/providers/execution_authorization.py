@@ -46,7 +46,27 @@ _FIELDS = (
     "issued_at",
     "expires_at",
 )
-_OPTIONAL = ("allowed_pairs", "selection_constraints")
+_OPTIONAL = (
+    "allowed_pairs",
+    "selection_constraints",
+    "max_creates",
+    "max_gpu_instances",
+    "max_model_stages",
+    "max_model_loads",
+)
+
+
+def _optional_one(kwargs: dict, name: str) -> int:
+    """Missing means one. Any other value is over the authorization."""
+    if name not in kwargs:
+        return 1
+    try:
+        value = int(kwargs[name])
+    except (TypeError, ValueError):
+        raise WorkerStageError("INSTANCE_LIMIT") from None
+    if value != 1:
+        raise WorkerStageError("INSTANCE_LIMIT")
+    return value
 
 
 @dataclass(frozen=True)
@@ -69,6 +89,10 @@ class ExecutionAuthorization:
     expires_at: float
     allowed_pairs: tuple[tuple[int, int], ...] = ()
     gpu_families: tuple[str, ...] = ()
+    max_creates: int = 1
+    max_gpu_instances: int = 1
+    max_model_stages: int = 1
+    max_model_loads: int = 1
 
     def to_dict(self) -> dict:
         return {
@@ -83,8 +107,12 @@ class ExecutionAuthorization:
             "max_hourly_usd": str(self.max_hourly_usd),
             "max_total_usd": str(self.max_total_usd),
             "max_instances": self.max_instances,
+            "max_creates": self.max_creates,
+            "max_gpu_instances": self.max_gpu_instances,
             "max_inference_attempts": self.max_inference_attempts,
             "max_image_count": self.max_image_count,
+            "max_model_stages": self.max_model_stages,
+            "max_model_loads": self.max_model_loads,
             "max_disk_gb": self.max_disk_gb,
             "model": self.model,
             "revision": self.revision,
@@ -145,8 +173,12 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
         raise WorkerStageError("BUDGET_MISMATCH")
     if instances != 1:
         raise WorkerStageError("INSTANCE_LIMIT")
-    if inferences != 1 or images != 1:
+    if images not in (1, 3) or inferences != images:
         raise WorkerStageError("INSTANCE_LIMIT")
+    creates = _optional_one(kwargs, "max_creates")
+    gpu_instances = _optional_one(kwargs, "max_gpu_instances")
+    stages = _optional_one(kwargs, "max_model_stages")
+    loads = _optional_one(kwargs, "max_model_loads")
     if disk != LIVE7_DISK_GB:
         raise WorkerStageError("DISK_INSUFFICIENT")
     if str(kwargs["model"]) != MODEL_ID or str(kwargs["revision"]) != REVISION:
@@ -172,6 +204,10 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
         expires_at=expires,
         allowed_pairs=pairs,
         gpu_families=families,
+        max_creates=creates,
+        max_gpu_instances=gpu_instances,
+        max_model_stages=stages,
+        max_model_loads=loads,
     )
 
 
@@ -195,6 +231,17 @@ def accept_record(authorization: ExecutionAuthorization, *, now: float, code_sha
         raise WorkerStageError("EXPIRED_AUTHORIZATION")
     if authorization.max_instances != 1 or not _total_allowed(authorization):
         raise WorkerStageError("BUDGET_MISMATCH")
+    if authorization.max_image_count not in (1, 3):
+        raise WorkerStageError("INSTANCE_LIMIT")
+    if authorization.max_inference_attempts != authorization.max_image_count:
+        raise WorkerStageError("INSTANCE_LIMIT")
+    if (
+        authorization.max_creates != 1
+        or authorization.max_gpu_instances != 1
+        or authorization.max_model_stages != 1
+        or authorization.max_model_loads != 1
+    ):
+        raise WorkerStageError("INSTANCE_LIMIT")
 
 
 def select_for_authorization(

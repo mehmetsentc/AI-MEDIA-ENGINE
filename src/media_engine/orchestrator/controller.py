@@ -283,6 +283,13 @@ class MediaController:
                 if getattr(self.provider, "image_claimed", False):
                     raise JobError("SINGLE_IMAGE_ONLY")
                 self.provider.image_claimed = True
+            authorization = getattr(self.provider, "execution_authorization", None)
+            if authorization is not None and not getattr(self.provider, "single_image_only", False):
+                cap = int(authorization.max_image_count)
+                submitted = int(getattr(self.provider, "images_submitted", 0) or 0)
+                if submitted >= cap:
+                    raise JobError("SESSION_IMAGE_LIMIT")
+                self.provider.images_submitted = submitted + 1
             self.clients.require(job.client_id)
             if idempotency_key and hasattr(self.jobs, "insert_idempotent"):
                 stored = self.jobs.insert_idempotent(job, idempotency_key)

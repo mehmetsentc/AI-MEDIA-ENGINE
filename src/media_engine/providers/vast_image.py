@@ -387,6 +387,12 @@ class VastImageProvider(GPUProvider):
         self.session_limit = 0
         self._session_booted = False
         self._session_results: dict[tuple, bytes] = {}
+        self._images_started = 0
+        self._inference_attempts = 0
+        self._model_stages_used = 0
+        self._model_loads_used = 0
+        self._creates_used = 0
+        self.images_submitted = 0
         self.gpu_ram_mib = None
         self.cuda_max_good = None
         self.compute_cap = None
@@ -1338,6 +1344,12 @@ class VastImageProvider(GPUProvider):
         return self._dispatch_create(owner)
 
     def create(self, owner: str) -> CreateResult:
+        authorization = self.execution_authorization
+        if authorization is not None and self._creates_used >= int(authorization.max_creates):
+            self._create_closed = True
+            self.create_request_sent = False
+            self.billing_exposure = False
+            return CreateResult(outcome="definite_failure")
         if self._put_done or self._create_closed:
             return CreateResult(outcome="definite_failure")
         if not self._five_dollar_target_is_authorized():
@@ -1345,11 +1357,13 @@ class VastImageProvider(GPUProvider):
             self.create_request_sent = False
             self.billing_exposure = False
             if self._live8_bound():
+                self._creates_used += 1
                 self._create_closed = True
             else:
                 self._put_done = True
             return CreateResult(outcome="definite_failure")
         if self._live8_bound():
+            self._creates_used += 1
             self._create_closed = True
             return self._create_live8(owner)
         self._put_done = True
@@ -1548,6 +1562,7 @@ class VastImageProvider(GPUProvider):
             if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
                 self.cache_validation = "R2_FORBIDDEN"
                 raise WorkerStageError("MODEL_CACHE_INVALID")
+            self._claim_model_stage()
             self._stage_r2()
         else:
             worker = getattr(self, "_worker_ssh", None)
@@ -1589,20 +1604,71 @@ class VastImageProvider(GPUProvider):
             self._preserve_runtime_evidence(import_exit=str(code), stderr=err, exception="IMPORT_FAILED")
             raise WorkerStageError("MODEL_LOAD_FAILED")
 
+    def _claim_model_stage(self) -> None:
+        authorization = self.execution_authorization
+        if authorization is None:
+            return
+        if self._model_stages_used >= int(authorization.max_model_stages):
+            raise WorkerStageError("INSTANCE_LIMIT")
+        self._model_stages_used += 1
+
+    def _claim_model_load(self) -> None:
+        authorization = self.execution_authorization
+        if authorization is None:
+            return
+        if self._model_loads_used >= int(authorization.max_model_loads):
+            raise WorkerStageError("INSTANCE_LIMIT")
+        self._model_loads_used += 1
+
     def arm_live_session(self) -> None:
-        """Three images, one load. This does not create an instance or attach the volume."""
-        self.session_limit = 3
-        self.single_image_only = False
+        """Apply the bound record. This does not create an instance or raise its limits."""
+        authorization = self.execution_authorization
         self.attached_volume_id = 0
-        self._session_booted = False
-        self._session_results = {}
+        if authorization is None:
+            self.session_limit = 0
+            self.single_image_only = True
+            return
+        images = int(authorization.max_image_count)
+        inferences = int(authorization.max_inference_attempts)
+        if images not in (1, 3) or inferences != images:
+            raise WorkerStageError("INSTANCE_LIMIT")
+        if (
+            int(authorization.max_instances) != 1
+            or int(authorization.max_creates) != 1
+            or int(authorization.max_gpu_instances) != 1
+            or int(authorization.max_model_stages) != 1
+            or int(authorization.max_model_loads) != 1
+        ):
+            raise WorkerStageError("INSTANCE_LIMIT")
+        self.session_limit = images
+        self.single_image_only = images == 1
 
     def generate(self, *, prompt: str, width: int, height: int, seed: int) -> bytes:
-        if int(getattr(self, "session_limit", 0) or 0) > 1:
-            return self._session_generate(prompt=prompt, width=width, height=height, seed=seed)
+        authorization = self.execution_authorization
+        if authorization is not None:
+            if self.authorization_expires_at is not None and float(self._now()) >= float(self.authorization_expires_at):
+                raise WorkerStageError("EXPIRED_AUTHORIZATION")
+            if int(self.session_limit) > int(authorization.max_image_count):
+                raise WorkerStageError("INSTANCE_LIMIT")
+            key = (prompt, width, height, seed)
+            cached = self._session_results.get(key)
+            if cached is not None:
+                return cached
+            if self._images_started >= int(authorization.max_image_count):
+                raise WorkerStageError("SESSION_IMAGE_LIMIT")
+            if self._inference_attempts >= int(authorization.max_inference_attempts):
+                raise WorkerStageError("SESSION_IMAGE_LIMIT")
+            if int(authorization.max_image_count) > 1:
+                if int(self.session_limit) != int(authorization.max_image_count):
+                    raise WorkerStageError("INSTANCE_LIMIT")
+                return self._session_generate(prompt=prompt, width=width, height=height, seed=seed)
+        elif int(getattr(self, "session_limit", 0) or 0) > 1:
+            raise WorkerStageError("INSTANCE_LIMIT")
         python = self.python_executable
         if not python:
             raise WorkerStageError("RUNTIME_PREPARE_FAILED")
+        if self.execution_authorization is not None:
+            self._claim_model_load()
         command = _generate_command(prompt, width, height, seed, python=python)
         self.commands.append(command)
         code, out, err = self._remote(
@@ -1618,7 +1684,12 @@ class VastImageProvider(GPUProvider):
                 )
                 raise WorkerStageError("MODEL_LOAD_FAILED")
             raise WorkerStageError("GENERATION_FAILED")
-        return self._fetch_png()
+        data = self._fetch_png()
+        if self.execution_authorization is not None:
+            self._images_started += 1
+            self._inference_attempts += 1
+            self._session_results[(prompt, width, height, seed)] = data
+        return data
 
     def _session_generate(self, *, prompt: str, width: int, height: int, seed: int) -> bytes:
         """Submit one image to the resident worker. A repeated job does not infer again."""
@@ -1633,9 +1704,18 @@ class VastImageProvider(GPUProvider):
         cached = self._session_results.get(key)
         if cached is not None:
             return cached
-        if len(self._session_results) >= int(self.session_limit):
+        authorization = self.execution_authorization
+        limit = int(self.session_limit)
+        if authorization is not None:
+            if limit > int(authorization.max_image_count):
+                raise WorkerStageError("INSTANCE_LIMIT")
+            limit = int(authorization.max_image_count)
+            if self._inference_attempts >= int(authorization.max_inference_attempts):
+                raise WorkerStageError("SESSION_IMAGE_LIMIT")
+        if self._images_started >= limit or len(self._session_results) >= limit:
             raise WorkerStageError("SESSION_IMAGE_LIMIT")
         if not self._session_booted:
+            self._claim_model_load()
             code, out, _err = self._remote(_session_boot_command(python), 1200)
             if code != 0 or "SESSION_READY" not in out:
                 raise WorkerStageError("MODEL_LOAD_FAILED")
@@ -1648,6 +1728,8 @@ class VastImageProvider(GPUProvider):
         if code != 0 or "SESSION_IMAGE" not in out:
             raise WorkerStageError("GENERATION_FAILED")
         data = self._fetch_session_png(image_id)
+        self._images_started += 1
+        self._inference_attempts += 1
         self._session_results[key] = data
         self.commands.append("session:" + image_id)
         return data
