@@ -185,7 +185,7 @@ class PostgresRepository:
 
     def reserve_and_enqueue(self, *, user_id: str, amount: int, job_id: str, version: str, pools: list[str],
                             now: str, idempotency_key: str, max_concurrent: int, enqueue: bool = True) -> None:
-        with self.pool.session() as conn:
+        def write(conn: object) -> None:
             self._ensure_user(conn, user_id, now)
             conn.execute(
                 "SELECT id FROM credit_accounts WHERE user_id = %s FOR UPDATE",
@@ -222,6 +222,8 @@ class PostgresRepository:
             if enqueue:
                 self._enqueue(conn, user_id, job_id, idempotency_key, version, max_concurrent, now)
 
+        self.pool.run(write, idempotent=True)
+
     def reserved_by_pool(self, job_id: str) -> list[tuple[str, int]]:
         with self.pool.session() as conn:
             rows = conn.execute(
@@ -242,7 +244,7 @@ class PostgresRepository:
         return self._post(**kwargs)  # type: ignore[arg-type]
 
     def post_many(self, job_id: str, entries: list[dict], *, durable_status: str, now: str) -> None:
-        with self.pool.session() as conn:
+        def write(conn: object) -> None:
             if not self._settled(conn, job_id):
                 for entry in entries:
                     self._post_conn(conn, **entry)
@@ -258,6 +260,8 @@ class PostgresRepository:
                 "UPDATE generation_jobs SET status = %s WHERE id = %s",
                 (durable_status, job_id),
             )
+
+        self.pool.run(write, idempotent=True)
 
     def enqueue(self, *, user_id: str, job_id: str, idempotency_key: str, pricing_version: str,
                 max_concurrent: int, now: str) -> None:
@@ -829,9 +833,11 @@ class PostgresRepository:
         )
 
     def _post(self, **kwargs: object) -> str:
-        with self.pool.session() as conn:
+        def write(conn: object) -> str:
             self._ensure_user(conn, str(kwargs["user_id"]), str(kwargs["now"]))
             return self._post_conn(conn, **kwargs)
+
+        return self.pool.run(write, idempotent=True)
 
     def _post_conn(self, conn: object, **kwargs: object) -> str:
         idempotency_key = str(kwargs["idempotency_key"])

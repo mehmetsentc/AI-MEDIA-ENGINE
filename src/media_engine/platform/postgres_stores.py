@@ -122,7 +122,7 @@ class PostgresJobStore:
         current = self.get(job.id)
         if _progress_only(current, job):
             return job
-        with self.pool.session() as conn:
+        def write(conn: object) -> Job:
             cursor = conn.execute(
                 """
                 UPDATE jobs
@@ -137,11 +137,13 @@ class PostgresJobStore:
             )
             if cursor.rowcount != 1:
                 raise JobNotFound(job.id)
-        return job
+            return job
+
+        return self.pool.run(write, idempotent=True)
 
     def get(self, job_id: str) -> Job:
-        with self.pool.session() as conn:
-            row = conn.execute(
+        def read(conn: object) -> dict | None:
+            return conn.execute(
                 """
                 SELECT id, client_id, job_type, status, created_at, updated_at,
                        attempt_count, result_uri, error_code, input_json
@@ -149,6 +151,8 @@ class PostgresJobStore:
                 """,
                 (job_id,),
             ).fetchone()
+
+        row = self.pool.run(read, idempotent=True)
         if row is None:
             raise JobNotFound(job_id)
         return _row_to_job(_coerce(row))

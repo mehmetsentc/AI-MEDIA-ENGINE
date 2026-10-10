@@ -46,6 +46,7 @@ from media_engine.providers.base import (
     WorkerStageError,
 )
 from media_engine.providers.fake import FakeGPUProvider
+from media_engine.platform.postgres_conn import PostgresUnavailable
 from media_engine.platform.repository import PlatformBlocked
 from media_engine.resources.ledger import ResourceLedger, ResourceRecord, ResourceState
 from media_engine.safety.limits import SafetyLimits
@@ -439,9 +440,47 @@ class MediaController:
     def _run_one(self, job_id: str) -> None:
         self._lock.acquire()
         try:
+            self._note_database_deadline()
             self._run_one_locked(job_id)
+        except PostgresUnavailable:
+            self._stop_for_database(job_id)
         finally:
             self._lock.release()
+
+    def _note_database_deadline(self) -> None:
+        """Database retries stop at the authorization or spending deadline."""
+        expires = getattr(self.provider, "authorization_expires_at", None)
+        deadline = float(expires) if expires else None
+        budget = getattr(self.provider, "execution_budget", None)
+        wall = getattr(budget, "spending_deadline_wall", None) if budget is not None else None
+        if wall is not None:
+            deadline = float(wall) if deadline is None else min(deadline, float(wall))
+        pools = [getattr(self.jobs, "pool", None)]
+        platform = getattr(self, "platform", None)
+        repo = getattr(platform, "repo", None) if platform is not None else None
+        pools.append(getattr(repo, "pool", None) if repo is not None else None)
+        for pool in pools:
+            if pool is not None and hasattr(pool, "deadline"):
+                pool.deadline = deadline
+
+    def _stop_for_database(self, job_id: str) -> None:
+        """Delete the current GPU after retries are exhausted. Do not rent another."""
+        resource_id = self._worker_id
+        if resource_id:
+            try:
+                self._terminate(resource_id, "POSTGRES_CONNECTION_FAILED")
+            except Exception:
+                self.trace.append(f"{resource_id}:TERMINATE_FAILED")
+        try:
+            job = self.jobs.get(job_id)
+        except Exception:
+            return
+        if job.status in (JobStatus.FAILED, JobStatus.SUCCEEDED, JobStatus.CANCELLED):
+            return
+        try:
+            self._fail(job, "POSTGRES_CONNECTION_FAILED")
+        except Exception:
+            return
 
     def _run_one_locked(self, job_id: str) -> None:
         try:
@@ -679,6 +718,7 @@ class MediaController:
         job.public_status = status
         job.progress = PUBLIC_PROGRESS[status]
         job.updated_at = self.clock.iso()
+        self._note_database_deadline()
         self.jobs.save(job)
         self.trace.append(f"{job.id}:public:{status}")
 
