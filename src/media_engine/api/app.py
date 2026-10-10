@@ -17,6 +17,7 @@ from media_engine.studio.api import try_studio
 
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
+    "/gpu": ("gpu.html", "text/html; charset=utf-8"),
     "/studio.css": ("studio.css", "text/css; charset=utf-8"),
     "/studio.js": ("studio.js", "text/javascript; charset=utf-8"),
 }
@@ -64,6 +65,15 @@ def dispatch(controller: MediaController, method: str, path: str,
     try:
         if method == "GET" and path == "/health":
             return 200, controller.health()
+        if method == "GET" and path == "/v1/admin/gpu":
+            from media_engine.infra.dashboard import snapshot_for
+            cache = getattr(controller, "model_cache", None)
+            worker = getattr(controller, "warm_worker", None)
+            return 200, snapshot_for(
+                getattr(controller, "gpu_manager", None), cache=cache, worker=worker,
+            )
+        if method == "POST" and path == "/v1/admin/gpu/actions":
+            return 403, {"error": "PAID_ACTIONS_DISABLED"}
         if method == "POST" and path == "/v1/images/generations":
             payload = _object(body)
             if "negative_prompt" in payload:

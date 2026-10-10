@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DAIDOI GPU Manager</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font: 15px/1.45 "Segoe UI", sans-serif; background: #10140f; color: #e7efe4; }
+    main { max-width: 960px; margin: 0 auto; padding: 28px 20px 48px; }
+    h1 { font-size: 1.4rem; margin: 0 0 8px; }
+    p { color: #b7c4b4; }
+    .banner { border: 1px solid #8d5a2b; background: #2a2116; padding: 12px 14px; border-radius: 8px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 18px 0; }
+    article { background: #1a2219; border-radius: 8px; padding: 12px 14px; }
+    h2 { font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; color: #93a892; margin: 0 0 6px; }
+    strong { font-size: 1.15rem; font-weight: 650; }
+    button[disabled] { opacity: 0.55; }
+    pre { white-space: pre-wrap; background: #0c100c; padding: 12px; border-radius: 8px; }
+    a { color: #d5e7c8; }
+  </style>
+</head>
+<body>
+  <main>
+    <p><a href="/">Studio</a></p>
+    <h1>GPU Manager</h1>
+    <p class="banner" id="banner">Paid GPU actions are disabled. This page does not rent a machine.</p>
+    <section class="grid" id="cards"></section>
+    <h2>Alerts</h2>
+    <pre id="alerts">Loading</pre>
+    <p>
+      <button type="button" disabled>Start paid session</button>
+      <button type="button" disabled>Create instance</button>
+    </p>
+  </main>
+  <script>
+    const cards = document.querySelector("#cards");
+    const alerts = document.querySelector("#alerts");
+    function card(title, value) {
+      const node = document.createElement("article");
+      node.innerHTML = "<h2></h2><strong></strong>";
+      node.querySelector("h2").textContent = title;
+      node.querySelector("strong").textContent = value;
+      cards.appendChild(node);
+    }
+    fetch("/v1/admin/gpu", {credentials: "same-origin"})
+      .then((response) => response.json())
+      .then((body) => {
+        cards.replaceChildren();
+        card("GPU status", body.gpu_status || "STOPPED");
+        card("Instances", String((body.instances || []).length));
+        card("Loaded models", (body.loaded_models || []).join(", ") || "none");
+        card("Cache", (body.cache && body.cache.state) || "UNKNOWN");
+        card("Queue", String(body.queue_length ?? 0));
+        card("Hourly", body.hourly_usd || "0");
+        card("Est. daily", body.estimated_daily_usd || "0");
+        card("Est. monthly", body.estimated_monthly_usd || "0");
+        card("Session remaining", String(body.session_remaining_seconds ?? 0) + "s");
+        card("Shutdown", body.shutdown || "automatic");
+        alerts.textContent = JSON.stringify(body.alerts || [], null, 2);
+      })
+      .catch(() => {
+        alerts.textContent = "Admin status is unavailable.";
+      });
+  </script>
+</body>
+</html>

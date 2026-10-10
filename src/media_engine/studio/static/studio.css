@@ -73,6 +73,7 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
   letter-spacing: 0.16em;
   text-transform: uppercase;
 }
+a.nav-item { text-decoration: none; }
 .nav-item, .settings-item {
   display: flex;
   align-items: center;
