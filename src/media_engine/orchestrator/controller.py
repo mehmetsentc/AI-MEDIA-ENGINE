@@ -761,6 +761,31 @@ class MediaController:
             self._fail(job, "MAX_GPU_WORKERS")
             return None
         if result.outcome == "definite_failure":
+            sent = getattr(self.provider, "create_request_sent", None)
+            classification = str(getattr(self.provider, "create_classification", "") or "")
+            if sent is False:
+                code = str(getattr(self.provider, "live6_stop", "") or "OFFER_UNAVAILABLE")
+                self._ledger(
+                    provisional, job.client_id, ResourceState.FAILED, quote, now, code,
+                    create_attempted=False,
+                )
+                self._fail(job, code)
+                return None
+            if classification == "provider_create_rejected":
+                exposed = getattr(self.provider, "billing_exposure", True) is not False
+                if exposed:
+                    self._ledger(
+                        provisional, job.client_id, ResourceState.AMBIGUOUS, quote, now,
+                        "UNRESOLVED_BILLING",
+                    )
+                    self._fail(job, "UNRESOLVED_BILLING")
+                    return None
+                self._ledger(
+                    provisional, job.client_id, ResourceState.FAILED, quote, now,
+                    "PROVIDER_CREATE_REJECTED",
+                )
+                self._fail(job, "PROVIDER_CREATE_REJECTED")
+                return None
             self._ledger(
                 provisional, job.client_id, ResourceState.FAILED, quote, now, "PROVIDER_CREATE_FAILED",
             )
@@ -781,7 +806,7 @@ class MediaController:
         return result.resource_id
 
     def _ledger(self, resource_id: str, owner: str, state: str, quote: Quote, now: float,
-                error: Optional[str]) -> None:
+                error: Optional[str], *, create_attempted: bool = True) -> None:
         existing = self.ledger.get(resource_id)
         created = existing.created_at if existing is not None else now
         self.ledger.upsert(ResourceRecord(
@@ -789,7 +814,7 @@ class MediaController:
             provider=quote.provider,
             owner_id=owner,
             state=state,
-            create_attempted=True,
+            create_attempted=create_attempted,
             hourly_price_usd=str(quote.hourly_price_usd),
             created_at=created,
             updated_at=now,

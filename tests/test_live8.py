@@ -14,7 +14,8 @@ from pathlib import Path
 
 from media_engine.engines.image.qwen import MODEL_ID
 from media_engine.platform.service import Platform
-from media_engine.providers.base import WorkerStageError
+from media_engine.orchestrator.controller import MediaController
+from media_engine.providers.base import Quote, WorkerStageError
 from media_engine.providers.execution_authorization import (
     accept_record,
     authorization_from_json,
@@ -213,6 +214,33 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(reason, "MACHINE_SCOPE")
         wrong_offer = assess_offers([_offer(1003, 501)], observed_at=5_000)
         chosen, reason = select_for_authorization(authorization, wrong_offer, now=5_000)
+        self.assertIsNone(chosen)
+        self.assertEqual(reason, "OFFER_REJECTED")
+
+    def test_just_in_time_needs_an_explicit_pair_set(self) -> None:
+        with self.assertRaises(WorkerStageError) as raised:
+            self._auth(selection_policy="just_in_time")
+        self.assertEqual(raised.exception.code, "MACHINE_SCOPE")
+        with self.assertRaises(WorkerStageError) as raised:
+            self._auth(allowed_pairs=((501, 1001),))
+        self.assertEqual(raised.exception.code, "SELECTION_POLICY")
+        with self.assertRaises(WorkerStageError) as raised:
+            self._auth(
+                selection_policy="just_in_time",
+                allowed_pairs=((501, 1001),),
+                selection_constraints={"max_hourly_usd": "0.95"},
+            )
+        self.assertEqual(raised.exception.code, "SELECTION_POLICY")
+
+    def test_cross_pair_is_outside_the_just_in_time_set(self) -> None:
+        authorization = self._auth(
+            selection_policy="just_in_time",
+            allowed_machine_ids=(501, 502),
+            allowed_offer_ids=(1001, 1002),
+            allowed_pairs=((501, 1001), (502, 1002)),
+        )
+        crossed = assess_offers([_offer(1002, 501, inet_down=20000)], observed_at=5_000)
+        chosen, reason = select_for_authorization(authorization, crossed, now=5_000)
         self.assertIsNone(chosen)
         self.assertEqual(reason, "OFFER_REJECTED")
 
@@ -485,6 +513,340 @@ class CreateFlowTests(unittest.TestCase):
         result = provider.create("studio")
         self.assertEqual(result.outcome, "definite_failure")
         self.assertEqual(provider.live6_stop, "PROVIDER_CAPACITY_UNAVAILABLE")
+
+    def test_pre_create_failure_refunds_without_reporting_a_create(self) -> None:
+        platform = Platform(str(Path(tempfile.mkdtemp()) / "platform.sqlite3"))
+        platform.repo.set_config("pool_priority", "purchased")
+        platform.grant("nahaber", "purchased", 3, "promo_grant", idempotency_key="seed-live8-jit")
+        platform.repo.add_price(
+            version="daidoi-e2e", service="image", model="qwen-image", quality="",
+            unit="image", credit_price=2, internal_cost_units=0, effective_at="2020-01-01T00:00:00Z",
+        )
+        provider = self._provider([])
+        provider.bind_authorization(self._auth(), code_sha=SHA)
+        root = Path(tempfile.mkdtemp())
+        controller = MediaController(str(root / "jobs.sqlite3"), str(root / "storage"))
+        controller.provider = provider
+        controller.platform = platform
+        job = controller.submit_image("A cinematic editorial photograph of a newsroom.")
+        controller._create_worker(job, Quote(hourly_price_usd=Decimal("0.72"), provider="vast"))
+        self.assertEqual(job.error_code, "OFFER_UNAVAILABLE")
+        self.assertEqual(platform.balance("nahaber"), 3)
+        self.assertEqual(controller.ledger.unresolved(), [])
+        self.assertEqual(provider.puts, [])
+        self.assertFalse(provider.create_request_sent)
+        self.assertIsNone(provider.execution_grant)
+        self.assertEqual(provider.create_classification, "offer_unavailable_before_create")
+        self.assertFalse(provider.billing_exposure)
+        record = controller.ledger.list()[0]
+        self.assertFalse(record.create_attempted)
+        self.assertEqual(record.last_error, "OFFER_UNAVAILABLE")
+
+    def test_provider_rejection_confirms_there_is_no_instance(self) -> None:
+        provider = self._provider(
+            [_offer(1001, 501)],
+            put=(400, b'{"success": false, "error": "no_such_ask"}'),
+        )
+        provider.bind_authorization(self._auth(), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "definite_failure")
+        self.assertEqual(len(provider.puts), 1)
+        self.assertTrue(provider.create_request_sent)
+        self.assertEqual(provider.create_classification, "provider_create_rejected")
+        self.assertFalse(provider.billing_exposure)
+        observation = json.loads((provider.runtime / "create-observation.json").read_text(encoding="utf-8"))
+        self.assertEqual(observation["classification"], "provider_create_rejected")
+        self.assertEqual(observation["provider_response"]["status"], 400)
+        self.assertEqual(observation["provider_response"]["outcome"], "definite_failure")
+        self.assertIsNotNone(observation["create_request_at"])
+        self.assertFalse(observation["billing_exposure"])
+        retry = VastImageProvider(
+            api_key="fixture-key",
+            transport=provider._transport,
+            runtime=provider.runtime,
+            now=lambda: 5_000.0,
+        )
+        retry._watchdog_popen = _Popen
+        retry._manifest_ready = lambda: True
+        retry.puts = provider.puts
+        retry.bind_authorization(self._auth(), code_sha=SHA)
+        again = retry.create("studio")
+        self.assertEqual(again.outcome, "definite_failure")
+        self.assertFalse(retry.create_request_sent)
+        self.assertFalse(retry.billing_exposure)
+        self.assertEqual(len(provider.puts), 1)
+
+    def test_approved_pool_does_not_switch_after_the_final_check_fails(self) -> None:
+        posts = []
+
+        def transport(method, url, body, headers):
+            del url, headers
+            if method == "PUT":
+                raise AssertionError("create request")
+            if method == "POST":
+                query = json.loads(body.decode("utf-8"))
+                posts.append(query)
+                if "machine_id" in query:
+                    return 200, json.dumps({"offers": [_offer(1001, 501, rentable=False)]}).encode()
+                return 200, json.dumps({"offers": [
+                    _offer(1001, 501),
+                    _offer(1002, 502, gpu_name="RTX 5880 Ada", inet_down=2000),
+                ]}).encode()
+            if method == "GET":
+                return 200, b'{"success": true, "instances": [], "next_token": null}'
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
+        provider.bind_authorization(self._auth(
+            selection_policy="approved_pool",
+            allowed_machine_ids=(501, 502),
+            allowed_offer_ids=(1001, 1002),
+        ), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "definite_failure")
+        self.assertEqual(provider.live6_stop, "NOT_RENTABLE")
+        self.assertFalse(provider.create_request_sent)
+        self.assertIsNone(provider.execution_grant)
+        self.assertEqual(provider.launch_trace, [])
+        self.assertFalse((provider.runtime / "watchdog.json").is_file())
+        self.assertFalse(any("machine_id" in query and query["machine_id"].get("eq") == 502 for query in posts))
+
+
+class JustInTimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        CreateFlowTests.setUp(self)
+
+    def tearDown(self) -> None:
+        CreateFlowTests.tearDown(self)
+
+    def _auth(self, **overrides):
+        return CreateFlowTests._auth(self, **overrides)
+
+    def _jit(self, **overrides):
+        fields = dict(
+            selection_policy="just_in_time",
+            allowed_machine_ids=(501, 502),
+            allowed_offer_ids=(1001, 1002),
+            allowed_pairs=((501, 1001), (502, 1002)),
+        )
+        fields.update(overrides)
+        return self._auth(**fields)
+
+    def _timed(self):
+        state = {"now": 5_000.0}
+
+        def now() -> float:
+            state["now"] += 1
+            return state["now"]
+
+        return now
+
+    def test_missing_primary_uses_only_the_other_authorized_pair(self) -> None:
+        puts = []
+        box = {}
+        now = self._timed()
+
+        def transport(method, url, body, headers):
+            del headers
+            if method == "PUT":
+                spec = json.loads((box["provider"].runtime / "watchdog.json").read_text(encoding="utf-8"))
+                self.assertEqual(spec["machine_id"], 502)
+                puts.append((url, json.loads(body.decode("utf-8"))))
+                return 200, b'{"success": true, "new_contract": 77}'
+            if method == "POST":
+                query = json.loads(body.decode("utf-8"))
+                machine = (query.get("machine_id") or {}).get("eq")
+                if machine == 501:
+                    return 200, json.dumps({"offers": []}).encode()
+                if machine == 502:
+                    return 200, json.dumps({"offers": [
+                        _offer(1002, 502, gpu_name="RTX 5880 Ada", inet_down=2000),
+                    ]}).encode()
+                return 200, json.dumps({"offers": [
+                    _offer(1003, 503, inet_down=20000, dph_base="0.40", dph_total="0.42"),
+                ]}).encode()
+            if method == "GET":
+                return 200, b'{"success": true, "instances": [], "next_token": null}'
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()), now=now,
+        )
+        box["provider"] = provider
+        provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
+        provider.bind_authorization(self._jit(), code_sha=SHA)
+        self.assertIsNone(provider.execution_grant)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "created")
+        self.assertEqual(result.resource_id, "77")
+        self.assertEqual(len(puts), 1)
+        self.assertTrue(puts[0][0].endswith("/asks/1002/"))
+        self.assertEqual(puts[0][1]["disk"], 140)
+        self.assertNotIn("volume_info", puts[0][1])
+        self.assertEqual(provider.execution_grant.machine_id, 502)
+        self.assertEqual(provider.execution_grant.offer_id, 1002)
+        self.assertEqual(provider.launch_trace, ["watchdog", "put"])
+        self.assertEqual(provider.create_classification, "instance_created")
+        observation = json.loads((provider.runtime / "create-observation.json").read_text(encoding="utf-8"))
+        self.assertEqual(observation["selected_machine_id"], 502)
+        self.assertEqual(observation["selected_offer_id"], 1002)
+        self.assertLess(observation["offer_observed_at"], observation["final_verification_at"])
+        self.assertLess(observation["final_verification_at"], observation["create_request_at"])
+        self.assertEqual(observation["provider_response"]["outcome"], "created")
+        again = provider.create("studio")
+        self.assertEqual(again.outcome, "definite_failure")
+        self.assertEqual(len(puts), 1)
+
+    def test_unauthorized_offer_does_not_win_the_ranking(self) -> None:
+        puts = []
+
+        def transport(method, url, body, headers):
+            del body, headers
+            if method == "PUT":
+                puts.append(url)
+                return 200, b'{"success": true, "new_contract": 77}'
+            if method == "POST":
+                return 200, json.dumps({"offers": [
+                    _offer(1003, 503, inet_down=20000, dph_base="0.40", dph_total="0.42", reliability2=0.999),
+                    _offer(1001, 501, inet_down=3000),
+                    _offer(1002, 502, gpu_name="RTX 5880 Ada", inet_down=2000),
+                ]}).encode()
+            if method == "GET":
+                return 200, b'{"success": true, "instances": [], "next_token": null}'
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
+        provider.bind_authorization(self._jit(), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "created")
+        self.assertEqual(len(puts), 1)
+        self.assertTrue(str(puts[0]).endswith("/asks/1001/"))
+        self.assertEqual(provider.execution_grant.offer_id, 1001)
+
+    def test_final_price_increase_stops_before_the_grant_and_the_request(self) -> None:
+        seen = {"count": 0}
+
+        def transport(method, url, body, headers):
+            del url, headers
+            if method == "PUT":
+                raise AssertionError("create request")
+            if method == "POST":
+                seen["count"] += 1
+                if seen["count"] == 1:
+                    return 200, json.dumps({"offers": [_offer(1001, 501)]}).encode()
+                return 200, json.dumps({"offers": [
+                    _offer(1001, 501, dph_base="1.10", dph_total="1.10"),
+                ]}).encode()
+            if method == "GET":
+                return 200, b'{"success": true, "instances": [], "next_token": null}'
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
+        provider.bind_authorization(self._jit(
+            allowed_machine_ids=(501,),
+            allowed_offer_ids=(1001,),
+            allowed_pairs=((501, 1001),),
+        ), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "definite_failure")
+        self.assertEqual(provider.live6_stop, "PRICE_CHANGED")
+        self.assertFalse(provider.create_request_sent)
+        self.assertIsNone(provider.execution_grant)
+        self.assertEqual(provider.launch_trace, [])
+        self.assertFalse((provider.runtime / "watchdog.json").is_file())
+        self.assertEqual(provider.create_classification, "offer_unavailable_before_create")
+        again = provider.create("studio")
+        self.assertEqual(again.outcome, "definite_failure")
+        self.assertEqual(seen["count"], 2)
+
+    def test_offer_becoming_non_rentable_tries_the_next_pair_before_create(self) -> None:
+        puts = []
+        reads = {"501": 0}
+
+        def transport(method, url, body, headers):
+            del headers
+            if method == "PUT":
+                puts.append(url)
+                return 200, b'{"success": true, "new_contract": 78}'
+            if method == "POST":
+                query = json.loads(body.decode("utf-8"))
+                machine = (query.get("machine_id") or {}).get("eq")
+                if machine == 501:
+                    reads["501"] += 1
+                    rentable = reads["501"] == 1
+                    return 200, json.dumps({"offers": [_offer(1001, 501, rentable=rentable)]}).encode()
+                if machine == 502:
+                    return 200, json.dumps({"offers": [
+                        _offer(1002, 502, gpu_name="RTX 5880 Ada", inet_down=2000),
+                    ]}).encode()
+                return 200, b'{"offers": []}'
+            if method == "GET":
+                return 200, b'{"success": true, "instances": [], "next_token": null}'
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
+        provider.bind_authorization(self._jit(), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "created")
+        self.assertEqual(len(puts), 1)
+        self.assertTrue(puts[0].endswith("/asks/1002/"))
+        self.assertEqual(provider.execution_grant.machine_id, 502)
+        self.assertGreaterEqual(reads["501"], 2)
+        again = provider.create("studio")
+        self.assertEqual(len(puts), 1)
+
+    def test_gpu_family_constraint_narrows_the_authorized_pairs(self) -> None:
+        puts = []
+
+        def transport(method, url, body, headers):
+            del url, headers
+            if method == "PUT":
+                puts.append(1)
+                return 200, b'{"success": true, "new_contract": 79}'
+            if method == "POST":
+                return 200, json.dumps({"offers": [
+                    _offer(1001, 501, inet_down=12000),
+                    _offer(1002, 502, gpu_name="RTX 5880 Ada", inet_down=2000),
+                ]}).encode()
+            if method == "GET":
+                return 200, b'{"success": true, "instances": [], "next_token": null}'
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
+        provider.bind_authorization(self._jit(
+            selection_constraints={"gpu_families": ["5880ada"]},
+        ), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "created")
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(provider.execution_grant.offer_id, 1002)
+        self.assertEqual(provider.execution_grant.gpu_family, "5880ada")
 
 
 class BudgetAndWatchdogTests(unittest.TestCase):

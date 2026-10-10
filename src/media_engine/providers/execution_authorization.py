@@ -25,7 +25,8 @@ from media_engine.safety.spend_grant import SpendGrant
 
 _ID = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
-_POLICIES = frozenset({"exact_offers", "approved_pool"})
+_POLICIES = frozenset({"exact_offers", "approved_pool", "just_in_time"})
+_TOKEN = re.compile(r"^[a-z0-9]{1,32}$")
 _FIELDS = (
     "authorization_id",
     "execution_id",
@@ -44,6 +45,7 @@ _FIELDS = (
     "issued_at",
     "expires_at",
 )
+_OPTIONAL = ("allowed_pairs", "selection_constraints")
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,8 @@ class ExecutionAuthorization:
     revision: str
     issued_at: float
     expires_at: float
+    allowed_pairs: tuple[tuple[int, int], ...] = ()
+    gpu_families: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -72,7 +76,9 @@ class ExecutionAuthorization:
             "code_sha": self.code_sha,
             "allowed_machine_ids": list(self.allowed_machine_ids),
             "allowed_offer_ids": list(self.allowed_offer_ids),
+            "allowed_pairs": [[machine, offer] for machine, offer in self.allowed_pairs],
             "selection_policy": self.selection_policy,
+            "selection_constraints": {"gpu_families": list(self.gpu_families)},
             "max_hourly_usd": str(self.max_hourly_usd),
             "max_total_usd": str(self.max_total_usd),
             "max_instances": self.max_instances,
@@ -88,13 +94,17 @@ class ExecutionAuthorization:
 
 def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
     """Validate and freeze one authorization. Later edits are not a new issuance."""
-    unknown = set(kwargs) - set(_FIELDS)
+    unknown = set(kwargs) - set(_FIELDS) - set(_OPTIONAL)
     if unknown:
         raise WorkerStageError("MISSING_AUTHORIZATION")
     if any(name not in kwargs for name in _FIELDS):
         raise WorkerStageError("MISSING_AUTHORIZATION")
     policy = str(kwargs["selection_policy"])
     if policy not in _POLICIES:
+        raise WorkerStageError("SELECTION_POLICY")
+    pairs = _pairs(kwargs.get("allowed_pairs"))
+    families = _gpu_families(kwargs.get("selection_constraints"))
+    if policy != "just_in_time" and (pairs or families):
         raise WorkerStageError("SELECTION_POLICY")
     authorization_id = str(kwargs["authorization_id"])
     execution_id = str(kwargs["execution_id"])
@@ -107,6 +117,13 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
     offers = _positive_ids(kwargs["allowed_offer_ids"])
     if not machines or not offers:
         raise WorkerStageError("MACHINE_SCOPE")
+    if policy == "just_in_time":
+        if not pairs:
+            raise WorkerStageError("MACHINE_SCOPE")
+        pair_machines = {machine for machine, _offer in pairs}
+        pair_offers = {offer for _machine, offer in pairs}
+        if pair_machines != set(machines) or pair_offers != set(offers):
+            raise WorkerStageError("MACHINE_SCOPE")
     try:
         hourly = Decimal(str(kwargs["max_hourly_usd"]))
         total = Decimal(str(kwargs["max_total_usd"]))
@@ -149,6 +166,8 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
         revision=REVISION,
         issued_at=issued,
         expires_at=expires,
+        allowed_pairs=pairs,
+        gpu_families=families,
     )
 
 
@@ -181,25 +200,49 @@ def select_for_authorization(
     now: float,
 ) -> tuple[GpuCandidate | None, str]:
     """Pick one covered offer. An offer outside the record is never a fallback."""
+    ranked, reason = candidates_for_authorization(authorization, candidates, now=now)
+    if not ranked:
+        return None, reason
+    return ranked[0], ""
+
+
+def candidates_for_authorization(
+    authorization: ExecutionAuthorization,
+    candidates: list[GpuCandidate],
+    *,
+    now: float,
+) -> tuple[list[GpuCandidate], str]:
+    """Rank covered offers. Just-in-time keeps every pair; older policies keep the first."""
     if now >= authorization.expires_at:
-        return None, "EXPIRED_AUTHORIZATION"
+        return [], "EXPIRED_AUTHORIZATION"
     allowed_offers = set(authorization.allowed_offer_ids)
     allowed_machines = set(authorization.allowed_machine_ids)
+    allowed_pairs = set(authorization.allowed_pairs)
     eligible: list[GpuCandidate] = []
     seen: list[str] = []
     for candidate in candidates:
-        offered = candidate.offer_id in allowed_offers
-        hosted = candidate.machine_id in allowed_machines
-        if not offered and not hosted:
-            continue
-        if not offered:
-            seen.append("OFFER_REJECTED")
-            continue
-        if not hosted:
-            seen.append("MACHINE_SCOPE")
-            continue
+        if authorization.selection_policy == "just_in_time":
+            pair = (candidate.machine_id, candidate.offer_id)
+            if pair not in allowed_pairs:
+                if candidate.machine_id in allowed_machines or candidate.offer_id in allowed_offers:
+                    seen.append("OFFER_REJECTED")
+                continue
+        else:
+            offered = candidate.offer_id in allowed_offers
+            hosted = candidate.machine_id in allowed_machines
+            if not offered and not hosted:
+                continue
+            if not offered:
+                seen.append("OFFER_REJECTED")
+                continue
+            if not hosted:
+                seen.append("MACHINE_SCOPE")
+                continue
         if candidate.rejection:
             seen.append(candidate.rejection)
+            continue
+        if authorization.gpu_families and candidate.gpu_family not in authorization.gpu_families:
+            seen.append("GPU_MISMATCH")
             continue
         if candidate.hourly_usd > authorization.max_hourly_usd:
             seen.append("PRICE_CHANGED")
@@ -210,21 +253,30 @@ def select_for_authorization(
         eligible.append(candidate)
     if not eligible:
         if "PRICE_CHANGED" in seen:
-            return None, "PRICE_CHANGED"
+            return [], "PRICE_CHANGED"
         if "NOT_RENTABLE" in seen:
-            return None, "NOT_RENTABLE"
+            return [], "NOT_RENTABLE"
         if seen:
-            return None, seen[0]
-        return None, "OFFER_UNAVAILABLE"
-    return rank_candidates(eligible)[0], ""
+            return [], seen[0]
+        return [], "OFFER_UNAVAILABLE"
+    ranked = rank_candidates(eligible)
+    if authorization.selection_policy == "just_in_time":
+        return ranked, ""
+    return [ranked[0]], ""
 
 
 def make_live8_grant(authorization: ExecutionAuthorization, candidate: GpuCandidate) -> SpendGrant:
     """Bind the grant to the offer selected for this authorization, not to a source constant."""
+    if authorization.selection_policy == "just_in_time":
+        pair = (candidate.machine_id, candidate.offer_id)
+        if pair not in authorization.allowed_pairs:
+            raise WorkerStageError("OFFER_REJECTED")
     if candidate.offer_id not in authorization.allowed_offer_ids:
         raise WorkerStageError("OFFER_REJECTED")
     if candidate.machine_id not in authorization.allowed_machine_ids:
         raise WorkerStageError("MACHINE_SCOPE")
+    if authorization.gpu_families and candidate.gpu_family not in authorization.gpu_families:
+        raise WorkerStageError("GPU_MISMATCH")
     seconds = authorized_billable_seconds(candidate.hourly_usd, authorization.max_total_usd)
     if seconds is None:
         raise WorkerStageError("BUDGET_MISMATCH")
@@ -247,6 +299,47 @@ def make_live8_grant(authorization: ExecutionAuthorization, candidate: GpuCandid
         cuda_min=str(LIVE7_CUDA_MIN),
         forbidden_volume_id=FORBIDDEN_VOLUME_ID,
     )
+
+
+def _pairs(value: object) -> tuple[tuple[int, int], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise WorkerStageError("MACHINE_SCOPE")
+    found = []
+    for item in value:
+        if isinstance(item, (str, bytes)) or not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise WorkerStageError("MACHINE_SCOPE")
+        try:
+            machine = int(item[0])
+            offer = int(item[1])
+        except (TypeError, ValueError) as exc:
+            raise WorkerStageError("MACHINE_SCOPE") from exc
+        if machine <= 0 or offer <= 0:
+            raise WorkerStageError("MACHINE_SCOPE")
+        found.append((machine, offer))
+    return tuple(dict.fromkeys(found))
+
+
+def _gpu_families(value: object) -> tuple[str, ...]:
+    """Narrow a just-in-time set. Price and GPU class alone never add a machine."""
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise WorkerStageError("SELECTION_POLICY")
+    unknown = set(value) - {"gpu_families"}
+    if unknown:
+        raise WorkerStageError("SELECTION_POLICY")
+    raw = value.get("gpu_families", [])
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise WorkerStageError("SELECTION_POLICY")
+    found = []
+    for item in raw:
+        token = str(item).strip().casefold()
+        if _TOKEN.fullmatch(token) is None:
+            raise WorkerStageError("SELECTION_POLICY")
+        found.append(token)
+    return tuple(dict.fromkeys(found))
 
 
 def _positive_ids(value: object) -> tuple[int, ...]:

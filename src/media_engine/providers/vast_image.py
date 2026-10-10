@@ -356,6 +356,15 @@ class VastImageProvider(GPUProvider):
         self.cost_before_generation_usd = Decimal("0")
         self.last_instance_id = ""
         self._put_done = False
+        self._create_closed = False
+        self.create_request_sent = False
+        self.create_classification = ""
+        self.billing_exposure = False
+        self.offer_observed_at: float | None = None
+        self.final_verification_at: float | None = None
+        self.create_request_at: float | None = None
+        self.provider_response: dict | None = None
+        self.selection_attempts: list[dict] = []
         self.execution_grant = None
         self.execution_authorization = None
         self.execution_id = ""
@@ -750,7 +759,7 @@ class VastImageProvider(GPUProvider):
     def _search_live8(self) -> list:
         """Current rentable offers. A failed search is not an empty market."""
         from media_engine.providers.live7_contract import LIVE7_DISK_GB, LIVE7_MIN_VRAM_MIB
-        status, raw = self._request("POST", BUNDLES, {
+        return self._bundle_rows({
             "limit": 200,
             "type": "on-demand",
             "rentable": {"eq": True},
@@ -758,6 +767,18 @@ class VastImageProvider(GPUProvider):
             "gpu_ram": {"gte": LIVE7_MIN_VRAM_MIB},
             "disk_space": {"gte": LIVE7_DISK_GB},
         })
+
+    def _machine_offers(self, machine_id: int) -> list:
+        """One machine, including a row that is no longer marked rentable."""
+        return self._bundle_rows({
+            "limit": 16,
+            "type": "on-demand",
+            "num_gpus": {"eq": 1},
+            "machine_id": {"eq": int(machine_id)},
+        })
+
+    def _bundle_rows(self, query: dict) -> list:
+        status, raw = self._request("POST", BUNDLES, query)
         if status != 200:
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
         try:
@@ -767,7 +788,23 @@ class VastImageProvider(GPUProvider):
         offers = payload.get("offers") if isinstance(payload, dict) else None
         if not isinstance(offers, list):
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
-        return offers
+        return [row for row in offers if isinstance(row, dict)]
+
+    def _live8_inventory_rows(self) -> list:
+        """Fresh inventory. Just-in-time reads only the permitted machines."""
+        authorization = self.execution_authorization
+        if authorization is None:
+            raise WorkerStageError("MISSING_AUTHORIZATION")
+        if authorization.selection_policy != "just_in_time":
+            return self._search_live8()
+        rows: list = []
+        seen: set[int] = set()
+        for machine_id, _offer_id in authorization.allowed_pairs:
+            if machine_id in seen:
+                continue
+            seen.add(machine_id)
+            rows.extend(self._machine_offers(machine_id))
+        return rows
 
     def _refresh_live8(self, *, bind_grant: bool = True) -> None:
         """Re-read inventory and keep only an offer inside this authorization."""
@@ -808,7 +845,7 @@ class VastImageProvider(GPUProvider):
             grant = make_live8_grant(authorization, chosen)
             self.bind_execution(grant, execution_id=authorization.execution_id)
 
-    def _reject_live8_run(self) -> str:
+    def _reject_live8_run(self, listed: list | None = None) -> str:
         """Safety gates for the selected offer. A failed list blocks the rental."""
         authorization = self.execution_authorization
         if authorization is None or self.execution_grant is None:
@@ -830,7 +867,7 @@ class VastImageProvider(GPUProvider):
         if int(self.execution_grant.offer_id or 0) != int(self.offer_id):
             return "OFFER_REJECTED"
         try:
-            listed = self._instances()
+            listed = self._instances() if listed is None else listed
         except WorkerStageError as exc:
             return exc.code
         for row in listed:
@@ -993,6 +1030,8 @@ class VastImageProvider(GPUProvider):
         saved = str(payload.get("instance_id") or "")
         if payload.get("state") == "created" and saved.isdigit():
             return saved
+        if payload.get("state") == "rejected":
+            return self._reconcile_rejected(label, machine_id)
         try:
             listed = self._instances()
         except WorkerStageError as exc:
@@ -1008,37 +1047,241 @@ class VastImageProvider(GPUProvider):
         self.live6_stop = "UNRESOLVED_BILLING"
         return "unresolved"
 
-    def create(self, owner: str) -> CreateResult:
-        if self._put_done:
-            return CreateResult(outcome="definite_failure")
-        self._put_done = True
-        if self._live8_bound():
-            prior = self._reconcile_create_intent()
-            if prior == "unresolved":
-                return CreateResult(outcome="ambiguous")
-            if prior.isdigit():
-                self._resource_id = prior
-                self.last_instance_id = prior
-                self._remember_instance(prior)
-                return CreateResult(outcome="created", resource_id=prior)
-            try:
-                self._refresh_live8()
-            except WorkerStageError as exc:
-                self.live6_stop = exc.code
-                return CreateResult(outcome="definite_failure")
-            reason = self._reject_live8_run()
-            if reason:
-                self.live6_stop = reason
-                return CreateResult(outcome="definite_failure")
-            reason = self._stage_preflight_reason()
-            if reason:
-                self.live6_stop = reason
-                return CreateResult(outcome="definite_failure")
-            if not self._arm_guard():
+    def _reconcile_rejected(self, label: str, machine_id: int) -> str:
+        """A rejected create stays closed. An instance that actually appeared is adopted."""
+        try:
+            listed = self._instances()
+        except WorkerStageError as exc:
+            self.live6_stop = exc.code
+            return "unresolved"
+        found = [
+            str(row.get("id"))
+            for row in listed
+            if str(row.get("label") or "") == label and int(row.get("machine_id") or 0) == machine_id
+        ]
+        if len(found) == 1 and str(found[0]).isdigit():
+            return str(found[0])
+        if found:
+            self.live6_stop = "UNRESOLVED_BILLING"
+            return "unresolved"
+        self.create_classification = "provider_create_rejected"
+        self.billing_exposure = False
+        return "rejected"
+
+    def _stop_before_create(self, reason: str) -> CreateResult:
+        """The provider was not asked to create an instance."""
+        self.live6_stop = reason
+        self.create_request_sent = False
+        self.create_classification = "offer_unavailable_before_create"
+        self.billing_exposure = False
+        self.provider_response = None
+        self._write_create_observation()
+        return CreateResult(outcome="definite_failure")
+
+    def _write_create_observation(self) -> None:
+        selected_machine = int(self.machine_id or 0)
+        selected_offer = int(self.offer_id or 0)
+        if self.selection_attempts and self.selection_attempts[-1].get("result") != "verified":
+            selected_machine = int(self.selection_attempts[-1]["machine_id"])
+            selected_offer = int(self.selection_attempts[-1]["offer_id"])
+        payload = {
+            "offer_observed_at": self.offer_observed_at,
+            "selected_machine_id": selected_machine,
+            "selected_offer_id": selected_offer,
+            "final_verification_at": self.final_verification_at,
+            "create_request_at": self.create_request_at,
+            "create_request_sent": bool(self.create_request_sent),
+            "provider_response": self.provider_response,
+            "classification": self.create_classification,
+            "billing_exposure": bool(self.billing_exposure),
+            "stop": self.live6_stop,
+            "attempts": list(self.selection_attempts),
+        }
+        path = Path(self.runtime) / "create-observation.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    def _apply_live8_candidate(self, chosen) -> None:
+        authorization = self.execution_authorization
+        self.offer_id = str(chosen.offer_id)
+        self.machine_id = str(chosen.machine_id)
+        self.gpu_model = chosen.gpu_name
+        self.hourly_amount = chosen.hourly_usd
+        self.disk_gb = authorization.max_disk_gb
+        self.cache_source = "r2_cold_stage"
+        self.attached_volume_id = 0
+        self.gpu_ram_mib = float(chosen.vram_mib)
+        self.cuda_max_good = float(chosen.cuda or 0)
+        self.compute_cap = chosen.compute_cap
+        self.projected_cost_usd = chosen.session_cost_usd
+        self.fits_operation_budget = True
+
+    def _final_verify(self, candidate):
+        """Re-read one offer immediately before any create request."""
+        from media_engine.providers.gpu_discovery import assess_offer
+        authorization = self.execution_authorization
+        self.final_verification_at = float(self._now())
+        try:
+            rows = self._machine_offers(candidate.machine_id)
+        except WorkerStageError as exc:
+            return None, exc.code
+        match = [
+            row for row in rows
+            if int(row.get("id") or 0) == candidate.offer_id
+            and int(row.get("machine_id") or 0) == candidate.machine_id
+        ]
+        if len(match) != 1:
+            return None, "OFFER_UNAVAILABLE"
+        assessed = assess_offer(
+            match[0],
+            observed_at=float(self.final_verification_at),
+            max_hourly=authorization.max_hourly_usd,
+            ceiling=authorization.max_total_usd,
+        )
+        if assessed.rejection:
+            return None, assessed.rejection
+        if authorization.gpu_families and assessed.gpu_family not in authorization.gpu_families:
+            return None, "GPU_MISMATCH"
+        if assessed.hourly_usd > authorization.max_hourly_usd:
+            return None, "PRICE_CHANGED"
+        if authorization.selection_policy == "just_in_time":
+            pair = (assessed.machine_id, assessed.offer_id)
+            if pair not in authorization.allowed_pairs:
+                return None, "OFFER_REJECTED"
+        elif (
+            assessed.offer_id not in authorization.allowed_offer_ids
+            or assessed.machine_id not in authorization.allowed_machine_ids
+        ):
+            return None, "OFFER_REJECTED"
+        return assessed, ""
+
+    def _label_absent(self, label: str) -> bool:
+        try:
+            listed = self._instances()
+        except WorkerStageError:
+            return False
+        return not any(str(row.get("label") or "") == label for row in listed)
+
+    def _record_create_response(self, status: int, outcome: str, label: str) -> None:
+        self.provider_response = {"status": int(status), "outcome": outcome}
+        if outcome == "created":
+            self.create_classification = "instance_created"
+            self.billing_exposure = True
+        elif outcome == "definite_failure":
+            self.create_classification = "provider_create_rejected"
+            absent = self._label_absent(label)
+            self.billing_exposure = not absent
+            if absent:
+                self._mark_intent("rejected")
+            else:
+                self._mark_intent("unresolved")
                 if not self.live6_stop:
-                    self.live6_stop = "WATCHDOG_NOT_ARMED"
-                return CreateResult(outcome="definite_failure")
-        elif not self.offer_id:
+                    self.live6_stop = "UNRESOLVED_BILLING"
+        else:
+            self.create_classification = "ambiguous_create"
+            self.billing_exposure = True
+        self._write_create_observation()
+
+    def _create_live8(self, owner: str) -> CreateResult:
+        """Select inside the authorization, verify that offer, then send one create."""
+        from media_engine.providers.execution_authorization import (
+            candidates_for_authorization,
+            make_live8_grant,
+        )
+        from media_engine.providers.gpu_discovery import assess_offers
+        prior = self._reconcile_create_intent()
+        if prior == "unresolved":
+            self.create_classification = "ambiguous_create"
+            self.billing_exposure = True
+            self._write_create_observation()
+            return CreateResult(outcome="ambiguous")
+        if prior == "rejected":
+            self._write_create_observation()
+            return CreateResult(outcome="definite_failure")
+        if prior.isdigit():
+            self.create_classification = "instance_created"
+            self.billing_exposure = True
+            self._resource_id = prior
+            self.last_instance_id = prior
+            self._remember_instance(prior)
+            self._write_create_observation()
+            return CreateResult(outcome="created", resource_id=prior)
+        try:
+            listed = self._instances()
+        except WorkerStageError as exc:
+            return self._stop_before_create(exc.code)
+        try:
+            rows = self._live8_inventory_rows()
+        except WorkerStageError as exc:
+            return self._stop_before_create(exc.code)
+        self.offer_observed_at = float(self._now())
+        authorization = self.execution_authorization
+        assessed = assess_offers(
+            rows,
+            observed_at=float(self.offer_observed_at),
+            max_hourly=authorization.max_hourly_usd,
+            ceiling=authorization.max_total_usd,
+        )
+        ranked, reason = candidates_for_authorization(
+            authorization, assessed, now=float(self._now()),
+        )
+        if not ranked:
+            return self._stop_before_create(reason or "OFFER_UNAVAILABLE")
+        reason = self._stage_preflight_reason()
+        if reason:
+            return self._stop_before_create(reason)
+        verified = None
+        for candidate in ranked:
+            checked, rejection = self._final_verify(candidate)
+            self.selection_attempts.append({
+                "machine_id": candidate.machine_id,
+                "offer_id": candidate.offer_id,
+                "verified_at": self.final_verification_at,
+                "result": rejection or "verified",
+            })
+            if rejection:
+                if authorization.selection_policy != "just_in_time":
+                    return self._stop_before_create(rejection)
+                continue
+            verified = checked
+            break
+        if verified is None:
+            last = self.selection_attempts[-1]["result"] if self.selection_attempts else "OFFER_UNAVAILABLE"
+            return self._stop_before_create(str(last))
+        occupied = any(
+            str(row.get("label") or "").startswith("media-engine:")
+            and int(row.get("machine_id") or 0) == verified.machine_id
+            for row in listed
+        )
+        if occupied:
+            return self._stop_before_create("INSTANCE_LIMIT")
+        self._apply_live8_candidate(verified)
+        try:
+            grant = make_live8_grant(authorization, verified)
+            self.bind_execution(grant, execution_id=authorization.execution_id)
+        except WorkerStageError as exc:
+            return self._stop_before_create(exc.code)
+        reason = self._reject_live8_run(listed)
+        if reason:
+            return self._stop_before_create(reason)
+        if not self._arm_guard():
+            if not self.live6_stop:
+                self.live6_stop = "WATCHDOG_NOT_ARMED"
+            self.create_request_sent = False
+            self.create_classification = "offer_unavailable_before_create"
+            self.billing_exposure = False
+            self._write_create_observation()
+            return CreateResult(outcome="definite_failure")
+        return self._dispatch_create(owner)
+
+    def create(self, owner: str) -> CreateResult:
+        if self._put_done or self._create_closed:
+            return CreateResult(outcome="definite_failure")
+        if self._live8_bound():
+            self._create_closed = True
+            return self._create_live8(owner)
+        self._put_done = True
+        if not self.offer_id:
             self.quote(owner)
         if self._live7_bound():
             reason = self._reject_live7_run()
@@ -1061,6 +1304,9 @@ class VastImageProvider(GPUProvider):
                 if not self.live6_stop:
                     self.live6_stop = "WATCHDOG_NOT_ARMED"
                 return CreateResult(outcome="definite_failure")
+        return self._dispatch_create(owner)
+
+    def _dispatch_create(self, owner: str) -> CreateResult:
         label = ownership_label(self.execution_id if self._live8_bound() else owner)
         image = worker_image()
         body = {
@@ -1085,6 +1331,8 @@ class VastImageProvider(GPUProvider):
             }
         if self._live7_bound() or self._live8_bound():
             if "volume_info" in body or int(getattr(self, "attached_volume_id", 0) or 0) == VOLUME_ID:
+                if self._live8_bound():
+                    return self._stop_before_create("VOLUME_MISMATCH")
                 self.live6_stop = "VOLUME_MISMATCH"
                 return CreateResult(outcome="definite_failure")
         elif self.cache_source == "warm_cache":
@@ -1093,6 +1341,9 @@ class VastImageProvider(GPUProvider):
             }
         if self._live8_bound():
             self._write_create_intent(label)
+            self._put_done = True
+            self.create_request_sent = True
+            self.create_request_at = float(self._now())
         self.launch_trace.append("put")
         status, raw = self._request("PUT", f"https://console.vast.ai/api/v0/asks/{self.offer_id}/", body)
         if status <= 0:
@@ -1107,6 +1358,8 @@ class VastImageProvider(GPUProvider):
                 self._mark_intent("unresolved")
                 if not self.live6_stop:
                     self.live6_stop = "UNRESOLVED_BILLING"
+        if self._live8_bound():
+            self._record_create_response(status, outcome, label)
         if outcome == "created" and instance_id:
             self._resource_id = instance_id
             self.last_instance_id = instance_id
