@@ -21,6 +21,7 @@ from media_engine.infra.warm import WarmLease, WarmWorker
 from media_engine.infra.worker_cache import persistent_cache_hit
 from media_engine.platform.repository import SqliteRepository
 from media_engine.platform.service import Platform
+from media_engine.providers.base import WorkerStageError
 from media_engine.providers.vast_image import BUNDLES, VastImageProvider
 
 
@@ -238,11 +239,11 @@ class QueueAndCacheTests(unittest.TestCase):
         self.assertIn("FOR UPDATE SKIP LOCKED", postgres)
         self.assertNotIn("open_production_stores", Path("src/media_engine/infra/pipeline.py").read_text(encoding="utf-8"))
 
-    def test_persistent_cache_hit_skips_the_worker_download(self) -> None:
+    def test_control_plane_cache_does_not_skip_the_worker(self) -> None:
         root = Path(tempfile.mkdtemp()) / "models"
         cache = RevisionCache(root, revision=PINNED_REVISION, expected_files=1, expected_bytes=2)
         cache.stage(PINNED_REVISION, _Source(b"aa"), [{"path": "a.txt", "bytes": 2}])
-        self.assertTrue(persistent_cache_hit(str(root)))
+        self.assertFalse(persistent_cache_hit(str(root), min_bytes=2))
         calls = []
 
         def transport(method, url, body, headers):
@@ -254,15 +255,16 @@ class QueueAndCacheTests(unittest.TestCase):
         previous = __import__("os").environ.get("MEDIA_ENGINE_MODEL_CACHE")
         __import__("os").environ["MEDIA_ENGINE_MODEL_CACHE"] = str(root)
         try:
-            provider.confirm_cache("1")
+            with self.assertRaises(WorkerStageError):
+                provider.confirm_cache("1")
         finally:
             if previous is None:
                 __import__("os").environ.pop("MEDIA_ENGINE_MODEL_CACHE", None)
             else:
                 __import__("os").environ["MEDIA_ENGINE_MODEL_CACHE"] = previous
-        self.assertEqual(provider.cache_validation, "COMPLETE")
-        self.assertEqual(provider.cache_source, "persistent_revision_cache")
+        self.assertNotEqual(provider.cache_source, "worker_cache_hit")
         self.assertEqual(calls, [])
+        self.assertFalse(persistent_cache_hit(str(root), min_bytes=2))
         self.assertNotEqual(BUNDLES, "")
 
     def test_admin_snapshot_lists_disabled_session_budgets(self) -> None:

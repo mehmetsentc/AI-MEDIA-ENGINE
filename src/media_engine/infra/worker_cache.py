@@ -1,14 +1,13 @@
-"""Tell the Qwen worker whether the persistent revision cache is already valid."""
+"""Worker-layout cache decision. A control-plane directory is not the GPU."""
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
-from media_engine.infra.cache import PINNED_REVISION, RevisionCache
+from media_engine.engines.image.qwen_remote import cache_is_ready
 
 
-def persistent_cache_hit(root: str | None = None, revision: str = PINNED_REVISION) -> bool:
-    """A hit skips another download. Instance disk is not this path unless configured."""
-    path = root if root is not None else os.environ.get("MEDIA_ENGINE_MODEL_CACHE", "")
-    if not str(path or "").strip():
+def persistent_cache_hit(root: str | None = None, *, min_bytes: int | None = None) -> bool:
+    """Assess the Qwen worker layout. This does not skip a remote check by itself."""
+    if not str(root or "").strip():
         return False
-    return RevisionCache(path).lookup(revision) == "HIT"
+    return cache_is_ready(Path(root), min_bytes=min_bytes)

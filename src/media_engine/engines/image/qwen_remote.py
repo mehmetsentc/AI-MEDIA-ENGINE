@@ -35,6 +35,45 @@ def _record_exception(report: dict, error: str, exc: BaseException) -> None:
     _write_report(report)
 
 
+PINNED_QWEN_REVISION = "75e0b4be04f60ec59a75f475837eced720f823b6"
+WORKER_MOUNT = "/models"
+
+
+def resolve_worker_mount(job: dict | None = None, default: str = WORKER_MOUNT) -> Path:
+    """The worker reads MEDIA_ENGINE_MODEL_CACHE. A missing value stays on /models."""
+    configured = os.environ.get("MEDIA_ENGINE_MODEL_CACHE", "").strip()
+    if configured:
+        return Path(configured)
+    if isinstance(job, dict) and job.get("cache_mount"):
+        return Path(str(job["cache_mount"]))
+    return Path(default)
+
+
+def cache_is_ready(mount: Path, *, min_bytes: int | None = None) -> bool:
+    """True only when this worker directory already has the pinned Qwen snapshot."""
+    assess, read_manifest, complete, minimum = _worker_cache_api()
+    floor = minimum if min_bytes is None else int(min_bytes)
+    if assess(mount, min_bytes=floor) != complete:
+        return False
+    manifest = read_manifest(mount) or {}
+    return str(manifest.get("revision") or "") == PINNED_QWEN_REVISION
+
+
+def run_session(jobs: list[dict], *, mount: Path, cache_ready, sync, load, generate) -> dict:
+    """One load for every job. Download only when the worker cache is not ready."""
+    if not jobs:
+        raise RuntimeError("JOBS_REQUIRED")
+    downloads = 0
+    if not cache_ready(mount):
+        sync(mount)
+        downloads = 1
+        if not cache_ready(mount):
+            raise RuntimeError("MODEL_CACHE_NOT_READY")
+    pipe = load(mount)
+    outputs = [generate(pipe, job) for job in jobs]
+    return {"downloads": downloads, "loads": 1, "jobs": len(outputs), "outputs": outputs}
+
+
 def main() -> int:
     phase = sys.argv[1] if len(sys.argv) > 1 else "all"
     job = json.loads(Path("/workspace/phase2d_job.json").read_text(encoding="utf-8"))
@@ -44,15 +83,18 @@ def main() -> int:
         "operation": "PHASE2D_GENERATE",
     }
     prepare_generation, cache_error, mount_path = _cache_api()
-    mount = Path(str(job.get("cache_mount") or mount_path))
+    mount = resolve_worker_mount(job, mount_path)
     cache = mount / "hf-cache"
     os.environ["HF_HOME"] = str(cache)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache)
     if phase == "cache-sync":
         report["stage"] = "CACHE_SYNC"
         try:
-            if os.environ.get("MODEL_CACHE_PROVIDER") == "r2":
+            if cache_is_ready(mount):
+                report["cache"] = "HIT"
+            elif os.environ.get("MODEL_CACHE_PROVIDER") == "r2":
                 _sync_r2(mount, deadline_seconds=_phase_seconds("PHASE2D_CACHE_SYNC_SECONDS", 1200))
+                report["cache"] = "STAGED"
             else:
                 raise cache_error("INVALID")
         except TimeoutError:
@@ -88,7 +130,7 @@ def main() -> int:
     report["diffusers"] = diffusers.__version__
     report["transformers"] = transformers.__version__
     try:
-        if phase != "generate" and os.environ.get("MODEL_CACHE_PROVIDER") == "r2":
+        if phase != "generate" and os.environ.get("MODEL_CACHE_PROVIDER") == "r2" and not cache_is_ready(mount):
             _sync_r2(mount, deadline_seconds=_phase_seconds("PHASE2D_CACHE_SYNC_SECONDS", 1200))
         local = prepare_generation(mount, snapshot_download)
     except TimeoutError:
@@ -182,6 +224,20 @@ def _load_workspace_module(name: str, path: str):
         sys.modules.pop(name, None)
         raise
     return module
+
+
+def _worker_cache_api():
+    try:
+        from media_engine.engines.image.model_cache import (
+            COMPLETE,
+            QWEN_CACHE_MIN_BYTES,
+            assess_cache,
+            read_manifest,
+        )
+    except ImportError:
+        module = _load_workspace_module("phase2d_model_cache", "/workspace/model_cache.py")
+        return module.assess_cache, module.read_manifest, module.COMPLETE, module.QWEN_CACHE_MIN_BYTES
+    return assess_cache, read_manifest, COMPLETE, QWEN_CACHE_MIN_BYTES
 
 
 def _cache_api():

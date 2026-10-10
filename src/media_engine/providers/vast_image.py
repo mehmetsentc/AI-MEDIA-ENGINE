@@ -1537,10 +1537,9 @@ class VastImageProvider(GPUProvider):
 
     def confirm_cache(self, resource_id: str) -> None:
         if self.cache_source == "r2_cold_stage":
-            from media_engine.infra.worker_cache import persistent_cache_hit
-            if persistent_cache_hit():
+            if self._worker_cache_already_complete():
                 self.cache_validation = "COMPLETE"
-                self.cache_source = "persistent_revision_cache"
+                self.cache_source = "worker_cache_hit"
                 return
             if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
                 self.cache_validation = "R2_FORBIDDEN"
@@ -1751,6 +1750,14 @@ class VastImageProvider(GPUProvider):
             return []
         offers = payload.get("offers") if isinstance(payload, dict) else None
         return offers if isinstance(offers, list) else []
+
+    def _worker_cache_already_complete(self) -> bool:
+        """Ask the GPU. A cache directory on the control machine is not a hit."""
+        try:
+            code, out, _err = self._remote(_CACHE_CHECK, 180)
+        except WorkerStageError:
+            return False
+        return code == 0 and _cache_ok(out, require_mount=False)
 
     def _stage_r2(self) -> None:
         if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
@@ -2455,19 +2462,20 @@ def _cache_ok(text: str, *, require_mount: bool = True) -> bool:
 _CACHE_CHECK = r"""python3 - << 'PY'
 import json, os, sys
 sys.path.insert(0, "/workspace")
-manifest_path = "/models/%s"
+mount = os.environ.get("MEDIA_ENGINE_MODEL_CACHE") or "/models"
+manifest_path = mount.rstrip("/") + "/%s"
 try:
     manifest = json.load(open(manifest_path))
 except Exception:
-    print(json.dumps({"state": "MISSING", "mount": os.path.ismount("/models"), "entries": []}))
+    print(json.dumps({"state": "MISSING", "mount": os.path.ismount(mount), "entries": []}))
     raise SystemExit(0)
 state = manifest.get("state")
 entries = []
 try:
     import model_cache
-    state = model_cache.assess_cache(model_cache.Path("/models"))
+    state = model_cache.assess_cache(model_cache.Path(mount))
     revision = str(manifest.get("revision") or "")
-    snapshot = model_cache.snapshot_dir(model_cache.Path("/models"), revision)
+    snapshot = model_cache.snapshot_dir(model_cache.Path(mount), revision)
     files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
     for entry in files:
         if not isinstance(entry, dict):
@@ -2488,7 +2496,7 @@ print(json.dumps({
     "revision": manifest.get("revision"),
     "files": manifest.get("expected_file_count"),
     "bytes": manifest.get("expected_total_bytes"),
-    "mount": os.path.ismount("/models"),
+    "mount": os.path.ismount(mount),
     "entries": entries,
 }))
 PY""" % MANIFEST_NAME

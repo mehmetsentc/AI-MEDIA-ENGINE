@@ -990,6 +990,10 @@ def r2_worker_env(env: Mapping[str, str]) -> Optional[bytes]:
         if not value.strip():
             return None
         lines.append(name + "=" + shlex.quote(value))
+    cache = str(env.get("MEDIA_ENGINE_MODEL_CACHE") or "").strip()
+    if cache == "/models" or cache.startswith("/models/"):
+        lines.append("MEDIA_ENGINE_MODEL_CACHE=" + shlex.quote(cache))
+    lines.append('MEDIA_ENGINE_MODEL_REVISION="75e0b4be04f60ec59a75f475837eced720f823b6"')
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
