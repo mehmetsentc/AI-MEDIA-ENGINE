@@ -1,6 +1,8 @@
 """Admin snapshot. Credentials are not part of the payload."""
 from __future__ import annotations
 
+from media_engine.infra.policies import catalog, session_contract
+
 _SECRET_KEYS = {"api_key", "authorization", "secret", "token", "database_url"}
 
 
@@ -32,7 +34,16 @@ def snapshot_for(manager, *, cache=None, worker=None, queue_length: int = 0) -> 
         "shutdown": "automatic" if body["state"] in {"IDLE", "STOPPING", "STOPPED"} else "armed",
         "alerts": [_public_alert(item) for item in body.get("alerts", [])],
         "candidates": body.get("candidates", 0),
+        "inventory": body.get("inventory", []),
         "poll_backoff_seconds": body.get("poll_backoff_seconds", 0),
+        "recovery": body.get("recovery", body["state"]),
+        "session_budgets": [session_contract(name) for name in catalog()],
+        "estimated_session_usd": session_contract("1h")["total_target_usd"],
+        "billing_exposure": {
+            "create_attempted": body.get("create_attempted", False),
+            "provider_creates": body.get("provider_creates", 0),
+            "paid_actions_enabled": False,
+        },
     }
     return _redact(payload)
 

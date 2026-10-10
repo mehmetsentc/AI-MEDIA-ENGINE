@@ -50,13 +50,19 @@
         card("GPU status", body.gpu_status || "STOPPED");
         card("Instances", String((body.instances || []).length));
         card("Loaded models", (body.loaded_models || []).join(", ") || "none");
+        card("Inventory", String(body.candidates ?? 0));
         card("Cache", (body.cache && body.cache.state) || "UNKNOWN");
         card("Queue", String(body.queue_length ?? 0));
         card("Hourly", body.hourly_usd || "0");
         card("Est. daily", body.estimated_daily_usd || "0");
         card("Est. monthly", body.estimated_monthly_usd || "0");
+        card("Est. session", body.estimated_session_usd || "0");
+        card("Session budgets", (body.session_budgets || []).map(function (item) {
+          return item.name + " off";
+        }).join(", ") || "off");
         card("Session remaining", String(body.session_remaining_seconds ?? 0) + "s");
         card("Shutdown", body.shutdown || "automatic");
+        card("Recovery", body.recovery || body.gpu_status || "STOPPED");
         alerts.textContent = JSON.stringify(body.alerts || [], null, 2);
       })
       .catch(() => {

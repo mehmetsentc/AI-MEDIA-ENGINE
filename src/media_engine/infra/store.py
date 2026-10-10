@@ -58,6 +58,10 @@ class ManagerStore:
         )
         self._db.commit()
 
+    def authorizes_rental(self) -> bool:
+        """Local state cannot permit a rental, regardless of what a row contains."""
+        return False
+
     def load(self) -> dict | None:
         row = self._db.execute("SELECT * FROM gpu_manager_state WHERE id = 1").fetchone()
         if row is None:

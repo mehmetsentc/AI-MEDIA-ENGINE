@@ -43,6 +43,32 @@ class GpuManager:
         self.detail = {} if saved is None else saved["detail"]
         self.hourly_usd = Decimal(str(self.detail.get("hourly_usd") or "0"))
 
+    def pull(self, source, *, ceiling: Decimal) -> list:
+        """Read-only discovery plus instance reconciliation. This never creates."""
+        current = float(self.now())
+        if current < float(getattr(self, "next_pull_at", 0) or 0):
+            self.alerts.append({"code": "POLL_BACKOFF", "at": current})
+            return self.candidates
+        if not self.poll.allow(current):
+            self.alerts.append({"code": "POLL_LIMIT", "at": current})
+            return self.candidates
+        try:
+            rows = source.search()
+        except Exception as exc:
+            self.poll.record(current, ok=False)
+            self.next_pull_at = current + self.poll.backoff_seconds
+            self.alerts.append({"code": "DISCOVERY_FAILED", "error": type(exc).__name__})
+            return self.candidates
+        ranked = self.discover(rows, ceiling=ceiling)
+        self.next_pull_at = current + self.poll.interval_seconds
+        try:
+            listed = source.instances()
+        except Exception as exc:
+            self.alerts.append({"code": "RECONCILE_FAILED", "error": type(exc).__name__})
+            return ranked
+        self.reconcile(listed)
+        return ranked
+
     def discover(self, rows: list, *, ceiling: Decimal) -> list:
         current = float(self.now())
         if not self.poll.allow(current):
@@ -70,6 +96,8 @@ class GpuManager:
 
     def evaluate_capacity(self, policy_name: str, authorization: dict | None) -> dict:
         """Decide whether a future create would be legal. This method never creates one."""
+        if self.store.authorizes_rental():
+            return {"allowed": False, "reason": PAID_ACTIONS_DISABLED, "creates": 0}
         if self.state == AMBIGUOUS or self.create_attempted:
             return {"allowed": False, "reason": "AMBIGUOUS_CREATE", "creates": 0}
         policy = self.policies.get(policy_name)
@@ -195,7 +223,20 @@ class GpuManager:
             "paid_actions_enabled": False,
             "alerts": list(self.alerts),
             "candidates": len(self.candidates),
+            "inventory": [
+                {
+                    "offer_id": item.offer_id,
+                    "machine_id": item.machine_id,
+                    "gpu_name": item.gpu_name,
+                    "vram_mib": item.vram_mib,
+                    "hourly_usd": str(item.hourly_usd),
+                    "reliability": item.reliability,
+                    "eligible": item.eligible,
+                }
+                for item in self.candidates[:4]
+            ],
             "poll_backoff_seconds": self.poll.backoff_seconds,
+            "recovery": self.state,
         }
 
     def _adopt(self, row: dict, proposed: str) -> None:

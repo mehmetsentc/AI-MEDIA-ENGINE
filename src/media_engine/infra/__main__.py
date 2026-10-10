@@ -17,6 +17,7 @@ from pathlib import Path
 from media_engine.infra.manager import GpuManager
 from media_engine.infra.policies import PAID_ACTIONS_DISABLED
 from media_engine.infra.store import ManagerStore
+from media_engine.infra.vast_read import VastReadOnly, offline_transport
 
 
 def main() -> int:
@@ -31,8 +32,7 @@ def main() -> int:
     once = os.environ.get("MEDIA_ENGINE_GPU_ONCE", "1") == "1"
     while True:
         if manager.poll.allow(time.time()):
-            manager.discover([], ceiling=Decimal("5.00"))
-            manager.reconcile([])
+            manager.pull(VastReadOnly(offline_transport), ceiling=Decimal("5.00"))
         if once:
             break
         time.sleep(max(1.0, interval))

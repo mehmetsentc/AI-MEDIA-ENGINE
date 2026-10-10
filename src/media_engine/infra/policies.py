@@ -19,6 +19,7 @@ class SessionPolicy:
     hourly_ceiling_usd: Decimal = HOURLY_CEILING_USD
     idle_shutdown_seconds: int = IDLE_SHUTDOWN_SECONDS
     deletion_reserve_seconds: int = DELETION_RESERVE_SECONDS
+    max_jobs: int = 1
     allows_paid_create: bool = False
 
     def session_seconds(self) -> int:
@@ -39,8 +40,34 @@ class SessionPolicy:
 
 def catalog() -> dict[str, SessionPolicy]:
     return {
-        name: SessionPolicy(name=name, hours=hours)
-        for name, hours in (("1h", 1), ("8h", 8), ("10h", 10), ("24h", 24))
+        name: SessionPolicy(name=name, hours=hours, max_jobs=max_jobs)
+        for name, hours, max_jobs in (
+            ("1h", 1, 8),
+            ("8h", 8, 64),
+            ("10h", 10, 80),
+            ("24h", 24, 192),
+        )
+    }
+
+
+def session_contract(name: str) -> dict:
+    """Future session shape. Paid execution stays off for every length."""
+    policy = catalog()[name]
+    return {
+        "name": policy.name,
+        "hours": policy.hours,
+        "paid_execution": False,
+        "requires_explicit_authorization": True,
+        "deadline_seconds": policy.session_seconds(),
+        "hourly_ceiling_usd": str(policy.hourly_ceiling_usd),
+        "total_target_usd": str(policy.session_ceiling_usd(policy.hourly_ceiling_usd)),
+        "max_jobs": policy.max_jobs,
+        "idle_timeout_seconds": policy.idle_shutdown_seconds,
+        "deletion_reserve_seconds": policy.deletion_reserve_seconds,
+        "watchdog": "independent",
+        "verified_deletion": True,
+        "billing_exposure": "reported",
+        "allows_paid_create": False,
     }
 
 

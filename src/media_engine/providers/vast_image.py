@@ -1537,6 +1537,11 @@ class VastImageProvider(GPUProvider):
 
     def confirm_cache(self, resource_id: str) -> None:
         if self.cache_source == "r2_cold_stage":
+            from media_engine.infra.worker_cache import persistent_cache_hit
+            if persistent_cache_hit():
+                self.cache_validation = "COMPLETE"
+                self.cache_source = "persistent_revision_cache"
+                return
             if os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE", "").strip() == "1":
                 self.cache_validation = "R2_FORBIDDEN"
                 raise WorkerStageError("MODEL_CACHE_INVALID")
