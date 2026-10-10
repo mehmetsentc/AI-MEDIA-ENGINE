@@ -69,6 +69,11 @@ def _operation_ceiling() -> Decimal:
         if profile not in {"live7", "live8"}:
             raise WorkerStageError("BUDGET_MISMATCH")
         return granted
+    if granted == Decimal("5.00"):
+        profile = os.environ.get("MEDIA_ENGINE_EXECUTION_PROFILE", "").strip()
+        if profile != "live8":
+            raise WorkerStageError("BUDGET_MISMATCH")
+        return granted
     return OPERATION_BUDGET_USD
 
 
@@ -76,9 +81,10 @@ def active_operation_budget() -> Decimal:
     """The default cap stays $1. STUDIO_GPU_BUDGET_USD can only tighten it.
 
     MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD must be exactly 3.00 or 0.50,
-    or 1.50 with MEDIA_ENGINE_EXECUTION_PROFILE=live7.
+    or 1.50 with MEDIA_ENGINE_EXECUTION_PROFILE=live7 or live8,
+    or 5.00 with MEDIA_ENGINE_EXECUTION_PROFILE=live8.
     0.50 is the cache-verification ceiling. 0.49, 0.51, and 9.00 stay at $1.
-    1.50 is not rewritten as $1 or $3.
+    1.50 is not rewritten as $1 or $3. 5.00 on any other profile is rejected.
     """
     ceiling = _operation_ceiling()
     raw = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
@@ -398,6 +404,52 @@ class VastImageProvider(GPUProvider):
     def _live8_bound(self) -> bool:
         return self.execution_authorization is not None
 
+    def _live8_budget_agrees(self, expected: Decimal) -> bool:
+        """The $5 target is accepted only when the process config names it.
+
+        A missing or different value is a mismatch. It is not rewritten to
+        $1 or $1.50. Other LIVE-8 totals keep their existing env behavior.
+        """
+        from media_engine.safety.execution_budget import LIVE8_JIT_CEILING_USD
+        raw = os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip()
+        profile = os.environ.get("MEDIA_ENGINE_EXECUTION_PROFILE", "").strip()
+        configured = None
+        if raw:
+            try:
+                configured = Decimal(raw)
+            except Exception:
+                return False
+        authorization = self.execution_authorization
+        if expected == LIVE8_JIT_CEILING_USD:
+            return (
+                authorization is not None
+                and authorization.selection_policy == "just_in_time"
+                and profile == "live8"
+                and configured == LIVE8_JIT_CEILING_USD
+            )
+        return configured != LIVE8_JIT_CEILING_USD
+
+    def _five_dollar_target_is_authorized(self) -> bool:
+        """A $5 process value cannot widen a warm, live7, or background rental."""
+        from media_engine.safety.execution_budget import LIVE8_JIT_CEILING_USD
+        raw = os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", "").strip()
+        if not raw:
+            return True
+        try:
+            configured = Decimal(raw)
+        except Exception:
+            return True
+        if configured != LIVE8_JIT_CEILING_USD:
+            return True
+        authorization = self.execution_authorization
+        profile = os.environ.get("MEDIA_ENGINE_EXECUTION_PROFILE", "").strip()
+        return (
+            authorization is not None
+            and authorization.selection_policy == "just_in_time"
+            and authorization.max_total_usd == LIVE8_JIT_CEILING_USD
+            and profile == "live8"
+        )
+
     def bind_authorization(self, authorization, *, code_sha: str) -> None:
         """Attach one authorization. The machine is chosen later from its allowed set."""
         from media_engine.providers.execution_authorization import accept_record
@@ -628,6 +680,9 @@ class VastImageProvider(GPUProvider):
             studio = os.environ.get("STUDIO_GPU_BUDGET_USD", "").strip()
             if self._live8_bound():
                 expected_studio = self.execution_authorization.max_total_usd
+                if not self._live8_budget_agrees(expected_studio):
+                    self.live6_stop = "BUDGET_MISMATCH"
+                    return False
             elif self._live7_bound():
                 expected_studio = Decimal("1.50")
             else:
@@ -691,6 +746,8 @@ class VastImageProvider(GPUProvider):
     def quote(self, owner: str) -> Quote:
         if not owner:
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
+        if not self._five_dollar_target_is_authorized():
+            raise WorkerStageError("BUDGET_MISMATCH")
         self._owner = owner
         self._label = ownership_label(owner)
         if self._live8_bound():
@@ -1255,6 +1312,8 @@ class VastImageProvider(GPUProvider):
         )
         if occupied:
             return self._stop_before_create("INSTANCE_LIMIT")
+        if not self._live8_budget_agrees(authorization.max_total_usd):
+            return self._stop_before_create("BUDGET_MISMATCH")
         self._apply_live8_candidate(verified)
         try:
             grant = make_live8_grant(authorization, verified)
@@ -1276,6 +1335,15 @@ class VastImageProvider(GPUProvider):
 
     def create(self, owner: str) -> CreateResult:
         if self._put_done or self._create_closed:
+            return CreateResult(outcome="definite_failure")
+        if not self._five_dollar_target_is_authorized():
+            self.live6_stop = "BUDGET_MISMATCH"
+            self.create_request_sent = False
+            self.billing_exposure = False
+            if self._live8_bound():
+                self._create_closed = True
+            else:
+                self._put_done = True
             return CreateResult(outcome="definite_failure")
         if self._live8_bound():
             self._create_closed = True

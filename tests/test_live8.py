@@ -25,8 +25,13 @@ from media_engine.providers.execution_authorization import (
 from media_engine.providers.gpu_discovery import assess_offers, rejected, shortlist
 from media_engine.providers.live6_prepare import claim_execution_id
 from media_engine.providers.live7_contract import REVISION
-from media_engine.providers.vast_image import VastImageProvider
-from media_engine.safety.execution_budget import open_authorized_budget
+from media_engine.providers.vast_image import VastImageProvider, active_operation_budget
+from media_engine.safety.execution_budget import (
+    LIVE7_RESERVE_SECONDS,
+    LIVE8_JIT_CEILING_USD,
+    open_authorized_budget,
+    termination_reserve_usd,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "402cbfb0f2636acde3f44234e88e489de1d8afdd"
@@ -947,6 +952,252 @@ class CreditTests(unittest.TestCase):
         platform.settle_failure("nahaber", "job-live8")
         platform.settle_failure("nahaber", "job-live8")
         self.assertEqual(platform.balance("nahaber"), 3)
+
+
+class FiveDollarBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        CreateFlowTests.setUp(self)
+        self._saved_profile = os.environ.get("MEDIA_ENGINE_EXECUTION_PROFILE")
+        self._saved_budget = os.environ.get("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD")
+        self._saved_studio = os.environ.get("STUDIO_GPU_BUDGET_USD")
+
+    def tearDown(self) -> None:
+        self._restore("MEDIA_ENGINE_EXECUTION_PROFILE", self._saved_profile)
+        self._restore("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", self._saved_budget)
+        self._restore("STUDIO_GPU_BUDGET_USD", self._saved_studio)
+        CreateFlowTests.tearDown(self)
+
+    def _restore(self, name: str, value: str | None) -> None:
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+    def _auth(self, **overrides):
+        return CreateFlowTests._auth(self, **overrides)
+
+    def _five(self, **overrides):
+        fields = dict(
+            selection_policy="just_in_time",
+            allowed_machine_ids=(501, 502),
+            allowed_offer_ids=(1001, 1002),
+            allowed_pairs=((501, 1001), (502, 1002)),
+            max_total_usd=Decimal("5.00"),
+        )
+        fields.update(overrides)
+        return self._auth(**fields)
+
+    def _enable_five(self) -> None:
+        os.environ["MEDIA_ENGINE_EXECUTION_PROFILE"] = "live8"
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "5.00"
+
+    def test_just_in_time_five_dollar_authorization_opens_the_same_target(self) -> None:
+        authorization = self._five()
+        accept_record(authorization, now=5_000, code_sha=SHA)
+        self.assertEqual(authorization.max_total_usd, LIVE8_JIT_CEILING_USD)
+        budget = open_authorized_budget(
+            execution_id=authorization.execution_id,
+            grant_execution_id=authorization.execution_id,
+            grant_ceiling=authorization.max_total_usd,
+            hourly=Decimal("0.72"),
+            wall_now=5_000,
+            monotonic_now=10,
+            observed_starts=[5_000],
+        )
+        reserve = termination_reserve_usd(Decimal("0.72"))
+        self.assertEqual(LIVE7_RESERVE_SECONDS, 840)
+        self.assertEqual(budget.ceiling_usd, Decimal("5.00"))
+        self.assertEqual(budget.reserve_usd, reserve)
+        self.assertEqual(budget.planning_usd + budget.reserve_usd, Decimal("5.00"))
+        self.assertEqual(budget.spending_deadline_wall, 5_000 + budget.allowed_seconds)
+        self.assertFalse(budget.stop(5_000, 10))
+        self.assertTrue(budget.stop(budget.spending_deadline_wall, budget.spending_deadline_monotonic))
+        with self.assertRaises(WorkerStageError) as raised:
+            open_authorized_budget(
+                execution_id=authorization.execution_id,
+                grant_execution_id=authorization.execution_id,
+                grant_ceiling=Decimal("1.51"),
+                hourly=Decimal("0.72"),
+                wall_now=5_000,
+                monotonic_now=10,
+            )
+        self.assertEqual(raised.exception.code, "BUDGET_MISMATCH")
+        legacy = open_authorized_budget(
+            execution_id="live8-run-a",
+            grant_execution_id="live8-run-a",
+            grant_ceiling=Decimal("1.50"),
+            hourly=Decimal("0.72"),
+            wall_now=5_000,
+            monotonic_now=10,
+        )
+        self.assertEqual(legacy.ceiling_usd, Decimal("1.50"))
+
+    def test_five_dollars_requires_the_live8_profile_and_does_not_fall_back(self) -> None:
+        os.environ.pop("MEDIA_ENGINE_EXECUTION_PROFILE", None)
+        os.environ.pop("MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD", None)
+        self.assertEqual(active_operation_budget(), Decimal("1.00"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "5.00"
+        with self.assertRaises(WorkerStageError) as raised:
+            active_operation_budget()
+        self.assertEqual(raised.exception.code, "BUDGET_MISMATCH")
+        os.environ["MEDIA_ENGINE_EXECUTION_PROFILE"] = "live7"
+        with self.assertRaises(WorkerStageError) as raised:
+            active_operation_budget()
+        self.assertEqual(raised.exception.code, "BUDGET_MISMATCH")
+        os.environ["MEDIA_ENGINE_EXECUTION_PROFILE"] = "live8"
+        self.assertEqual(active_operation_budget(), Decimal("5.00"))
+        os.environ["STUDIO_GPU_BUDGET_USD"] = "1.50"
+        self.assertEqual(active_operation_budget(), Decimal("1.50"))
+        os.environ["STUDIO_GPU_BUDGET_USD"] = "9.00"
+        self.assertEqual(active_operation_budget(), Decimal("5.00"))
+        os.environ.pop("MEDIA_ENGINE_EXECUTION_PROFILE", None)
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "9.00"
+        self.assertEqual(active_operation_budget(), Decimal("1.00"))
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "1.50"
+        os.environ["MEDIA_ENGINE_EXECUTION_PROFILE"] = "live8"
+        self.assertEqual(active_operation_budget(), Decimal("1.50"))
+
+    def test_other_policies_and_invalid_totals_reject_five_dollars(self) -> None:
+        with self.assertRaises(WorkerStageError) as raised:
+            self._auth(max_total_usd=Decimal("5.00"))
+        self.assertEqual(raised.exception.code, "BUDGET_MISMATCH")
+        with self.assertRaises(WorkerStageError) as raised:
+            self._five(max_total_usd=Decimal("5.01"))
+        self.assertEqual(raised.exception.code, "BUDGET_MISMATCH")
+        with self.assertRaises(WorkerStageError) as raised:
+            self._five(max_hourly_usd=Decimal("0.96"))
+        self.assertEqual(raised.exception.code, "PRICE_CHANGED")
+        with self.assertRaises(WorkerStageError) as raised:
+            self._five(max_instances=2)
+        self.assertEqual(raised.exception.code, "INSTANCE_LIMIT")
+        with self.assertRaises(WorkerStageError) as raised:
+            self._five(max_inference_attempts=2)
+        self.assertEqual(raised.exception.code, "INSTANCE_LIMIT")
+
+    def test_sha_expiry_reuse_and_unauthorized_pair_are_refused(self) -> None:
+        authorization = self._five()
+        with self.assertRaises(WorkerStageError) as raised:
+            accept_record(authorization, now=5_000, code_sha="a" * 40)
+        self.assertEqual(raised.exception.code, "STALE_AUTHORIZATION")
+        with self.assertRaises(WorkerStageError) as raised:
+            accept_record(authorization, now=20_000, code_sha=SHA)
+        self.assertEqual(raised.exception.code, "EXPIRED_AUTHORIZATION")
+        root = Path(tempfile.mkdtemp())
+        claim_execution_id(root / "live8-authorizations", authorization.authorization_id)
+        with self.assertRaises(WorkerStageError) as raised:
+            claim_execution_id(root / "live8-authorizations", authorization.authorization_id)
+        self.assertEqual(raised.exception.code, "STALE_AUTHORIZATION")
+        outside = assess_offers([_offer(1003, 501)], observed_at=5_000)
+        chosen, reason = select_for_authorization(authorization, outside, now=5_000)
+        self.assertIsNone(chosen)
+        self.assertEqual(reason, "OFFER_REJECTED")
+
+    def test_matching_configuration_creates_once_at_the_five_dollar_target(self) -> None:
+        self._enable_five()
+        os.environ["STUDIO_GPU_BUDGET_USD"] = "5.00"
+        puts = []
+
+        def transport(method, url, body, headers):
+            del body, headers
+            if method == "PUT":
+                puts.append(url)
+                return 200, b'{"success": true, "new_contract": 91}'
+            if method == "POST":
+                return 200, json.dumps({"offers": [
+                    _offer(1003, 503, inet_down=20000, dph_base="0.40", dph_total="0.42"),
+                    _offer(1001, 501),
+                ]}).encode()
+            if method == "GET":
+                return 200, b'{"success": true, "instances": [], "next_token": null}'
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
+        provider.bind_authorization(self._five(), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "created")
+        self.assertEqual(len(puts), 1)
+        self.assertTrue(puts[0].endswith("/asks/1001/"))
+        self.assertEqual(provider.execution_grant.ceiling_usd, Decimal("5.00"))
+        self.assertEqual(provider.execution_grant.max_instances, 1)
+        spec = json.loads((provider.runtime / "watchdog.json").read_text(encoding="utf-8"))
+        self.assertEqual(Decimal(spec["ceiling_usd"]), Decimal("5.00"))
+        self.assertEqual(Decimal(spec["reserve_usd"]), termination_reserve_usd(provider.hourly_amount))
+        self.assertEqual(spec["machine_id"], 501)
+        self.assertEqual(provider.launch_trace, ["watchdog", "put"])
+        again = provider.create("studio")
+        self.assertEqual(again.outcome, "definite_failure")
+        self.assertEqual(len(puts), 1)
+
+    def test_five_dollar_process_value_does_not_authorize_another_profile(self) -> None:
+        self._enable_five()
+        calls = []
+
+        def transport(method, url, body, headers):
+            del url, body, headers
+            calls.append(method)
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        with self.assertRaises(WorkerStageError) as raised:
+            provider.quote("studio")
+        self.assertEqual(raised.exception.code, "BUDGET_MISMATCH")
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "definite_failure")
+        self.assertEqual(provider.live6_stop, "BUDGET_MISMATCH")
+        self.assertEqual(calls, [])
+        self.assertFalse(provider.create_request_sent)
+        os.environ["MEDIA_ENGINE_EXECUTION_PROFILE"] = "live7"
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        result = provider.create("studio")
+        self.assertEqual(provider.live6_stop, "BUDGET_MISMATCH")
+        self.assertEqual(calls, [])
+
+    def test_five_dollar_authorization_without_matching_config_does_not_create(self) -> None:
+        os.environ["MEDIA_ENGINE_EXECUTION_PROFILE"] = "live8"
+        os.environ["MEDIA_ENGINE_AUTHORIZED_RUN_BUDGET_USD"] = "1.50"
+        provider = CreateFlowTests._provider(self, [_offer(1001, 501)])
+        provider.bind_authorization(self._five(), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "definite_failure")
+        self.assertEqual(provider.live6_stop, "BUDGET_MISMATCH")
+        self.assertEqual(provider.puts, [])
+        self.assertIsNone(provider.execution_grant)
+        self.assertFalse(provider.create_request_sent)
+
+    def test_unconfirmed_deletion_keeps_the_billing_exposure(self) -> None:
+        listed = [{"id": "77", "machine_id": 501, "label": "media-engine:live8-run-a"}]
+
+        def transport(method, url, body, headers):
+            del url, body, headers
+            if method == "DELETE":
+                return 200, b"{}"
+            if method == "GET":
+                return 200, json.dumps({
+                    "success": True, "instances": listed, "next_token": None,
+                }).encode()
+            return 500, b""
+
+        provider = VastImageProvider(
+            api_key="fixture-key", transport=transport, runtime=Path(tempfile.mkdtemp()),
+            now=lambda: 5_000.0,
+        )
+        provider.machine_id = "501"
+        provider.billing_exposure = True
+        with self.assertRaises(WorkerStageError) as raised:
+            provider.terminate("77")
+        self.assertEqual(raised.exception.code, "DELETE_UNCONFIRMED")
+        self.assertTrue(provider.billing_exposure)
 
 
 if __name__ == "__main__":

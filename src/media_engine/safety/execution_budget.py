@@ -4,7 +4,8 @@ Authorization expiry is not this deadline. The clock starts at the create
 request and is not moved forward when later stages are observed.
 
 The $0.50 verification profile is unchanged. The $1.50 profile has its own
-reserve and refuses any other ceiling.
+reserve. A $5.00 just-in-time session target is a local deadline, not a
+provider hard cap, and it is refused for every other policy.
 """
 from __future__ import annotations
 
@@ -20,6 +21,9 @@ LIVE6_PLANNING_USD = Decimal("0.40")
 LIVE6_MAX_HOURLY_USD = Decimal("0.375")
 # LIVE-7 alternative GPU. These numbers do not apply to the $0.50 path.
 LIVE7_CEILING_USD = Decimal("1.50")
+# LIVE-8 just-in-time session target. This is not a Vast-enforced cap, and
+# it is not the default for any other profile.
+LIVE8_JIT_CEILING_USD = Decimal("5.00")
 LIVE7_MAX_HOURLY_USD = Decimal("0.95")
 LIVE7_REFERENCE_HOURLY_USD = Decimal("0.743704")
 LIVE7_RESERVE_SECONDS = 840
@@ -275,13 +279,25 @@ def open_live7_budget(
     )
 
 
+def _accepted_authorization_ceiling(cap: Decimal) -> bool:
+    """$1.50 remains the normal ceiling. $5 is only the just-in-time target."""
+    amount = Decimal(cap)
+    if amount == LIVE8_JIT_CEILING_USD:
+        return True
+    return amount > 0 and amount <= LIVE7_CEILING_USD and amount != LIVE6_CEILING_USD
+
+
 def authorized_billable_seconds(hourly: Decimal, ceiling: Decimal) -> Optional[int]:
-    """Seconds that fit one authorization. The ceiling cannot rise above $1.50."""
+    """Seconds that fit one authorization. The hourly cap stays $0.95.
+
+    $5.00 is a session target for one just-in-time authorization. Any other
+    total above $1.50 does not produce a deadline.
+    """
     amount = Decimal(hourly)
     cap = Decimal(ceiling)
     if amount <= 0 or amount > LIVE7_MAX_HOURLY_USD:
         return None
-    if cap <= 0 or cap > LIVE7_CEILING_USD or cap == LIVE6_CEILING_USD:
+    if not _accepted_authorization_ceiling(cap):
         return None
     reserve = termination_reserve_usd(amount)
     planning = cap - reserve
@@ -306,11 +322,15 @@ def open_authorized_budget(
     monotonic_now: float,
     observed_starts: Optional[list] = None,
 ) -> ExecutionBudget:
-    """Freeze the authorization ceiling. A later stage cannot extend it."""
+    """Freeze the authorization target. A later stage cannot extend it.
+
+    The resulting deadline is local. Vast is not given this amount as a
+    hard spending cap, and provider deletion delay can bill past it.
+    """
     if not execution_id or execution_id != grant_execution_id:
         raise WorkerStageError("STALE_AUTHORIZATION")
     cap = Decimal(grant_ceiling)
-    if cap <= 0 or cap > LIVE7_CEILING_USD:
+    if not _accepted_authorization_ceiling(cap):
         raise WorkerStageError("BUDGET_MISMATCH")
     seconds = authorized_billable_seconds(hourly, cap)
     if seconds is None or live7_transfer_room(seconds) < LIVE7_TRANSFER_FLOOR_SECONDS:

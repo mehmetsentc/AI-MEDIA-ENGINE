@@ -18,6 +18,7 @@ from media_engine.providers.live7_contract import (
 from media_engine.safety.execution_budget import (
     LIVE7_CEILING_USD,
     LIVE7_MAX_HOURLY_USD,
+    LIVE8_JIT_CEILING_USD,
     authorized_billable_seconds,
     live7_transfer_room,
 )
@@ -137,7 +138,10 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
         raise WorkerStageError("BUDGET_MISMATCH") from exc
     if hourly <= 0 or hourly > LIVE7_MAX_HOURLY_USD:
         raise WorkerStageError("PRICE_CHANGED")
-    if total <= 0 or total > LIVE7_CEILING_USD:
+    if total == LIVE8_JIT_CEILING_USD:
+        if policy != "just_in_time":
+            raise WorkerStageError("BUDGET_MISMATCH")
+    elif total <= 0 or total > LIVE7_CEILING_USD:
         raise WorkerStageError("BUDGET_MISMATCH")
     if instances != 1:
         raise WorkerStageError("INSTANCE_LIMIT")
@@ -189,7 +193,7 @@ def accept_record(authorization: ExecutionAuthorization, *, now: float, code_sha
         raise WorkerStageError("STALE_AUTHORIZATION")
     if now >= authorization.expires_at or authorization.expires_at <= authorization.issued_at:
         raise WorkerStageError("EXPIRED_AUTHORIZATION")
-    if authorization.max_instances != 1 or authorization.max_total_usd > LIVE7_CEILING_USD:
+    if authorization.max_instances != 1 or not _total_allowed(authorization):
         raise WorkerStageError("BUDGET_MISMATCH")
 
 
@@ -299,6 +303,13 @@ def make_live8_grant(authorization: ExecutionAuthorization, candidate: GpuCandid
         cuda_min=str(LIVE7_CUDA_MIN),
         forbidden_volume_id=FORBIDDEN_VOLUME_ID,
     )
+
+
+def _total_allowed(authorization: ExecutionAuthorization) -> bool:
+    total = authorization.max_total_usd
+    if total == LIVE8_JIT_CEILING_USD:
+        return authorization.selection_policy == "just_in_time"
+    return total > 0 and total <= LIVE7_CEILING_USD
 
 
 def _pairs(value: object) -> tuple[tuple[int, int], ...]:
