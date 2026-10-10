@@ -106,7 +106,18 @@ class MemoryObjectStore:
 
 
 def reliable_transfer_enabled() -> bool:
-    from media_engine.engines.image.r2_reliability import reliable_transfer_enabled as enabled
+    """The rented image does not ship the media_engine package.
+
+    The flag defaults off. Checking it first keeps the plain downloader on
+    the worker. Importing the helper when the flag is unset crashes the
+    sync after it has already reported zero bytes.
+    """
+    if os.environ.get("MEDIA_ENGINE_R2_RELIABLE_TRANSFER", "").strip() != "1":
+        return False
+    try:
+        from media_engine.engines.image.r2_reliability import reliable_transfer_enabled as enabled
+    except ImportError as exc:
+        raise ModelCacheNotReady("RELIABILITY_MODULE_MISSING") from exc
     return enabled()
 
 

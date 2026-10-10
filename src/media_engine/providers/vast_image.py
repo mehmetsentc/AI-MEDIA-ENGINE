@@ -838,6 +838,62 @@ class VastImageProvider(GPUProvider):
                     return "INSTANCE_LIMIT"
         return ""
 
+    def _stage_preflight_reason(self) -> str:
+        """Refuse to rent when the worker cannot stage the pinned model."""
+        from media_engine.providers.stage_preflight import assess_manifest_body, local_stage_problems
+        problems = local_stage_problems(os.environ, _R2_SYNC)
+        if problems:
+            self.stage_problems = problems
+            return "STAGE_CONFIG_INVALID"
+        probe = getattr(self, "_manifest_ready", None)
+        if probe is None:
+            probe = self._manifest_probe
+        try:
+            ready = probe()
+        except Exception:
+            return "MODEL_CACHE_INVALID"
+        if ready is True:
+            return ""
+        if ready is False or ready is None:
+            return "MODEL_CACHE_INVALID"
+        self.stage_problems = [str(ready)]
+        return "MODEL_CACHE_INVALID"
+
+    def _manifest_probe(self):
+        from media_engine.engines.image.r2_cache import R2Client, config_from_env
+        from media_engine.providers.stage_preflight import assess_manifest_body, manifest_object_key
+        loaded = R2Client(config_from_env(os.environ)).get(manifest_object_key())
+        if loaded is None:
+            return False
+        body, _meta = loaded
+        reason = assess_manifest_body(body)
+        return reason or True
+
+    def _preserve_stage_evidence(self, exit_code: str) -> None:
+        from media_engine.providers.phase2d import _runtime_secrets
+        from media_engine.providers.stage_evidence import CAPTURE_TIMEOUT_SECONDS, preserve_stage_evidence
+        samples = getattr(self, "transfer_samples", None) or []
+        preserve_stage_evidence(
+            destination=Path(self.runtime) / "stage-evidence.json",
+            fetch=self._fetch_stage_text,
+            secrets=_runtime_secrets(self._api_key),
+            exit_code=exit_code,
+            bytes_done=getattr(self, "transfer_bytes_done", None),
+            started_at=getattr(self, "stage_started_wall", None),
+            ended_at=time.time(),
+            last_progress_at=samples[-1][0] if samples else None,
+            timeout_seconds=CAPTURE_TIMEOUT_SECONDS,
+        )
+
+    def _fetch_stage_text(self) -> tuple[str, str]:
+        from media_engine.providers.stage_evidence import CAPTURE_TIMEOUT_SECONDS, REMOTE_STAGE_EVIDENCE
+        if self._ssh_run is None or not self._host or not self._port:
+            raise WorkerStageError("WORKER_BOOT_FAILED")
+        _code, out, err = self._ssh_run(
+            self._host, self._port, REMOTE_STAGE_EVIDENCE, int(CAPTURE_TIMEOUT_SECONDS),
+        )
+        return out, err
+
     def _intent_path(self) -> Path:
         return Path(self.runtime) / "create-intent.json"
 
@@ -924,6 +980,10 @@ class VastImageProvider(GPUProvider):
                 self.live6_stop = exc.code
                 return CreateResult(outcome="definite_failure")
             reason = self._reject_live8_run()
+            if reason:
+                self.live6_stop = reason
+                return CreateResult(outcome="definite_failure")
+            reason = self._stage_preflight_reason()
             if reason:
                 self.live6_stop = reason
                 return CreateResult(outcome="definite_failure")
@@ -1323,6 +1383,7 @@ class VastImageProvider(GPUProvider):
         env["MODEL_CACHE_PROVIDER"] = "r2"
         payload = r2_worker_env(env)
         if payload is None or not self._host or not self._port:
+            self._preserve_stage_evidence("")
             raise WorkerStageError("MODEL_CACHE_INVALID")
         worker = getattr(self, "_worker_ssh", None) or WorkerSSH(self.runtime)
         self.runtime.mkdir(parents=True, exist_ok=True)
@@ -1335,6 +1396,7 @@ class VastImageProvider(GPUProvider):
             worker._copy(self._host, self._port, path, "/workspace/" + path.name)
         worker._copy(self._host, self._port, env_path, "/workspace/phase2d-r2.env")
         started = time.perf_counter()
+        self.stage_started_wall = time.time()
         self._watch_cache_sync()
         self.transfer_seconds = round(time.perf_counter() - started, 3)
 
@@ -1542,10 +1604,12 @@ class VastImageProvider(GPUProvider):
         if self._live7_bound() and self.execution_budget is not None:
             remaining = float(self.execution_budget.spending_deadline_wall) - float(self._now())
             if remaining <= float(self.staging_reserve_seconds or 0):
+                self._preserve_stage_evidence("")
                 raise WorkerStageError("CACHE_TIMEOUT")
             watch.max_seconds = remaining
         code, out, _err = self._remote(_R2_SYNC, 60, "CACHE_TIMEOUT")
         if code != 0 or "STARTED" not in out:
+            self._preserve_stage_evidence("")
             raise WorkerStageError("MODEL_CACHE_INVALID")
         while True:
             _code, progress, _err = self._remote(_CACHE_PROGRESS, 30, "CACHE_TIMEOUT")
@@ -1575,6 +1639,7 @@ class VastImageProvider(GPUProvider):
                     break
             if status.isdigit():
                 if status != "0":
+                    self._preserve_stage_evidence(status)
                     raise WorkerStageError("MODEL_CACHE_INVALID")
                 return
             decision = decide_staging_budget(
@@ -1588,13 +1653,16 @@ class VastImageProvider(GPUProvider):
             if decision["action"] == "stop":
                 self.staging_stop_reason = decision["reason"]
                 self._remote(_CACHE_KILL, 20, "CACHE_TIMEOUT")
+                self._preserve_stage_evidence("")
                 raise WorkerStageError("CACHE_TIMEOUT")
             reason = watch.expired(self._now())
             if reason == "PHASE_STALL":
                 self._remote(_CACHE_KILL, 20, "CACHE_STALL")
+                self._preserve_stage_evidence("")
                 raise WorkerStageError("CACHE_STALL")
             if reason == "PHASE_TIMEOUT":
                 self._remote(_CACHE_KILL, 20, "CACHE_TIMEOUT")
+                self._preserve_stage_evidence("")
                 raise WorkerStageError("CACHE_TIMEOUT")
             self._sleep(10)
 

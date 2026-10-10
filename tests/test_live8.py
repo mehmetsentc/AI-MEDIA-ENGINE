@@ -156,6 +156,20 @@ class AuthorizationTests(unittest.TestCase):
         restored = authorization_from_json(json.dumps(authorization.to_dict()))
         self.assertEqual(restored, authorization)
 
+    def test_truncated_authorization_sha_is_refused(self) -> None:
+        truncated = "0af07ddb2b374d7c0c81c9a6e748de6f68ef06"
+        executed = "0af07ddb2b374d7c0c81c9a6e6a748de6f68ef06"
+        self.assertEqual(len(truncated), 38)
+        self.assertEqual(len(executed), 40)
+        with self.assertRaises(WorkerStageError) as raised:
+            self._auth(code_sha=truncated)
+        self.assertEqual(raised.exception.code, "STALE_AUTHORIZATION")
+        issued = self._auth(code_sha=executed)
+        with self.assertRaises(WorkerStageError) as raised:
+            accept_record(issued, now=5_000, code_sha=SHA)
+        self.assertEqual(raised.exception.code, "STALE_AUTHORIZATION")
+        accept_record(issued, now=5_000, code_sha=executed)
+
     def test_expired_record_and_wrong_sha_are_refused(self) -> None:
         authorization = self._auth()
         with self.assertRaises(WorkerStageError) as raised:
@@ -207,8 +221,25 @@ class CreateFlowTests(unittest.TestCase):
     def setUp(self) -> None:
         self._cold = os.environ.get("MEDIA_ENGINE_ALLOW_COLD_STAGE")
         self._forbid = os.environ.get("MEDIA_ENGINE_FORBID_R2_STAGE")
+        self._saved_stage = {
+            name: os.environ.get(name)
+            for name in (
+                "MODEL_CACHE_PROVIDER",
+                "R2_ENDPOINT",
+                "R2_BUCKET",
+                "R2_ACCESS_KEY_ID",
+                "R2_SECRET_ACCESS_KEY",
+                "MEDIA_ENGINE_R2_RELIABLE_TRANSFER",
+            )
+        }
         os.environ["MEDIA_ENGINE_ALLOW_COLD_STAGE"] = "1"
         os.environ.pop("MEDIA_ENGINE_FORBID_R2_STAGE", None)
+        os.environ["MODEL_CACHE_PROVIDER"] = "r2"
+        os.environ["R2_ENDPOINT"] = "https://example.r2.cloudflarestorage.com"
+        os.environ["R2_BUCKET"] = "ai-media-engine-models"
+        os.environ["R2_ACCESS_KEY_ID"] = "fixture-access"
+        os.environ["R2_SECRET_ACCESS_KEY"] = "fixture-secret"
+        os.environ.pop("MEDIA_ENGINE_R2_RELIABLE_TRANSFER", None)
 
     def tearDown(self) -> None:
         if self._cold is None:
@@ -219,6 +250,11 @@ class CreateFlowTests(unittest.TestCase):
             os.environ.pop("MEDIA_ENGINE_FORBID_R2_STAGE", None)
         else:
             os.environ["MEDIA_ENGINE_FORBID_R2_STAGE"] = self._forbid
+        for name, value in self._saved_stage.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
     def _auth(self, **overrides):
         fields = dict(
@@ -269,6 +305,7 @@ class CreateFlowTests(unittest.TestCase):
         )
         provider._monotonic = lambda: 10.0
         provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
         provider.puts = puts
         provider.gets = gets
         return provider
@@ -296,6 +333,16 @@ class CreateFlowTests(unittest.TestCase):
         again = provider.create("studio")
         self.assertEqual(again.outcome, "definite_failure")
         self.assertEqual(len(provider.puts), 1)
+
+    def test_incomplete_stage_config_does_not_create(self) -> None:
+        os.environ["R2_BUCKET"] = "other-bucket"
+        provider = self._provider([_offer(1001, 501)])
+        provider.bind_authorization(self._auth(), code_sha=SHA)
+        result = provider.create("studio")
+        self.assertEqual(result.outcome, "definite_failure")
+        self.assertEqual(provider.live6_stop, "STAGE_CONFIG_INVALID")
+        self.assertEqual(provider.puts, [])
+        self.assertIn("R2_BUCKET", provider.stage_problems)
 
     def test_offer_disappearing_does_not_switch_offers(self) -> None:
         rows = [_offer(1001, 501), _offer(1003, 503, inet_down=12000, dph_base="0.40", dph_total="0.42")]
@@ -385,6 +432,7 @@ class CreateFlowTests(unittest.TestCase):
         )
         provider._monotonic = lambda: 10.0
         provider._watchdog_popen = _Popen
+        provider._manifest_ready = lambda: True
         provider.puts = appeared
         provider.bind_authorization(self._auth(), code_sha=SHA)
         result = provider.create("studio")
