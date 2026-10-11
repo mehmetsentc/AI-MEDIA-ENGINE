@@ -10,7 +10,7 @@ import psycopg
 from psycopg.types.json import Json
 
 from media_engine.platform.postgres_conn import PgPool
-from media_engine.platform.repository import PlatformBlocked
+from media_engine.platform.repository import PlatformBlocked, _media_view
 
 
 def _iso(value: object) -> str:
@@ -484,7 +484,7 @@ class PostgresRepository:
         with self.pool.session() as conn:
             row = conn.execute(
                 """
-                SELECT object_key, bucket, sha256, byte_count
+                SELECT object_key, bucket, sha256, byte_count, user_id, job_id
                 FROM media_artifacts
                 WHERE id = %s AND deleted_at IS NULL
                 """,
@@ -497,7 +497,37 @@ class PostgresRepository:
             "bucket": str(row["bucket"]),
             "sha256": str(row["sha256"]),
             "byte_count": int(row["byte_count"]),
+            "user_id": str(row["user_id"]),
+            "job_id": str(row["job_id"]),
         }
+
+    def list_media(self, user_id: str) -> list[dict]:
+        with self.pool.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, job_id, sha256, byte_count, width, height,
+                       model, created_at::text AS created_at, generation_settings::text AS generation_settings
+                FROM media_artifacts
+                WHERE user_id = %s AND deleted_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (user_id,),
+            ).fetchall()
+        return [_media_view(row) for row in rows]
+
+    def job_ledger(self, job_id: str) -> list[dict]:
+        with self.pool.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT entry_type, amount_units
+                FROM credit_ledger
+                WHERE job_id = %s
+                ORDER BY created_at
+                """,
+                (job_id,),
+            ).fetchall()
+        return [{"entry_type": str(row["entry_type"]), "amount": int(row["amount_units"])} for row in rows]
 
     def settlement_exists(self, job_id: str) -> bool:
         with self.pool.session() as conn:

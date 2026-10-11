@@ -15,6 +15,12 @@ def main() -> None:
     mode = resolve_studio_mode()
     root = Path(os.environ.get("MEDIA_ENGINE_RUNTIME", "runtime")) / "studio"
     controller = build_controller(root, mode)
+    if mode == "development":
+        from media_engine.studio.boot import _local_credit_platform
+        controller.platform = _local_credit_platform(root)
+        if os.environ.get("MEDIA_ENGINE_STUDIO_READONLY") == "1":
+            from media_engine.studio.readonly import attach_readonly
+            attach_readonly(controller)
     port = int(os.environ.get("STUDIO_PORT", "8765"))
     server = LocalAPIServer(controller, port=port)
     ceiling = budget_usd()

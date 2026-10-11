@@ -125,6 +125,25 @@ class Platform:
     def balance(self, user_id: str, pool: Optional[str] = None) -> int:
         return self.repo.balance(user_id, pool)
 
+    def image_price(self) -> int:
+        """Published image price. Missing local rules still quote the approved 2 credits."""
+        rule = self.repo.price_at("image", "qwen-image", self.now_iso())
+        if rule is None:
+            return 2
+        return int(rule["credit_price"])
+
+    def list_media(self, user_id: str) -> list[dict]:
+        listed = getattr(self.repo, "list_media", None)
+        if listed is None:
+            return []
+        return listed(user_id)
+
+    def job_ledger(self, job_id: str) -> list[dict]:
+        listed = getattr(self.repo, "job_ledger", None)
+        if listed is None:
+            return []
+        return listed(job_id)
+
     def add_price(self, **fields: object) -> None:
         self.repo.add_price(**fields)
 

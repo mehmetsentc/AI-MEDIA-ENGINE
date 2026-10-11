@@ -352,3 +352,68 @@ h1 { font-family: Georgia, "Iowan Old Style", serif; font-weight: 500; font-size
   .workspace { min-height: 70vh; }
   h1 { font-size: 30px; }
 }
+
+.studio-app {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+}
+.studio-side { display: flex; flex-direction: column; min-height: 100vh; }
+.studio-main { min-width: 0; padding: 28px 24px 48px; }
+.studio-main h1 { margin: 0 0 16px; font-size: 32px; font-weight: 600; }
+.studio-main form, .result-card, .media-card, .job-row {
+  display: grid;
+  gap: 10px;
+  max-width: 720px;
+}
+.studio-main textarea, .studio-main input {
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.settings { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.credit-pill, .engine-name, .hint, .form-error { color: var(--muted); }
+.form-error { color: var(--bad); }
+.primary {
+  border: 0;
+  border-radius: 999px;
+  padding: 10px 16px;
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.primary:disabled { opacity: 0.45; }
+.text-btn { color: var(--ink); background: transparent; border: 0; padding: 0; text-decoration: none; }
+.cards, .job-list { display: grid; gap: 16px; }
+.media-card img, #result, #viewer-image { width: min(100%, 640px); border-radius: 12px; background: var(--bg-3); }
+.job-row, .media-card { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+#viewer { border: 0; border-radius: 16px; background: var(--bg-2); color: var(--ink); padding: 16px; max-width: 90vw; }
+#viewer::backdrop { background: rgba(0, 0, 0, 0.72); }
+.nav-item:disabled { opacity: 0.4; cursor: not-allowed; }
+.status[data-tone="error"] { color: var(--bad); }
+.status[data-tone="done"] { color: var(--good); }
+.status[data-tone="waiting"] { color: var(--wait); }
+@media (max-width: 1180px) {
+  .studio-app .nav-item,
+  .studio-app .logo-type { font-size: 14px; gap: 8px; }
+}
+@media (max-width: 720px) {
+  .studio-app { grid-template-columns: 1fr; }
+  .studio-app .studio-side {
+    min-height: 0;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 10px;
+  }
+  .studio-app .logo-type,
+  .studio-app .nav-label { display: block; }
+  .studio-app .side-nav { flex-direction: row; flex-wrap: wrap; gap: 6px; }
+  .studio-app .nav-item { width: auto; font-size: 14px; }
+  .studio-app .credit-pill { margin: 0; }
+  .settings { grid-template-columns: 1fr; }
+  .studio-main h1 { font-size: 28px; }
+}

@@ -105,6 +105,23 @@ def build_controller(root: Path, mode: Optional[str] = None,
     return controller
 
 
+def _local_credit_platform(root: Path) -> Platform:
+    """Local ledger for the development studio. This does not grant credits."""
+    platform = Platform(str(root / "platform.sqlite3"))
+    if platform.repo.price_at("image", "qwen-image", platform.now_iso()) is None:
+        platform.add_price(
+            version="daidoi-e2e",
+            service="image",
+            model="qwen-image",
+            quality="standard",
+            unit="image",
+            credit_price=2,
+            internal_cost_units=0,
+            effective_at="2026-01-01T00:00:00Z",
+        )
+    return platform
+
+
 def budget_usd(environ: Optional[dict] = None) -> Optional[Decimal]:
     source = os.environ if environ is None else environ
     raw = str(source.get("STUDIO_GPU_BUDGET_USD", "")).strip()

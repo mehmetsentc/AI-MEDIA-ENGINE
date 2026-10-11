@@ -149,8 +149,9 @@ class StudioTests(unittest.TestCase):
             html = response.read().decode("utf-8")
             cookie = response.headers.get("Set-Cookie", "")
         self.assertIn("AI-MEDIA-ENGINE", html)
+        self.assertIn("DAIDOI", html)
         self.assertIn("What do you want to create?", html)
-        self.assertIn("Create Project", html)
+        self.assertIn("Sign in", html)
         token = cookie.split(";", 1)[0]
         self.assertTrue(token.startswith("studio_session="))
         status, body = _http(server, "GET", "/studio.js")

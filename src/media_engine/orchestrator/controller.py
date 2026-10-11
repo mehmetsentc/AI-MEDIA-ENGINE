@@ -250,7 +250,8 @@ class MediaController:
         return job
 
     def submit_image(self, prompt: str, *, width: int = 1024, height: int = 1024,
-                     seed: Optional[int] = None, idempotency_key: Optional[str] = None) -> Job:
+                     seed: Optional[int] = None, idempotency_key: Optional[str] = None,
+                     client_id: str = "nahaber") -> Job:
         if width != 1024 or height != 1024 or isinstance(width, bool) or isinstance(height, bool):
             raise JobError("RESOLUTION_UNSUPPORTED")
         if seed is None:
@@ -259,11 +260,12 @@ class MediaController:
             raise JobError("SEED_INVALID")
         else:
             chosen = seed
+        self.clients.require(client_id)
         with self._lock:
             now = self.clock.iso()
             job = Job(
                 id=new_job_id(),
-                client_id="nahaber",
+                client_id=client_id,
                 job_type=IMAGE_GENERATE,
                 status=JobStatus.QUEUED,
                 created_at=now,
@@ -297,7 +299,6 @@ class MediaController:
                 if submitted >= cap:
                     raise JobError("SESSION_IMAGE_LIMIT")
                 self.provider.images_submitted = submitted + 1
-            self.clients.require(job.client_id)
             if idempotency_key and hasattr(self.jobs, "insert_idempotent"):
                 stored = self.jobs.insert_idempotent(job, idempotency_key)
                 if stored.id != job.id:
@@ -323,7 +324,12 @@ class MediaController:
     def artifact_bytes(self, artifact_id: str) -> bytes:
         record = self.artifacts.get(artifact_id)
         if record is None:
-            raise JobNotFound(artifact_id)
+            platform = getattr(self, "platform", None)
+            reader = getattr(platform, "read_media", None) if platform is not None else None
+            data = None if reader is None else reader(artifact_id)
+            if not data:
+                raise JobNotFound(artifact_id)
+            return data
         if str(record.path).startswith("r2://"):
             if self.platform is None:
                 raise JobNotFound(artifact_id)

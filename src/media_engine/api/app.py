@@ -13,6 +13,7 @@ from typing import Optional
 from media_engine.auth.clients import UnknownClient
 from media_engine.jobs.model import IllegalTransition, JobError, JobNotFound, UnsupportedJobType
 from media_engine.orchestrator.controller import MediaController
+from media_engine.studio.account import SessionBook, artifact_owner, browser_route
 from media_engine.studio.api import try_studio
 
 _STATIC = {
@@ -168,7 +169,10 @@ class LocalAPIServer:
         self.controller = controller
         self.api_key = os.environ.get("AI_MEDIA_ENGINE_API_KEY", "") if api_key is None else api_key
         self.studio_session = secrets.token_urlsafe(24)
-        self._httpd = _LoopbackServer((host, port), _handler(controller, self.api_key, self.studio_session))
+        self.sessions = SessionBook()
+        self._httpd = _LoopbackServer(
+            (host, port), _handler(controller, self.api_key, self.studio_session, self.sessions),
+        )
         self._thread: Optional[threading.Thread] = None
 
     @property
@@ -196,7 +200,8 @@ class LocalAPIServer:
         self.controller.stop()
 
 
-def _handler(controller: MediaController, api_key: str, studio_session: str) -> type[BaseHTTPRequestHandler]:
+def _handler(controller: MediaController, api_key: str, studio_session: str,
+             sessions: SessionBook) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -220,9 +225,8 @@ def _handler(controller: MediaController, api_key: str, studio_session: str) -> 
             if self.command == "GET" and path in _STATIC:
                 self._static(path)
                 return
-            denied = authorize(
-                path, {key: value for key, value in self.headers.items()}, api_key, studio_session,
-            )
+            headers = {key: value for key, value in self.headers.items()}
+            denied = authorize(path, headers, api_key, studio_session)
             if denied is not None:
                 self._json(*denied)
                 return
@@ -231,19 +235,37 @@ def _handler(controller: MediaController, api_key: str, studio_session: str) -> 
                 self._json(400, {"error": "BODY_REQUIRED"})
                 return
             body = self.rfile.read(length) if length else None
+            cookie = _cookie(headers, "studio_session")
+            browser = bool(studio_session and cookie == studio_session)
+            user = sessions.user_for(cookie) if browser else None
             artifact = _ARTIFACT.fullmatch(path)
             if self.command == "GET" and artifact:
+                artifact_id = artifact.group(1)
+                if browser and not user:
+                    self._json(401, {"error": "SIGN_IN_REQUIRED"})
+                    return
+                if browser and artifact_owner(controller, artifact_id) != user:
+                    self._json(404, {"error": "JOB_NOT_FOUND"})
+                    return
                 try:
-                    data = controller.artifact_bytes(artifact.group(1))
+                    data = controller.artifact_bytes(artifact_id)
                 except JobNotFound:
                     self._json(404, {"error": "JOB_NOT_FOUND"})
                     return
+                download = "download=1" in self.path
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Content-Length", str(len(data)))
+                disposition = "attachment" if download else "inline"
+                self.send_header("Content-Disposition", f'{disposition}; filename="{artifact_id}.png"')
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if browser:
+                handled = browser_route(controller, self.command, path, body, user, sessions, cookie)
+                if handled is not None:
+                    self._json(*handled)
+                    return
             status, payload = dispatch(controller, self.command, self.path, body)
             self._json(status, payload)
 

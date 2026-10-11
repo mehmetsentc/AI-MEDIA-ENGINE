@@ -49,6 +49,16 @@ class ArtifactStore:
             conn.close()
         return artifact
 
+    def list_recent(self) -> list[Artifact]:
+        conn = connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT * FROM artifacts ORDER BY created_at DESC LIMIT 100",
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_artifact(row) for row in rows]
+
     def get(self, artifact_id: str) -> Optional[Artifact]:
         conn = connect(self.db_path)
         try:
@@ -60,17 +70,21 @@ class ArtifactStore:
             conn.close()
         if row is None:
             return None
-        return Artifact(
-            artifact_id=row["artifact_id"],
-            job_id=row["job_id"],
-            engine=row["engine"],
-            model=row["model"],
-            prompt=row["prompt"],
-            seed=row["seed"],
-            width=row["width"],
-            height=row["height"],
-            created_at=row["created_at"],
-            byte_count=int(row["byte_count"]),
-            sha256=row["sha256"],
-            path=row["path"],
-        )
+        return _artifact(row)
+
+
+def _artifact(row: object) -> Artifact:
+    return Artifact(
+        artifact_id=row["artifact_id"],
+        job_id=row["job_id"],
+        engine=row["engine"],
+        model=row["model"],
+        prompt=row["prompt"],
+        seed=row["seed"],
+        width=row["width"],
+        height=row["height"],
+        created_at=row["created_at"],
+        byte_count=int(row["byte_count"]),
+        sha256=row["sha256"],
+        path=row["path"],
+    )

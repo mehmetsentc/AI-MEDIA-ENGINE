@@ -432,7 +432,7 @@ class SqliteRepository:
         try:
             row = conn.execute(
                 """
-                SELECT object_key, bucket, sha256, byte_count
+                SELECT object_key, bucket, sha256, byte_count, user_id, job_id
                 FROM media_artifacts
                 WHERE id = ? AND deleted_at IS NULL
                 """,
@@ -445,9 +445,45 @@ class SqliteRepository:
                 "bucket": str(row["bucket"]),
                 "sha256": str(row["sha256"]),
                 "byte_count": int(row["byte_count"]),
+                "user_id": str(row["user_id"]),
+                "job_id": str(row["job_id"]),
             }
         finally:
             conn.close()
+
+    def list_media(self, user_id: str) -> list[dict]:
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, job_id, object_key, sha256, byte_count, width, height,
+                       model, created_at, generation_settings
+                FROM media_artifacts
+                WHERE user_id = ? AND deleted_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_media_view(row) for row in rows]
+
+    def job_ledger(self, job_id: str) -> list[dict]:
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT entry_type, amount_units
+                FROM credit_ledger
+                WHERE job_id = ?
+                ORDER BY created_at
+                """,
+                (job_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [{"entry_type": str(row["entry_type"]), "amount": int(row["amount_units"])} for row in rows]
 
     def settlement_exists(self, job_id: str) -> bool:
         conn = self._conn()
@@ -836,3 +872,19 @@ class SqliteRepository:
             ),
         )
         return entry_id
+
+
+def _media_view(row: object) -> dict:
+    settings = row["generation_settings"]
+    return {
+        "id": str(row["id"]),
+        "user_id": str(row["user_id"]),
+        "job_id": str(row["job_id"]),
+        "sha256": str(row["sha256"]),
+        "byte_count": int(row["byte_count"]),
+        "width": None if row["width"] is None else int(row["width"]),
+        "height": None if row["height"] is None else int(row["height"]),
+        "model": None if row["model"] is None else str(row["model"]),
+        "created_at": str(row["created_at"]),
+        "settings": settings,
+    }
