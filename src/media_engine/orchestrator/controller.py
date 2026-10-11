@@ -516,6 +516,10 @@ class MediaController:
             self._fail(job, "ATTEMPT_LIMIT")
             return
         self._usage_opened[job.id] = (self.clock.now(), self.clock.iso())
+        if job.job_type == "MULTIMODAL":
+            from media_engine.models.runner import execute_multimodal
+            execute_multimodal(self, job)
+            return
         if job.job_type == TEXT_GENERATE:
             self._run_text(job)
             return

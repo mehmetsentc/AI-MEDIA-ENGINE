@@ -1,11 +1,12 @@
 """Local engine ids. The HTTP contract names a job type, not a vendor."""
 from __future__ import annotations
 
-from media_engine.jobs.model import IMAGE_GENERATE, TEXT_GENERATE, UnsupportedJobType
+from media_engine.jobs.model import IMAGE_GENERATE, MULTIMODAL, TEXT_GENERATE, UnsupportedJobType
 
 LOCAL_ENGINE_IDS = {
     IMAGE_GENERATE: "fake-image",
     TEXT_GENERATE: "fake-text",
+    MULTIMODAL: "multimodal-local",
 }
 
 

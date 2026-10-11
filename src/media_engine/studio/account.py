@@ -265,7 +265,7 @@ def history_for(controller: MediaController, user_id: str) -> list[dict]:
     rows = []
     seen: set[str] = set()
     for job in controller.jobs.list():
-        if job.client_id != user_id or job.job_type != IMAGE_GENERATE:
+        if job.client_id != user_id or job.job_type not in {IMAGE_GENERATE, "MULTIMODAL"}:
             continue
         rows.append(history_item(controller, job))
         seen.add(job.id)
@@ -283,7 +283,7 @@ def history_for(controller: MediaController, user_id: str) -> list[dict]:
 
 def history_item(controller: MediaController, job: Job) -> dict:
     status = job.public_status or job.status.lower()
-    return {
+    item = {
         "job_id": job.id,
         "user_id": job.client_id,
         "status": status,
@@ -298,6 +298,12 @@ def history_item(controller: MediaController, job: Job) -> dict:
         "updated_at": job.updated_at,
         "credit_status": credit_status(controller, job.id),
     }
+    if job.job_type == "MULTIMODAL" and job.task:
+        try:
+            item["capability"] = json.loads(job.task).get("kind", "")
+        except json.JSONDecodeError:
+            item["capability"] = ""
+    return item
 
 
 def job_group(status: str) -> str:

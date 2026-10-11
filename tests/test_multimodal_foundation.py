@@ -72,7 +72,7 @@ class MultimodalFoundationTests(unittest.TestCase):
         self.assertEqual(image.readiness, "GPU_VERIFIED")
         self.assertTrue(image.executable)
         self.assertEqual(primary_for("audio.tts").model_id, "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
-        self.assertEqual(primary_for("audio.tts").readiness, "LICENSE_REVIEWED")
+        self.assertEqual(primary_for("audio.tts").readiness, "OFFLINE_TESTED")
         self.assertFalse(primary_for("audio.tts").executable)
         blocked = {spec.model_id for spec in CATALOG if spec.commercial_use == "blocked"}
         self.assertIn("SWivid/F5-TTS", blocked)

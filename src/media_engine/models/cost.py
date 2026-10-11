@@ -7,6 +7,17 @@ from decimal import Decimal, ROUND_CEILING
 # Planning constant for non-image estimates. It is not the image credit price.
 PLANNING_CREDIT_USD = Decimal("0.05")
 
+# Local ledger keys. These do not change the published image price.
+CREDIT_RULES = {
+    "audio.transcribe": ("transcribe", "faster-whisper-large-v3", 1),
+    "audio.tts": ("tts", "qwen3-tts-custom", 1),
+    "audio.voice_clone": ("voice-clone", "qwen3-tts-base", 2),
+    "audio.translate": ("translate", "qwen2.5-1.5b-instruct", 1),
+    "image.edit": ("image-edit", "qwen-image-edit", 2),
+    "music.generate": ("music", "ace-step-v1-3.5b", 2),
+    "video.text_to_video": ("video", "wan2.1-t2v-1.3b", 8),
+}
+
 
 @dataclass(frozen=True)
 class CostProfile:

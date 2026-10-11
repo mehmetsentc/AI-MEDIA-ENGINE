@@ -30,7 +30,7 @@ class UploadStore:
         self._meta: dict[str, dict] = {}
 
     def accept(self, user_id: str, *, filename: str, header: bytes, declared_bytes: int,
-               kind: str, duration_seconds: int | None = None) -> dict:
+               kind: str, duration_seconds: int | None = None, body: bytes | None = None) -> dict:
         if kind not in LIMITS:
             raise UploadError("UPLOAD_KIND")
         if not isinstance(declared_bytes, int) or declared_bytes < 1:
@@ -42,13 +42,18 @@ class UploadStore:
                 raise UploadError("DURATION_REQUIRED")
             if duration_seconds > DURATION_LIMITS[kind]:
                 raise UploadError("DURATION_LIMIT")
-        if not _matches(kind, header):
+        if body is not None:
+            if len(body) != declared_bytes:
+                raise UploadError("UPLOAD_SIZE")
+            if not _matches(kind, body[:32]):
+                raise UploadError("UPLOAD_TYPE")
+        elif not _matches(kind, header):
             raise UploadError("UPLOAD_TYPE")
         upload_id = "upload_" + uuid.uuid4().hex
         folder = self.root / user_id
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / upload_id
-        path.write_bytes(header)
+        path.write_bytes(body if body is not None else header)
         record = {
             "upload_id": upload_id,
             "user_id": user_id,
@@ -65,6 +70,14 @@ class UploadStore:
         if row is None or row["user_id"] != user_id:
             return None
         return dict(row)
+
+    def read(self, user_id: str, upload_id: str) -> bytes | None:
+        if self.owned(user_id, upload_id) is None:
+            return None
+        path = self.root / user_id / upload_id
+        if not path.is_file():
+            return None
+        return path.read_bytes()
 
     def delete(self, user_id: str, upload_id: str) -> bool:
         row = self.owned(user_id, upload_id)

@@ -92,10 +92,18 @@ def submit_capability(controller, user_id: str, kind: str, payload: dict, book) 
         except ConsentError as exc:
             return 403, {"error": exc.code}
     spec = primary_for(kind)
-    if spec is None or not spec.executable:
+    if kind == "video.image_to_video" or spec is None or spec.role != "primary":
         return 409, {"error": "CAPABILITY_UNAVAILABLE", "kind": kind}
-    from media_engine.studio.account import submit_for_studio
-    return submit_for_studio(controller, user_id, payload, book)
+    if spec.commercial_use != "allowed":
+        return 409, {"error": "LICENSE_BLOCKED", "kind": kind}
+    provider_name = getattr(getattr(controller, "provider", None), "name", "")
+    if provider_name == "vast" and not spec.executable:
+        return 409, {"error": "CAPABILITY_UNAVAILABLE", "kind": kind}
+    if kind == "image.generate":
+        from media_engine.studio.account import submit_for_studio
+        return submit_for_studio(controller, user_id, payload, book)
+    from media_engine.models.runner import submit_local
+    return submit_local(controller, user_id, kind, payload, book)
 
 
 def record_consent(controller, user_id: str, payload: dict) -> tuple[int, dict]:
@@ -160,7 +168,7 @@ def _validate(kind: str, payload: dict) -> None:
         _text(payload.get("prompt"), "PROMPT_REQUIRED")
         if payload.get("aspect_ratio") not in _ASPECTS:
             raise SchemaError("ASPECT_UNSUPPORTED")
-        _duration(payload.get("duration_seconds"), 10)
+        _duration(payload.get("duration_seconds"), 5 if kind == "video.text_to_video" else 10)
         if kind == "video.image_to_video":
             _text(payload.get("upload_id"), "UPLOAD_REQUIRED")
         return

@@ -46,6 +46,20 @@ def authorize(path: str, headers: Optional[dict], api_key: str,
     return None
 
 
+def _artifact_type(data: bytes) -> tuple[str, str]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if data.startswith(b"RIFF") and b"WAVE" in data[:16]:
+        return "audio/wav", "wav"
+    if len(data) >= 8 and data[4:8] == b"ftyp":
+        return "video/mp4", "mp4"
+    if data.startswith(b"{"):
+        return "application/json", "json"
+    if data.startswith(b"WEBVTT"):
+        return "text/vtt", "vtt"
+    return "application/octet-stream", "bin"
+
+
 def _cookie(headers: dict, name: str) -> str:
     raw = str(headers.get("Cookie") or headers.get("cookie") or "")
     for part in raw.split(";"):
@@ -253,11 +267,12 @@ def _handler(controller: MediaController, api_key: str, studio_session: str,
                     self._json(404, {"error": "JOB_NOT_FOUND"})
                     return
                 download = "download=1" in self.path
+                content_type, extension = _artifact_type(data)
                 self.send_response(200)
-                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 disposition = "attachment" if download else "inline"
-                self.send_header("Content-Disposition", f'{disposition}; filename="{artifact_id}.png"')
+                self.send_header("Content-Disposition", f'{disposition}; filename="{artifact_id}.{extension}"')
                 self.end_headers()
                 self.wfile.write(data)
                 return
