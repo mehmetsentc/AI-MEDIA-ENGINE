@@ -1,0 +1,7 @@
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+qwen-tts==0.1.1
+transformers==4.57.3
+accelerate==1.12.0
+torchaudio==2.11.0
+safetensors==0.8.0
