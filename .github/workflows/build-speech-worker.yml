@@ -1,0 +1,185 @@
+name: build-speech-worker
+
+"on":
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit SHA to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject a malformed source SHA
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -eu
+          if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "source_sha must be 40 lowercase hex characters" >&2
+            exit 1
+          fi
+
+      - name: Checkout selected commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Require the approved feature lineage
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -eu
+          lineage_root=f2aea9b5fc91e570c8c412bef72f2dabf36f307d
+          git fetch --no-tags --quiet --depth=200 origin feature/daidoi-studio-mvp
+          if ! git merge-base --is-ancestor "$lineage_root" "$SOURCE_SHA"; then
+            echo "source_sha is outside the approved feature lineage" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/feature/daidoi-studio-mvp; then
+            echo "source_sha is not on feature/daidoi-studio-mvp" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$lineage_root" origin/feature/daidoi-studio-mvp; then
+            echo "feature branch no longer contains the approved source" >&2
+            exit 1
+          fi
+          head="$(git rev-parse HEAD)"
+          echo "checked_out=${head}"
+          if [ "$head" != "$SOURCE_SHA" ]; then
+            echo "checkout does not match source_sha" >&2
+            exit 1
+          fi
+          test -f deploy/worker/speech/Dockerfile
+          test -f deploy/worker/speech/requirements.txt
+          test -f deploy/worker/speech/probe.py
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Require 35 GiB free
+        run: |
+          set -eu
+          avail="$(df -B1 --output=avail / | tail -n 1 | tr -d '[:space:]')"
+          required=$((35 * 1024 * 1024 * 1024))
+          echo "available_bytes=${avail}"
+          echo "required_bytes=${required}"
+          if [ "$avail" -lt "$required" ]; then
+            echo "available disk is below 35 GiB" >&2
+            exit 1
+          fi
+
+      - name: Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push speech image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/worker/speech/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ghcr.io/${{ github.repository_owner }}/ai-media-engine-speech-worker:sha-${{ inputs.source_sha }}
+
+      - name: Verify pins, digest, and absent weights
+        run: |
+          set -eu
+          digest="${{ steps.push.outputs.digest }}"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "image digest is not immutable" >&2; exit 1 ;;
+          esac
+          image="ghcr.io/${{ github.repository_owner }}/ai-media-engine-speech-worker@${digest}"
+          case "$image" in
+            *"/ai-media-engine-worker@"*|*"ai-media-engine-worker:"*)
+              echo "refusing the Qwen image name" >&2
+              exit 1
+              ;;
+          esac
+          docker pull "$image"
+          docker run --rm --entrypoint python3 "$image" /workspace/speech_probe.py > /tmp/speech-probe.json
+          python3 - << 'PY'
+          import json
+          payload = json.load(open("/tmp/speech-probe.json", encoding="utf-8"))
+          expected = {
+              "faster_whisper": "1.2.1",
+              "ctranslate2": "4.8.2",
+              "qwen_tts": "0.1.1",
+              "transformers": "4.57.3",
+              "accelerate": "1.12.0",
+              "torchaudio": "2.11.0",
+          }
+          for name, version in expected.items():
+              if payload.get(name) != version:
+                  raise SystemExit("version mismatch")
+          if not str(payload.get("torch", "")).startswith("2.11."):
+              raise SystemExit("torch mismatch")
+          if payload.get("cuda_gpu_support") is not False:
+              raise SystemExit("cuda must stay unclaimed")
+          if payload.get("imports_ok") is not True:
+              raise SystemExit("imports failed")
+          print("speech_probe_ok")
+          PY
+          docker run --rm --entrypoint bash "$image" -lc 'test ! -e /models/speech/model.bin && test ! -e /models/speech/model.safetensors && test ! -e /workspace/model.bin && test ! -e /workspace/model.safetensors'
+
+      - name: Write image reference artifact
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          OWNER: ${{ github.repository_owner }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -eu
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$SOURCE_SHA" ]; then
+            echo "image tag commit does not match checkout" >&2
+            exit 1
+          fi
+          python3 - << 'PY'
+          import json, os
+          digest = os.environ["IMAGE_DIGEST"]
+          sha = os.environ["SOURCE_SHA"]
+          owner = os.environ["OWNER"].lower()
+          repository = f"ghcr.io/{owner}/ai-media-engine-speech-worker"
+          if repository.endswith("/ai-media-engine-worker"):
+              raise SystemExit("qwen image name")
+          if not digest.startswith("sha256:") or len(digest) != 71:
+              raise SystemExit("digest")
+          document = {
+              "repository": repository,
+              "tag": f"sha-{sha}",
+              "digest": digest,
+              "pinned_reference": f"{repository}@{digest}",
+              "previous_digest": "",
+              "cuda_gpu_support": False,
+          }
+          path = "deploy/worker/speech/image_ref.json"
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(document, handle, indent=2)
+              handle.write("\n")
+          print(document["pinned_reference"])
+          PY
+
+      - name: Upload image reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-image-ref
+          path: deploy/worker/speech/image_ref.json
