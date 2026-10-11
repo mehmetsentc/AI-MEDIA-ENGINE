@@ -11,7 +11,12 @@ from pathlib import Path
 from media_engine.orchestrator.controller import _DESTROY_ON
 from media_engine.providers.base import WorkerStageError
 from media_engine.providers.phase2d import INSTANCE_IMAGE
-from media_engine.providers.phase_clock import PHASE_LIMITS, PhaseWatch, note_transfer_text
+from media_engine.providers.phase_clock import (
+    INSTANCE_STARTUP_SECONDS,
+    PHASE_LIMITS,
+    PhaseWatch,
+    note_transfer_text,
+)
 from media_engine.providers.vast_image import (
     MACHINE_ID,
     VOLUME_ID,
@@ -926,7 +931,7 @@ class PhaseClockTests(unittest.TestCase):
         for code in (
             "CONNECT_TIMEOUT", "CACHE_STALL", "CACHE_TIMEOUT", "RUNTIME_TIMEOUT",
             "WORKER_READY_TIMEOUT", "PORT_UNPUBLISHED", "STARTUP_FAILED",
-            "INSTANCE_NOT_RUNNING",
+            "INSTANCE_NOT_RUNNING", "STARTUP_DEADLINE",
         ):
             self.assertIn(code, _DESTROY_ON)
 
@@ -1699,11 +1704,12 @@ class PortableWorkerTests(unittest.TestCase):
         provider.machine_id = "26359"
         with self.assertRaises(WorkerStageError) as caught:
             provider.boot("7")
-        self.assertEqual(caught.exception.code, "INSTANCE_NOT_RUNNING")
+        self.assertEqual(caught.exception.code, "STARTUP_DEADLINE")
         self.assertEqual(provider.health_error, "")
+        self.assertEqual(provider._session_closed_reason, "STARTUP_DEADLINE")
         elapsed = clock.t - 1_000
-        self.assertGreater(elapsed, PHASE_LIMITS["worker_ready"][0])
-        self.assertLess(elapsed, PHASE_LIMITS["worker_ready"][0] + 10)
+        self.assertGreater(elapsed, INSTANCE_STARTUP_SECONDS)
+        self.assertLess(elapsed, INSTANCE_STARTUP_SECONDS + 10)
 
     def test_refreshing_the_stall_clock_cannot_extend_the_startup_maximum(self) -> None:
         watch = PhaseWatch.start("worker_ready", 0)

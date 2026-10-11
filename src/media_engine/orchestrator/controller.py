@@ -76,6 +76,13 @@ _DESTROY_ON = frozenset({
     "HTTP_HEALTH_FAILED",
     "WORKER_NOT_READY",
     "INSTANCE_NOT_RUNNING",
+    "STARTUP_DEADLINE",
+    "UNKNOWN_STARTUP_FAILURE",
+    "INSTANCE_EXITED",
+    "INSTANCE_STOPPED",
+    "HOST_OFFLINE",
+    "IMAGE_PULL_FAILED",
+    "CONTAINER_START_FAILED",
 })
 
 # An authorized verification run must release the GPU after these failures too.
@@ -577,6 +584,9 @@ class MediaController:
         try:
             quote = self.provider.quote(job.client_id)
         except WorkerStageError as exc:
+            cause = str(getattr(self.provider, "_session_closed_reason", "") or "")
+            if exc.code == "SESSION_CLOSED" and cause:
+                self.trace.append(f"{job.id}:SESSION_CLOSED:{cause}")
             self._fail(job, exc.code)
             return
         if quote.hourly_price_usd > self.limits.max_hourly_price_usd:

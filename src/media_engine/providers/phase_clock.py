@@ -21,6 +21,12 @@ PHASE_LIMITS: dict[str, tuple[float, float]] = {
     "saving": (180.0, 120.0),
 }
 
+# A Vast instance can stay in "loading" while its image is pulled. That is not
+# a dead machine. The worker-ready clock starts only after actual_status is running.
+INSTANCE_STARTUP_SECONDS = 900.0
+UNKNOWN_STATUS_SECONDS = 60.0
+MISSING_INSTANCE_SECONDS = 45.0
+
 
 @dataclass
 class PhaseWatch:

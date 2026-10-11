@@ -34,7 +34,14 @@ from media_engine.providers.base import (
     WorkerStageError,
 )
 from media_engine.providers.phase2d import INSTANCE_IMAGE
-from media_engine.providers.phase_clock import PHASE_LIMITS, PhaseWatch, note_transfer_text
+from media_engine.providers.phase_clock import (
+    INSTANCE_STARTUP_SECONDS,
+    MISSING_INSTANCE_SECONDS,
+    PHASE_LIMITS,
+    PhaseWatch,
+    UNKNOWN_STATUS_SECONDS,
+    note_transfer_text,
+)
 from media_engine.providers.vast_lifecycle import classify_create_response, ownership_label
 from media_engine.safety.limits import SafetyLimits
 
@@ -403,6 +410,7 @@ class VastImageProvider(GPUProvider):
         self._port = ""
         self._busy: set[str] = set()
         self._gone: set[str] = set()
+        self._session_closed_reason = ""
         self._started_at: dict[str, float] = {}
         self.commands: list[str] = []
 
@@ -756,6 +764,8 @@ class VastImageProvider(GPUProvider):
     def quote(self, owner: str) -> Quote:
         if not owner:
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
+        if self._session_closed_reason:
+            raise WorkerStageError("SESSION_CLOSED")
         if not self._five_dollar_target_is_authorized():
             raise WorkerStageError("BUDGET_MISMATCH")
         self._owner = owner
@@ -1383,11 +1393,18 @@ class VastImageProvider(GPUProvider):
         return self._dispatch_create(owner)
 
     def create(self, owner: str) -> CreateResult:
+        if self._session_closed_reason:
+            self.live6_stop = "SESSION_CLOSED"
+            self.create_request_sent = False
+            self.billing_exposure = False
+            return CreateResult(outcome="definite_failure")
         authorization = self.execution_authorization
         if authorization is not None and self._creates_used >= int(authorization.max_creates):
             self._create_closed = True
             self.create_request_sent = False
             self.billing_exposure = False
+            if not self.live6_stop:
+                self.live6_stop = "SESSION_CLOSED"
             return CreateResult(outcome="definite_failure")
         if self._put_done or self._create_closed:
             return CreateResult(outcome="definite_failure")
@@ -1546,12 +1563,19 @@ class VastImageProvider(GPUProvider):
         self._request("DELETE", f"https://console.vast.ai/api/v0/instances/{resource_id}/", None)
         self._confirm_absent(resource_id)
 
+    def _close_session(self, reason: str) -> None:
+        """The rented GPU is finished. Later jobs must not search for a replacement."""
+        if not self._session_closed_reason:
+            self._session_closed_reason = str(reason or "SESSION_CLOSED")
+
     def _mark_gone(self, resource_id: str) -> None:
         self._gone.add(resource_id)
         self._busy.discard(resource_id)
         if self._resource_id == resource_id:
             self._resource_id = ""
         self._put_done = False
+        if self.execution_authorization is not None:
+            self._close_session(self._session_closed_reason or "SESSION_CLOSED")
 
     def _confirm_absent(self, resource_id: str) -> None:
         try:
@@ -2062,25 +2086,63 @@ class VastImageProvider(GPUProvider):
                     return
             self._sleep(5)
 
+    def _boot_failure(self, code: str) -> None:
+        self._close_session(code)
+        raise WorkerStageError(code)
+
     def _wait_until_ready(self, resource_id: str) -> None:
-        """Wait until the worker process reports ready. Instance running is not enough."""
-        watch = PhaseWatch.start("worker_ready", self._now())
+        """Wait until the worker process reports ready. Instance running is not enough.
+
+        loading, starting, and provisioning stay in a separate startup budget.
+        The worker-ready stall starts only after the provider says running.
+        """
+        from media_engine.providers.phase2d import classify_startup_failure
+
+        startup_started = self._now()
+        watch: Optional[PhaseWatch] = None
         seen = ""
         running_without_port: Optional[float] = None
+        missing_since: float | None = None
+        unknown_since: float | None = None
         self.health_error = ""
         while True:
-            row = self._instance_row(resource_id)
+            now = self._now()
+            try:
+                row = self._instance_row(resource_id)
+            except WorkerStageError:
+                raise
             if row is None:
-                raise WorkerStageError("WORKER_BOOT_FAILED")
-            status_name = str(row.get("actual_status") or "")
-            # Image pull has no worker yet. The 180s stall applies only after
-            # the instance is running. The startup maximum is unchanged.
+                if missing_since is None:
+                    missing_since = now
+                elif now - missing_since >= MISSING_INSTANCE_SECONDS:
+                    self._boot_failure("WORKER_BOOT_FAILED")
+                self._sleep(5)
+                continue
+            missing_since = None
+            status_name = str(row.get("actual_status") or "").strip().casefold()
+            failure = classify_startup_failure(row)
+            if failure == "UNKNOWN_STARTUP_FAILURE":
+                failure = None
+            if failure:
+                self._boot_failure(failure)
+            if status_name in _BOOTING_STATUSES:
+                unknown_since = None
+                if now - startup_started > INSTANCE_STARTUP_SECONDS:
+                    self._boot_failure("STARTUP_DEADLINE")
+                self._sleep(5)
+                continue
             if status_name != "running":
-                watch.mark(self._now())
-            if watch.expired(self._now()):
-                if status_name != "running" and not self.health_error:
-                    raise WorkerStageError("INSTANCE_NOT_RUNNING")
-                raise WorkerStageError(_readiness_timeout_code(self.health_error))
+                if unknown_since is None:
+                    unknown_since = now
+                elif now - unknown_since >= UNKNOWN_STATUS_SECONDS:
+                    self._boot_failure("UNKNOWN_STARTUP_FAILURE")
+                self._sleep(5)
+                continue
+            unknown_since = None
+            if watch is None:
+                watch = PhaseWatch.start("worker_ready", now)
+            if watch.expired(now):
+                self._boot_failure(_readiness_timeout_code(self.health_error))
             endpoint = worker_http_endpoint(row)
             ssh_endpoint = worker_ssh_endpoint(row)
             if status_name == "running" and endpoint is None and ssh_endpoint is None:
@@ -2088,14 +2150,14 @@ class VastImageProvider(GPUProvider):
                     running_without_port = self._now()
                 elif self._now() - running_without_port >= PORT_MAP_GRACE_SECONDS:
                     self.worker_state = "instance_running"
-                    raise WorkerStageError("PORT_UNPUBLISHED")
+                    self._boot_failure("PORT_UNPUBLISHED")
             else:
                 running_without_port = None
             if ssh_endpoint is not None:
                 kind, health = self._ssh_local_health(row)
                 if kind == "http":
                     self.worker_state = "http_failed"
-                    raise WorkerStageError("HTTP_HEALTH_FAILED")
+                    self._boot_failure("HTTP_HEALTH_FAILED")
                 if kind in {"ssh", "connect", "not_ready"}:
                     self.health_error = kind
             elif endpoint is not None:
@@ -2118,9 +2180,9 @@ class VastImageProvider(GPUProvider):
                 self.runtime_ready = True
                 return
             if state == "startup_failed":
-                raise WorkerStageError("STARTUP_FAILED")
+                self._boot_failure("STARTUP_FAILED")
             if state == "worker_failed":
-                raise WorkerStageError("WORKER_BOOT_FAILED")
+                self._boot_failure("WORKER_BOOT_FAILED")
             self._sleep(5)
 
     def _ssh_local_health(self, row: dict) -> tuple[str, Optional[dict]]:
@@ -2336,6 +2398,9 @@ def plan_cold_stage(hourly: Decimal, inet_down: float) -> Optional[dict[str, Dec
 # A running instance should already have its published ports. This is long
 # enough for Vast to fill the ports map and far shorter than the readiness stall.
 PORT_MAP_GRACE_SECONDS = 45.0
+_BOOTING_STATUSES = frozenset({
+    "loading", "starting", "provisioning", "created", "pending", "scheduling", "pulling",
+})
 _LOOPBACK_HEALTH_PROBE = """
 import json, urllib.request, urllib.error
 url = "http://127.0.0.1:8080/health"
