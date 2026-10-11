@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 from media_engine.engines.image import model_cache, qwen_remote
@@ -20,16 +21,29 @@ class WorkerSSH:
         self._ensure()
         return self.key.with_suffix(".pub").read_text(encoding="utf-8")
 
-    def run(self, host: str, port: str, command: str, timeout: int) -> tuple[int, str, str]:
+    def run(self, host: str, port: str, command: str, timeout: int, pulse=None) -> tuple[int, str, str]:
+        """Run one remote command. pulse is the supervising thread, not a side process."""
         self._ensure()
-        try:
-            completed = subprocess.run(
-                self._ssh(host, port) + [command],
-                text=True, capture_output=True, timeout=timeout, check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise WorkerStageError("WORKER_TIMEOUT") from exc
-        return completed.returncode, completed.stdout, completed.stderr
+        proc = subprocess.Popen(
+            self._ssh(host, port) + [command],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        started = time.monotonic()
+        while True:
+            if pulse is not None:
+                pulse()
+            remaining = float(timeout) - (time.monotonic() - started)
+            if remaining <= 0:
+                proc.kill()
+                proc.communicate()
+                raise WorkerStageError("WORKER_TIMEOUT")
+            try:
+                out, err = proc.communicate(timeout=min(20.0, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            return proc.returncode or 0, out or "", err or ""
 
     def stage(self, host: str, port: str) -> None:
         self._ensure()

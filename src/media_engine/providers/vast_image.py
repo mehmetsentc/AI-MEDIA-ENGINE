@@ -340,6 +340,10 @@ class VastImageProvider(GPUProvider):
         self._ssh_run = ssh_run
         self._sleep = sleep or time.sleep
         self.runtime = runtime or Path(os.environ.get("MEDIA_ENGINE_RUNTIME", "runtime"))
+        self._heartbeat_at: float | None = None
+        self._heartbeat_closed = False
+        self.heartbeat_error = ""
+        self.heartbeat_writes = 0
         self.gpu_model = ""
         self.machine_id = ""
         self.hourly_amount = Decimal("0")
@@ -1568,7 +1572,51 @@ class VastImageProvider(GPUProvider):
         if not self._session_closed_reason:
             self._session_closed_reason = str(reason or "SESSION_CLOSED")
 
+    def note_supervision(self, instance_id: str | None = None) -> None:
+        """Refresh the watchdog heartbeat from the thread that is waiting.
+
+        Closed sessions and foreign executions do not write. A failed write is
+        recorded by its exception type and leaves the previous file in place.
+        """
+        if self._heartbeat_closed:
+            return
+        execution_id = str(self.execution_id or "")
+        resource = str(instance_id or self._resource_id or "")
+        if not execution_id or not resource.isdigit():
+            return
+        from media_engine.providers.session_heartbeat import (
+            HeartbeatOwnershipError,
+            HeartbeatReadError,
+            refresh_heartbeat,
+        )
+        try:
+            written = refresh_heartbeat(
+                Path(self.runtime) / "watchdog.heartbeat",
+                execution_id=execution_id,
+                instance_id=resource,
+                now=float(self._now()),
+                previous_at=self._heartbeat_at,
+            )
+        except HeartbeatOwnershipError:
+            self.heartbeat_error = "HEARTBEAT_OWNERSHIP"
+            self.launch_trace.append("heartbeat_ownership")
+            return
+        except HeartbeatReadError as exc:
+            self.heartbeat_error = "HEARTBEAT_UNREADABLE"
+            self.launch_trace.append("heartbeat_unreadable")
+            return
+        except OSError as exc:
+            self.heartbeat_error = type(exc).__name__
+            self.launch_trace.append("heartbeat_write_failed")
+            return
+        if written is None:
+            return
+        self._heartbeat_at = written
+        self.heartbeat_writes += 1
+        self.heartbeat_error = ""
+
     def _mark_gone(self, resource_id: str) -> None:
+        self._heartbeat_closed = True
         self._gone.add(resource_id)
         self._busy.discard(resource_id)
         if self._resource_id == resource_id:
@@ -1824,6 +1872,7 @@ class VastImageProvider(GPUProvider):
             self._ensure_ssh()
         if self._ssh_run is None:
             raise WorkerStageError("WORKER_BOOT_FAILED")
+        self.note_supervision()
         try:
             return self._ssh_run(self._host or "worker", self._port or "22", command, timeout)
         except TimeoutError as exc:
@@ -2045,6 +2094,7 @@ class VastImageProvider(GPUProvider):
         attached = False
         seen_status = ""
         while True:
+            self.note_supervision(resource_id)
             if watch.expired(self._now()):
                 raise WorkerStageError("CONNECT_TIMEOUT")
             row = self._instance_row(resource_id)
@@ -2081,7 +2131,9 @@ class VastImageProvider(GPUProvider):
                 if code == 0 and "ready" in out:
                     self._host = host
                     self._port = port
-                    self._ssh_run = worker.run
+                    self._ssh_run = lambda host, port, command, timeout: worker.run(
+                        host, port, command, timeout, pulse=self.note_supervision,
+                    )
                     self._worker_ssh = worker
                     return
             self._sleep(5)
@@ -2106,6 +2158,7 @@ class VastImageProvider(GPUProvider):
         unknown_since: float | None = None
         self.health_error = ""
         while True:
+            self.note_supervision(resource_id)
             now = self._now()
             try:
                 row = self._instance_row(resource_id)
@@ -2245,6 +2298,7 @@ class VastImageProvider(GPUProvider):
             self._preserve_stage_evidence("")
             raise WorkerStageError("MODEL_CACHE_INVALID")
         while True:
+            self.note_supervision()
             _code, progress, _err = self._remote(_CACHE_PROGRESS, 30, "CACHE_TIMEOUT")
             note_transfer_text(watch, progress, self._now())
             if "MB_per_sec" in progress:

@@ -616,12 +616,12 @@ class MediaController:
         self.trace.append(f"{resource_id}:BUSY")
         try:
             self._set_public(job, "booting")
-            self._unlocked(lambda: self.provider.boot(resource_id))
-            self._unlocked(lambda: self.provider.confirm_cache(resource_id))
+            self._unlocked(lambda: self._supervised_phase(resource_id, self.provider.boot))
+            self._unlocked(lambda: self._supervised_phase(resource_id, self.provider.confirm_cache))
             self._set_public(job, "runtime_preparing")
-            self._unlocked(lambda: self.provider.prepare_runtime(resource_id))
+            self._unlocked(lambda: self._supervised_phase(resource_id, self.provider.prepare_runtime))
             self._set_public(job, "model_loading")
-            self._unlocked(lambda: self.provider.ensure_model(resource_id))
+            self._unlocked(lambda: self._supervised_phase(resource_id, self.provider.ensure_model))
         except WorkerStageError as exc:
             self._fail_worker(job, exc.code, resource_id, destroy=self._destroy_for(exc.code))
             return
@@ -718,7 +718,22 @@ class MediaController:
         self._mark_idle(resource_id)
         self._record_usage(job, JobStatus.SUCCEEDED)
 
+    def _note_gpu_supervision(self, resource_id: str | None) -> None:
+        """One beat from the controller thread. Failures stay visible and secret-free."""
+        note = getattr(self.provider, "note_supervision", None)
+        if not callable(note) or not resource_id:
+            return
+        try:
+            note(str(resource_id))
+        except Exception as exc:
+            self.trace.append("heartbeat:" + type(exc).__name__)
+
+    def _supervised_phase(self, resource_id: str, method) -> None:
+        self._note_gpu_supervision(resource_id)
+        method(resource_id)
+
     def _render_public(self, job: Job) -> bytes:
+        self._note_gpu_supervision(self._worker_id)
         generate = getattr(self.provider, "generate", None)
         if callable(generate):
             return generate(prompt=job.prompt, width=job.width or 1024, height=job.height or 1024, seed=job.seed or 0)
