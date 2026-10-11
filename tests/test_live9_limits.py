@@ -154,8 +154,8 @@ class AuthorizationLimitTests(unittest.TestCase):
         self.assertEqual(provider.session_limit, 1)
         self.assertTrue(provider.single_image_only)
 
-    def test_counts_other_than_one_or_three_are_rejected(self) -> None:
-        for images, inferences in ((2, 2), (4, 4), (3, 1), (1, 3)):
+    def test_unmatched_and_out_of_range_counts_are_rejected(self) -> None:
+        for images, inferences in ((0, 0), (4, 4), (3, 1), (1, 3), (2, 1), (2, 3)):
             with self.assertRaises(WorkerStageError) as raised:
                 _three(max_image_count=images, max_inference_attempts=inferences)
             self.assertEqual(raised.exception.code, "INSTANCE_LIMIT")

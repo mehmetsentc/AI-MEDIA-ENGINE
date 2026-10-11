@@ -264,8 +264,20 @@ def _load_workspace_module(name: str, path: str):
     return module
 
 
+def session_image_limit() -> int:
+    """The rented process stops at the authorized count. A missing value does not become three."""
+    raw = os.environ.get("MEDIA_ENGINE_SESSION_IMAGE_LIMIT", "").strip()
+    if raw not in {"1", "2", "3"}:
+        raise RuntimeError("SESSION_IMAGE_LIMIT")
+    return int(raw)
+
+
 def _serve() -> int:
     """Stay up, load Qwen once, and write one PNG per inbox job. Not the one-shot command."""
+    try:
+        limit = session_image_limit()
+    except RuntimeError:
+        return 2
     mount = resolve_worker_mount(None, WORKER_MOUNT)
     os.environ["HF_HOME"] = str(mount / "hf-cache")
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(mount / "hf-cache")
@@ -285,7 +297,7 @@ def _serve() -> int:
     Path("/workspace/session.ready").write_text("ready\n", encoding="utf-8")
     seen: set[str] = set()
     completed = 0
-    while completed < 3 and not Path("/workspace/session.stop").exists():
+    while completed < limit and not Path("/workspace/session.stop").exists():
         progressed = False
         for path in sorted(inbox.glob("*.json")):
             if path.name in seen:
@@ -307,7 +319,7 @@ def _serve() -> int:
             seen.add(path.name)
             completed += 1
             progressed = True
-            if completed >= 3:
+            if completed >= limit:
                 break
         if not progressed:
             time.sleep(1)

@@ -1669,7 +1669,7 @@ class VastImageProvider(GPUProvider):
             return
         images = int(authorization.max_image_count)
         inferences = int(authorization.max_inference_attempts)
-        if images not in (1, 3) or inferences != images:
+        if images not in (1, 2, 3) or inferences != images:
             raise WorkerStageError("INSTANCE_LIMIT")
         if (
             int(authorization.max_instances) != 1
@@ -1755,7 +1755,7 @@ class VastImageProvider(GPUProvider):
             raise WorkerStageError("SESSION_IMAGE_LIMIT")
         if not self._session_booted:
             self._claim_model_load()
-            code, out, _err = self._remote(_session_boot_command(python), 1200)
+            code, out, _err = self._remote(_session_boot_command(python, limit), 1200)
             if code != 0 or "SESSION_READY" not in out:
                 raise WorkerStageError("MODEL_LOAD_FAILED")
             self._session_booted = True
@@ -2724,13 +2724,15 @@ _CACHE_PROGRESS = "cat /workspace/r2-sync-progress.json 2>/dev/null || true"
 _CACHE_EXIT = "if [ -f /workspace/cache-sync.exit ]; then cat /workspace/cache-sync.exit; else echo RUNNING; fi"
 _CACHE_KILL = "if [ -f /workspace/cache-sync.pid ]; then kill $(cat /workspace/cache-sync.pid) >/dev/null 2>&1 || true; fi"
 
-def _session_boot_command(python: str) -> str:
+def _session_boot_command(python: str, limit: int) -> str:
+    if int(limit) not in (1, 2, 3):
+        raise WorkerStageError("INSTANCE_LIMIT")
     quoted = shlex.quote(python)
     return (
         "mkdir -p /workspace/session-inbox /workspace/session-out && "
         f"if [ ! -f /workspace/qwen_remote.py ]; then echo MISSING_REMOTE; exit 3; fi && "
         "if [ ! -f /workspace/session.ready ]; then "
-        f"nohup {quoted} -u /workspace/qwen_remote.py serve >> /workspace/session.log 2>&1 & "
+        f"MEDIA_ENGINE_SESSION_IMAGE_LIMIT={int(limit)} nohup {quoted} -u /workspace/qwen_remote.py serve >> /workspace/session.log 2>&1 & "
         "echo $! > /workspace/session.pid; fi && "
         "ready=0; i=0; while [ \"$i\" -lt 600 ]; do "
         "if [ -f /workspace/session.ready ]; then ready=1; break; fi; "

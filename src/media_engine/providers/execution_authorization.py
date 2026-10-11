@@ -173,7 +173,7 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
         raise WorkerStageError("BUDGET_MISMATCH")
     if instances != 1:
         raise WorkerStageError("INSTANCE_LIMIT")
-    if images not in (1, 3) or inferences != images:
+    if images not in (1, 2, 3) or inferences != images:
         raise WorkerStageError("INSTANCE_LIMIT")
     creates = _optional_one(kwargs, "max_creates")
     gpu_instances = _optional_one(kwargs, "max_gpu_instances")
@@ -231,7 +231,7 @@ def accept_record(authorization: ExecutionAuthorization, *, now: float, code_sha
         raise WorkerStageError("EXPIRED_AUTHORIZATION")
     if authorization.max_instances != 1 or not _total_allowed(authorization):
         raise WorkerStageError("BUDGET_MISMATCH")
-    if authorization.max_image_count not in (1, 3):
+    if authorization.max_image_count not in (1, 2, 3):
         raise WorkerStageError("INSTANCE_LIMIT")
     if authorization.max_inference_attempts != authorization.max_image_count:
         raise WorkerStageError("INSTANCE_LIMIT")
