@@ -599,6 +599,11 @@ class MediaController:
             resource_id = reusable
             self.trace.append(f"{resource_id}:REUSED")
         self._remember_worker(resource_id, quote)
+        # The idle clock belongs to a session with nothing left to run.
+        # Booting the next queued image is still that session.
+        self._worker_idle_since = None
+        self.provider.begin_busy(resource_id)
+        self.trace.append(f"{resource_id}:BUSY")
         try:
             self._set_public(job, "booting")
             self._unlocked(lambda: self.provider.boot(resource_id))
@@ -610,9 +615,6 @@ class MediaController:
         except WorkerStageError as exc:
             self._fail_worker(job, exc.code, resource_id, destroy=self._destroy_for(exc.code))
             return
-        self.provider.begin_busy(resource_id)
-        self._worker_idle_since = None
-        self.trace.append(f"{resource_id}:BUSY")
         self._transition(job, JobStatus.RUNNING)
         now_iso = self.clock.iso()
         attempt_id = self.attempts.start(job.id, now_iso)
@@ -977,6 +979,8 @@ class MediaController:
             return self.last_shutdown_reason
         if status == "READY" and self._worker_idle_since is not None:
             if now - self._worker_idle_since >= self.limits.gpu_idle_shutdown_seconds:
+                if self.queue.pending():
+                    return None
                 self._terminate(resource_id, "GPU_IDLE_SHUTDOWN")
                 return self.last_shutdown_reason
         return None

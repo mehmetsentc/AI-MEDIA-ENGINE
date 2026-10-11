@@ -761,6 +761,8 @@ class VastImageProvider(GPUProvider):
         self._owner = owner
         self._label = ownership_label(owner)
         if self._live8_bound():
+            if str(self._resource_id).isdigit() and self.execution_grant is not None:
+                return self._quote_bound_session()
             self._refresh_live8(bind_grant=False)
             return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
         if self._live7_bound():
@@ -781,6 +783,43 @@ class VastImageProvider(GPUProvider):
         self.fits_operation_budget = chosen.projected_cost <= active_operation_budget()
         if chosen.source == "r2_cold_stage" and not _r2_configured():
             raise WorkerStageError("MODEL_CACHE_INVALID")
+        return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
+
+    def _quote_bound_session(self) -> Quote:
+        """Price the instance already rented for this authorization.
+
+        The original offer leaves the rentable market once it is taken. Later
+        images stay on this instance. They do not search, and they do not create.
+        """
+        authorization = self.execution_authorization
+        grant = self.execution_grant
+        if authorization is None or grant is None:
+            raise WorkerStageError("MISSING_AUTHORIZATION")
+        if float(self._now()) >= float(authorization.expires_at):
+            raise WorkerStageError("EXPIRED_AUTHORIZATION")
+        if (
+            grant.execution_id != authorization.execution_id
+            or self.execution_id != authorization.execution_id
+            or int(self.offer_id or 0) != int(grant.offer_id or 0)
+            or int(self.machine_id or 0) != int(grant.machine_id or 0)
+        ):
+            raise WorkerStageError("OWNERSHIP_MISMATCH")
+        resource_id = str(self._resource_id or "")
+        if not resource_id.isdigit() or resource_id in self._gone or self.status(resource_id) == "TERMINATED":
+            raise WorkerStageError("SESSION_CLOSED")
+        try:
+            row = self._instance_row(resource_id)
+        except WorkerStageError:
+            raise
+        if row is None:
+            raise WorkerStageError("SESSION_CLOSED")
+        label = str(row.get("label") or "")
+        if label != ownership_label(self.execution_id):
+            raise WorkerStageError("OWNERSHIP_MISMATCH")
+        if not self._same_machine(row) or int(row.get("machine_id") or 0) != int(grant.machine_id or 0):
+            raise WorkerStageError("MACHINE_SCOPE")
+        if str(row.get("actual_status") or "") != "running":
+            raise WorkerStageError("WORKER_NOT_READY")
         return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
 
     def _quote_live7(self, owner: str) -> Quote:
