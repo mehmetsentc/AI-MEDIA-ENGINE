@@ -194,26 +194,40 @@ def cost_estimate(transfer_seconds: float | None, inference_seconds: dict | None
 
 
 def authorization_requirements() -> dict:
+    from media_engine.models.speech_inventory import TARGETS
+    pins = [
+        {"model_id": item["model_id"], "revision": item["revision"]}
+        for item in TARGETS
+        if item["capability"] in {"audio.transcribe", "audio.tts"}
+    ]
     return {
-        "issuer_accepts_speech_models": False,
-        "refusal": "MODEL_SUBSTITUTION",
-        "accepted_model": "Qwen/Qwen-Image",
-        "accepted_revision": REVISION,
+        "issuer_accepts_speech_models": True,
+        "paid_authorization_issued": False,
+        "recorded_worker_digest": None,
+        "speech_models": pins,
+        "refusal_without_digest": "SPEECH_IMAGE_NOT_BUILT",
+        "image_issuer_model": "Qwen/Qwen-Image",
+        "image_issuer_revision": REVISION,
         "required_fields": list(_FIELDS),
         "constraints": {
             "max_instances": 1,
             "max_creates": 1,
             "max_gpu_instances": 1,
-            "max_model_stages": 1,
-            "max_model_loads": 1,
+            "max_model_stages": 2,
+            "max_model_loads": 2,
+            "max_inference_attempts": 2,
+            "max_image_count": 0,
             "max_hourly_usd_at_most": format(LIVE7_MAX_HOURLY_USD, "f"),
-            "max_total_usd_at_most": format(LIVE7_CEILING_USD, "f"),
+            "max_total_usd": format(LIVE7_CEILING_USD, "f"),
+            "provider_billing_cap": False,
             "max_disk_gb": LIVE7_DISK_GB,
             "forbidden_volume_id": FORBIDDEN_VOLUME_ID,
             "one_use": True,
             "code_sha": "the commit that will actually run",
+            "worker_digest": "the built speech image digest",
+            "user_approval": "fresh explicit approval inside the validity window",
         },
-        "missing": "A speech authorization must name these revisions without weakening the Qwen issuer.",
+        "missing": "The speech image has no recorded digest, and no paid approval has been issued.",
     }
 
 

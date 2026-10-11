@@ -53,6 +53,11 @@ _OPTIONAL = (
     "max_gpu_instances",
     "max_model_stages",
     "max_model_loads",
+    "speech_session",
+    "worker_digest",
+    "speech_models",
+    "user_approval",
+    "provider_billing_cap",
 )
 
 
@@ -93,9 +98,15 @@ class ExecutionAuthorization:
     max_gpu_instances: int = 1
     max_model_stages: int = 1
     max_model_loads: int = 1
+    speech_session: bool = False
+    worker_digest: str = ""
+    speech_models: tuple[tuple[str, str], ...] = ()
+    approval_id: str = ""
+    approved_at: float = 0.0
+    provider_billing_cap: bool = False
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "authorization_id": self.authorization_id,
             "execution_id": self.execution_id,
             "code_sha": self.code_sha,
@@ -119,6 +130,14 @@ class ExecutionAuthorization:
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
         }
+        if not self.speech_session:
+            return result
+        result["speech_session"] = True
+        result["worker_digest"] = self.worker_digest
+        result["speech_models"] = [list(pair) for pair in self.speech_models]
+        result["user_approval"] = {"approval_id": self.approval_id, "approved_at": self.approved_at}
+        result["provider_billing_cap"] = False
+        return result
 
 
 def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
@@ -128,6 +147,12 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
         raise WorkerStageError("MISSING_AUTHORIZATION")
     if any(name not in kwargs for name in _FIELDS):
         raise WorkerStageError("MISSING_AUTHORIZATION")
+    if kwargs.get("speech_session") is True:
+        return _issue_speech(kwargs)
+    if kwargs.get("speech_session") not in (None, False):
+        raise WorkerStageError("MISSING_AUTHORIZATION")
+    if any(kwargs.get(name) for name in ("worker_digest", "speech_models", "user_approval", "provider_billing_cap")):
+        raise WorkerStageError("MODEL_SUBSTITUTION")
     policy = str(kwargs["selection_policy"])
     if policy not in _POLICIES:
         raise WorkerStageError("SELECTION_POLICY")
@@ -211,6 +236,130 @@ def issue_authorization(**kwargs: object) -> ExecutionAuthorization:
     )
 
 
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _speech_pins() -> tuple[tuple[str, str], ...]:
+    from media_engine.models.speech_inventory import TARGETS
+    pins = []
+    for capability in ("audio.transcribe", "audio.tts"):
+        matches = [item for item in TARGETS if item["capability"] == capability]
+        if len(matches) != 1:
+            raise WorkerStageError("MODEL_SUBSTITUTION")
+        pins.append((matches[0]["model_id"], matches[0]["revision"]))
+    return tuple(pins)
+
+
+def _issue_speech(kwargs: dict) -> ExecutionAuthorization:
+    """One speech session for the two pinned models. This does not rent a GPU."""
+    pins = _speech_pins()
+    policy = str(kwargs["selection_policy"])
+    if policy != "just_in_time":
+        raise WorkerStageError("SELECTION_POLICY")
+    pairs = _pairs(kwargs.get("allowed_pairs"))
+    families = _gpu_families(kwargs.get("selection_constraints"))
+    if not pairs:
+        raise WorkerStageError("MACHINE_SCOPE")
+    authorization_id = str(kwargs["authorization_id"])
+    execution_id = str(kwargs["execution_id"])
+    code_sha = str(kwargs["code_sha"])
+    if _ID.fullmatch(authorization_id) is None or _ID.fullmatch(execution_id) is None:
+        raise WorkerStageError("MISSING_AUTHORIZATION")
+    if _SHA.fullmatch(code_sha) is None:
+        raise WorkerStageError("STALE_AUTHORIZATION")
+    machines = _positive_ids(kwargs["allowed_machine_ids"])
+    offers = _positive_ids(kwargs["allowed_offer_ids"])
+    pair_machines = {machine for machine, _offer in pairs}
+    pair_offers = {offer for _machine, offer in pairs}
+    if pair_machines != set(machines) or pair_offers != set(offers):
+        raise WorkerStageError("MACHINE_SCOPE")
+    digest = str(kwargs.get("worker_digest") or "")
+    if _DIGEST.fullmatch(digest) is None:
+        raise WorkerStageError("IMAGE_DIGEST")
+    approval = kwargs.get("user_approval")
+    if not isinstance(approval, dict):
+        raise WorkerStageError("APPROVAL_REQUIRED")
+    approval_id = str(approval.get("approval_id") or "")
+    if _ID.fullmatch(approval_id) is None or "approved_at" not in approval:
+        raise WorkerStageError("APPROVAL_REQUIRED")
+    try:
+        hourly = Decimal(str(kwargs["max_hourly_usd"]))
+        total = Decimal(str(kwargs["max_total_usd"]))
+        issued = float(kwargs["issued_at"])
+        expires = float(kwargs["expires_at"])
+        approved = float(approval["approved_at"])
+        instances = int(kwargs["max_instances"])
+        inferences = int(kwargs["max_inference_attempts"])
+        images = int(kwargs["max_image_count"])
+        disk = int(kwargs["max_disk_gb"])
+        creates = int(kwargs["max_creates"])
+        gpu_instances = int(kwargs["max_gpu_instances"])
+        stages = int(kwargs["max_model_stages"])
+        loads = int(kwargs["max_model_loads"])
+    except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise WorkerStageError("BUDGET_MISMATCH") from exc
+    if kwargs.get("provider_billing_cap") not in (None, False):
+        raise WorkerStageError("BUDGET_MISMATCH")
+    if hourly <= 0 or hourly > LIVE7_MAX_HOURLY_USD:
+        raise WorkerStageError("PRICE_CHANGED")
+    if total != LIVE7_CEILING_USD:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    if instances != 1 or creates != 1 or gpu_instances != 1:
+        raise WorkerStageError("INSTANCE_LIMIT")
+    if stages != 2 or loads != 2 or inferences != 2 or images != 0:
+        raise WorkerStageError("INSTANCE_LIMIT")
+    if disk != LIVE7_DISK_GB:
+        raise WorkerStageError("DISK_INSUFFICIENT")
+    supplied = _model_pairs(kwargs.get("speech_models"))
+    if supplied != pins:
+        raise WorkerStageError("MODEL_SUBSTITUTION")
+    if str(kwargs["model"]) != pins[0][0] or str(kwargs["revision"]) != pins[0][1]:
+        raise WorkerStageError("MODEL_SUBSTITUTION")
+    if expires <= issued or approved < issued or approved >= expires:
+        raise WorkerStageError("EXPIRED_AUTHORIZATION")
+    return ExecutionAuthorization(
+        authorization_id=authorization_id,
+        execution_id=execution_id,
+        code_sha=code_sha,
+        allowed_machine_ids=machines,
+        allowed_offer_ids=offers,
+        selection_policy=policy,
+        max_hourly_usd=hourly,
+        max_total_usd=total,
+        max_instances=instances,
+        max_inference_attempts=inferences,
+        max_image_count=images,
+        max_disk_gb=disk,
+        model=pins[0][0],
+        revision=pins[0][1],
+        issued_at=issued,
+        expires_at=expires,
+        allowed_pairs=pairs,
+        gpu_families=families,
+        max_creates=creates,
+        max_gpu_instances=gpu_instances,
+        max_model_stages=stages,
+        max_model_loads=loads,
+        speech_session=True,
+        worker_digest=digest,
+        speech_models=pins,
+        approval_id=approval_id,
+        approved_at=approved,
+        provider_billing_cap=False,
+    )
+
+
+def _model_pairs(value: object) -> tuple[tuple[str, str], ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)) or not value:
+        raise WorkerStageError("MODEL_SUBSTITUTION")
+    found = []
+    for item in value:
+        if isinstance(item, (str, bytes)) or not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise WorkerStageError("MODEL_SUBSTITUTION")
+        found.append((str(item[0]), str(item[1])))
+    return tuple(found)
+
+
 def authorization_from_json(text: str) -> ExecutionAuthorization:
     try:
         payload = json.loads(text)
@@ -225,6 +374,8 @@ def accept_record(authorization: ExecutionAuthorization, *, now: float, code_sha
     """Refuse a record that does not match the code that is about to run."""
     if not isinstance(authorization, ExecutionAuthorization):
         raise WorkerStageError("MISSING_AUTHORIZATION")
+    if authorization.speech_session:
+        raise WorkerStageError("MODEL_SUBSTITUTION")
     if code_sha != authorization.code_sha:
         raise WorkerStageError("STALE_AUTHORIZATION")
     if now >= authorization.expires_at or authorization.expires_at <= authorization.issued_at:
@@ -242,6 +393,45 @@ def accept_record(authorization: ExecutionAuthorization, *, now: float, code_sha
         or authorization.max_model_loads != 1
     ):
         raise WorkerStageError("INSTANCE_LIMIT")
+
+
+def accept_speech_record(
+    authorization: ExecutionAuthorization,
+    *,
+    now: float,
+    code_sha: str,
+    recorded_digest: str | None,
+    volume_id: int | None = None,
+) -> None:
+    """Accept one speech record. A missing image digest fails closed."""
+    if not isinstance(authorization, ExecutionAuthorization) or not authorization.speech_session:
+        raise WorkerStageError("MISSING_AUTHORIZATION")
+    if code_sha != authorization.code_sha:
+        raise WorkerStageError("STALE_AUTHORIZATION")
+    if now >= authorization.expires_at or now < authorization.approved_at:
+        raise WorkerStageError("EXPIRED_AUTHORIZATION")
+    if authorization.approved_at < authorization.issued_at:
+        raise WorkerStageError("EXPIRED_AUTHORIZATION")
+    if recorded_digest is None:
+        raise WorkerStageError("SPEECH_IMAGE_NOT_BUILT")
+    if recorded_digest != authorization.worker_digest:
+        raise WorkerStageError("IMAGE_DIGEST")
+    if volume_id is not None and int(volume_id) == FORBIDDEN_VOLUME_ID:
+        raise WorkerStageError("VOLUME_FORBIDDEN")
+    if authorization.max_total_usd != LIVE7_CEILING_USD or authorization.max_hourly_usd > LIVE7_MAX_HOURLY_USD:
+        raise WorkerStageError("BUDGET_MISMATCH")
+    if (
+        authorization.max_instances != 1
+        or authorization.max_creates != 1
+        or authorization.max_gpu_instances != 1
+        or authorization.max_model_stages != 2
+        or authorization.max_model_loads != 2
+        or authorization.max_inference_attempts != 2
+        or authorization.max_image_count != 0
+    ):
+        raise WorkerStageError("INSTANCE_LIMIT")
+    if authorization.speech_models != _speech_pins() or authorization.provider_billing_cap:
+        raise WorkerStageError("MODEL_SUBSTITUTION")
 
 
 def select_for_authorization(
@@ -318,6 +508,8 @@ def candidates_for_authorization(
 
 def make_live8_grant(authorization: ExecutionAuthorization, candidate: GpuCandidate) -> SpendGrant:
     """Bind the grant to the offer selected for this authorization, not to a source constant."""
+    if authorization.speech_session:
+        raise WorkerStageError("MODEL_SUBSTITUTION")
     if authorization.selection_policy == "just_in_time":
         pair = (candidate.machine_id, candidate.offer_id)
         if pair not in authorization.allowed_pairs:

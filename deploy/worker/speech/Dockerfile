@@ -20,8 +20,10 @@ RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED \
     && rm -rf /var/lib/apt/lists/*
 
 COPY deploy/worker/speech/requirements.txt /tmp/speech-requirements.txt
+COPY deploy/worker/speech/probe.py /workspace/speech_probe.py
 RUN python3 -m pip install --no-cache-dir --disable-pip-version-check \
       -r /tmp/speech-requirements.txt \
+    && python3 /workspace/speech_probe.py \
     && python3 -c "import importlib.metadata as meta; assert meta.version('faster-whisper')=='1.2.1'; assert meta.version('qwen-tts')=='0.1.1'; assert meta.version('transformers')=='4.57.3'"
 
 ENV HF_HUB_OFFLINE=1 \
