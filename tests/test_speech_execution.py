@@ -361,3 +361,49 @@ class SpeechExecutionTests(unittest.TestCase):
         with self.assertRaises(WorkerStageError) as mutable_digest:
             _speech(worker_digest="latest")
         self.assertEqual(mutable_digest.exception.code, "IMAGE_DIGEST")
+
+def _speech_probe():
+    import importlib.util
+    path = ROOT / "deploy" / "worker" / "speech" / "probe.py"
+    spec = importlib.util.spec_from_file_location("speech_probe", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class SpeechProbeVersionTests(unittest.TestCase):
+    def test_base_image_local_version_matches_the_pin_and_cuda_stays_unverified(self) -> None:
+        probe = _speech_probe()
+        actual = {key: version for key, version in probe.EXPECTED.items()}
+        actual["torchaudio"] = "2.11.0+cu128"
+        actual["torch"] = "2.11.0+cu128"
+        verified = probe.check_distribution_versions(actual)
+        self.assertEqual(verified["torchaudio"], "2.11.0")
+        self.assertEqual(verified["torchaudio_distribution"], "2.11.0+cu128")
+        self.assertTrue(verified["torch"].startswith("2.11."))
+        source = (ROOT / "deploy" / "worker" / "speech" / "probe.py").read_text(encoding="utf-8")
+        self.assertIn('payload["cuda_gpu_support"] = False', source)
+        self.assertNotIn("snapshot_download", source)
+        self.assertNotIn("from_pretrained", source)
+        self.assertNotIn("hf_hub_download", source)
+
+    def test_wrong_missing_and_unrelated_versions_name_the_package(self) -> None:
+        probe = _speech_probe()
+        actual = {key: version for key, version in probe.EXPECTED.items()}
+        actual["torch"] = "2.11.0"
+        actual["torchaudio"] = "2.10.0"
+        with self.assertRaises(SystemExit) as mismatch:
+            probe.check_distribution_versions(actual)
+        self.assertIn("VERSION_MISMATCH", str(mismatch.exception))
+        self.assertIn("package=torchaudio", str(mismatch.exception))
+        self.assertIn("expected=2.11.0", str(mismatch.exception))
+        self.assertIn("actual=2.10.0", str(mismatch.exception))
+        self.assertIn("method=importlib.metadata", str(mismatch.exception))
+        del actual["qwen_tts"]
+        actual["torchaudio"] = "2.11.0"
+        with self.assertRaises(SystemExit) as missing:
+            probe.check_distribution_versions(actual)
+        self.assertIn("MISSING_DISTRIBUTION", str(missing.exception))
+        self.assertIn("package=qwen-tts", str(missing.exception))
+        self.assertFalse(probe.release_matches("2.11.0.post1", "2.11.0"))
+        self.assertFalse(probe.release_matches("2.11.1+cu128", "2.11.0"))
