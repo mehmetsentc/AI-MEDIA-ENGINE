@@ -10,6 +10,7 @@ from media_engine.infra.volume_audit import VOLUME_ID
 from media_engine.models.audio import encode_wav
 from media_engine.models.cost import CREDIT_RULES
 from media_engine.models.speech_execution import classify_probe, run_speech_rehearsal
+from media_engine.models.speech_image import SPEECH_REPOSITORY, assess_speech_image_ref, load_image_ref, speech_image_ref_path
 from media_engine.models.speech_stage import SpeechPrepError, stage_from_r2, verify_tree
 from media_engine.platform.service import Platform
 from media_engine.providers.base import WorkerStageError
@@ -93,6 +94,17 @@ class _Client:
         return 200, {}, b""
 
 
+def _verified_ref(digest: str) -> dict:
+    return {
+        "repository": SPEECH_REPOSITORY,
+        "tag": "sha-" + SHA,
+        "digest": digest,
+        "pinned_reference": SPEECH_REPOSITORY + "@" + digest,
+        "previous_digest": "",
+        "cuda_gpu_support": False,
+    }
+
+
 def _speech(**overrides):
     fields = dict(
         authorization_id="speech-auth-dry",
@@ -162,6 +174,7 @@ class SpeechExecutionTests(unittest.TestCase):
             instance_id="77",
             clock=self.clock,
             weights_root=self.weights,
+            image_ref=_verified_ref(DIGEST),
         )
         fields.update(overrides)
         return run_speech_rehearsal(**fields)
@@ -278,7 +291,29 @@ class SpeechExecutionTests(unittest.TestCase):
         dockerfile = (ROOT / "deploy" / "worker" / "Dockerfile").read_text(encoding="utf-8")
         self.assertNotIn("faster-whisper", dockerfile)
         self.assertNotIn("speech_probe", dockerfile)
-        self.assertFalse((ROOT / "deploy" / "worker" / "speech" / "image_ref.json").exists())
+        self.assertFalse((ROOT / "deploy" / "worker" / "speech" / "image_ref.json").read_text(encoding="utf-8").find("sha256:be2c96a09947") >= 0)
+        committed = load_image_ref(speech_image_ref_path())
+        with self.assertRaises(WorkerStageError) as unverified:
+            assess_speech_image_ref(committed)
+        self.assertEqual(unverified.exception.code, "IMAGE_UNVERIFIED")
+        with self.assertRaises(WorkerStageError) as mutable:
+            assess_speech_image_ref({
+                "repository": SPEECH_REPOSITORY,
+                "tag": "latest",
+                "digest": DIGEST,
+                "pinned_reference": SPEECH_REPOSITORY + ":latest",
+                "cuda_gpu_support": False,
+            })
+        self.assertEqual(mutable.exception.code, "IMAGE_MUTABLE")
+        with self.assertRaises(WorkerStageError) as substituted:
+            assess_speech_image_ref({
+                "repository": "ghcr.io/mehmetsentc/ai-media-engine-worker",
+                "tag": "sha-" + SHA,
+                "digest": DIGEST,
+                "pinned_reference": "ghcr.io/mehmetsentc/ai-media-engine-worker@" + DIGEST,
+                "cuda_gpu_support": False,
+            })
+        self.assertEqual(substituted.exception.code, "IMAGE_SUBSTITUTION")
         probed = classify_probe({"imports_ok": True, "torch_cuda_is_available": True, "faster_whisper": "1.2.1"})
         self.assertFalse(probed["cuda_gpu_support"])
         self.assertEqual(probed["reason"], "imports_are_not_gpu_proof")
@@ -303,3 +338,26 @@ class SpeechExecutionTests(unittest.TestCase):
         self.assertFalse(image_auth.speech_session)
         self.assertEqual(image_auth.max_model_stages, 1)
         accept_record(image_auth, now=5_000, code_sha=SHA)
+
+    def test_manual_workflow_does_not_retag_the_image_worker(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "build-speech-worker.yml").read_text(encoding="utf-8")
+        trigger = workflow.split("jobs:", 1)[0]
+        self.assertIn("workflow_dispatch:", trigger)
+        self.assertNotIn("push:", trigger)
+        self.assertNotIn("pull_request:", trigger)
+        self.assertIn("platforms: linux/amd64", workflow)
+        self.assertIn("file: deploy/worker/speech/Dockerfile", workflow)
+        tags = [line for line in workflow.splitlines() if line.strip().startswith("tags:")]
+        self.assertEqual(tags, [
+            "          tags: ghcr.io/${{ github.repository_owner }}/ai-media-engine-speech-worker:sha-${{ github.sha }}",
+        ])
+        self.assertIn("secrets.GITHUB_TOKEN", workflow)
+        self.assertNotIn("echo ${{ secrets.GITHUB_TOKEN }}", workflow)
+        self.assertIn("speech-image-ref", workflow)
+        issued = _speech(authorization_id="speech-auth-unverified", execution_id="speech-run-unverified")
+        with self.assertRaises(WorkerStageError) as unverified:
+            accept_speech_record(issued, now=5_000, code_sha=SHA, recorded_digest=DIGEST)
+        self.assertEqual(unverified.exception.code, "IMAGE_UNVERIFIED")
+        with self.assertRaises(WorkerStageError) as mutable_digest:
+            _speech(worker_digest="latest")
+        self.assertEqual(mutable_digest.exception.code, "IMAGE_DIGEST")

@@ -222,6 +222,7 @@ class SpeechPreflightTests(unittest.TestCase):
         self.assertTrue(report["authorization"]["issuer_accepts_speech_models"])
         self.assertFalse(report["authorization"]["paid_authorization_issued"])
         self.assertIsNone(report["authorization"]["recorded_worker_digest"])
+        self.assertEqual(report["authorization"]["speech_image"]["status"], "IMAGE_UNVERIFIED")
         self.assertEqual(report["authorization"]["refusal_without_digest"], "SPEECH_IMAGE_NOT_BUILT")
         self.assertEqual(report["authorization"]["constraints"]["forbidden_volume_id"], VOLUME_ID)
         self.assertEqual(report["watchdog"]["heartbeat_stale_seconds"], 300.0)

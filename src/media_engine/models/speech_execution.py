@@ -50,6 +50,7 @@ def run_speech_rehearsal(
     volume_id: int | None = None,
     pause_after=None,
     weights_root: Path | None = None,
+    image_ref: dict | None = None,
 ) -> dict:
     """Run both models on one fake instance. Vast providers are refused."""
     if getattr(provider, "name", "") == "vast":
@@ -60,6 +61,7 @@ def run_speech_rehearsal(
         code_sha=code_sha,
         recorded_digest=recorded_digest,
         volume_id=volume_id,
+        image_ref=image_ref,
     )
     if (int(machine_id), int(offer_id)) not in authorization.allowed_pairs:
         raise WorkerStageError("MACHINE_SCOPE")

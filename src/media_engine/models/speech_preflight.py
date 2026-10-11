@@ -204,6 +204,7 @@ def authorization_requirements() -> dict:
         "issuer_accepts_speech_models": True,
         "paid_authorization_issued": False,
         "recorded_worker_digest": None,
+        "speech_image": _speech_image_status(),
         "speech_models": pins,
         "refusal_without_digest": "SPEECH_IMAGE_NOT_BUILT",
         "image_issuer_model": "Qwen/Qwen-Image",
@@ -227,7 +228,22 @@ def authorization_requirements() -> dict:
             "worker_digest": "the built speech image digest",
             "user_approval": "fresh explicit approval inside the validity window",
         },
-        "missing": "The speech image has no recorded digest, and no paid approval has been issued.",
+        "missing": "The speech image reference has no immutable digest, and no paid approval has been issued.",
+    }
+
+
+def _speech_image_status() -> dict:
+    from media_engine.models.speech_image import assess_speech_image_ref, load_image_ref, speech_image_ref_path
+    from media_engine.providers.base import WorkerStageError
+    document = load_image_ref(speech_image_ref_path())
+    try:
+        assessed = assess_speech_image_ref(document)
+    except WorkerStageError as exc:
+        return {"status": exc.code, "digest": None, "cuda_gpu_support": False}
+    return {
+        "status": "VERIFIED",
+        "digest": assessed["digest"],
+        "cuda_gpu_support": False,
     }
 
 

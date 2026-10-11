@@ -402,8 +402,9 @@ def accept_speech_record(
     code_sha: str,
     recorded_digest: str | None,
     volume_id: int | None = None,
+    image_ref: dict | None = None,
 ) -> None:
-    """Accept one speech record. A missing image digest fails closed."""
+    """Accept one speech record. A missing or movable image reference fails closed."""
     if not isinstance(authorization, ExecutionAuthorization) or not authorization.speech_session:
         raise WorkerStageError("MISSING_AUTHORIZATION")
     if code_sha != authorization.code_sha:
@@ -414,7 +415,10 @@ def accept_speech_record(
         raise WorkerStageError("EXPIRED_AUTHORIZATION")
     if recorded_digest is None:
         raise WorkerStageError("SPEECH_IMAGE_NOT_BUILT")
-    if recorded_digest != authorization.worker_digest:
+    from media_engine.models.speech_image import assess_speech_image_ref, load_image_ref, speech_image_ref_path
+    document = image_ref if image_ref is not None else load_image_ref(speech_image_ref_path())
+    assessed = assess_speech_image_ref(document)
+    if recorded_digest != assessed["digest"] or recorded_digest != authorization.worker_digest:
         raise WorkerStageError("IMAGE_DIGEST")
     if volume_id is not None and int(volume_id) == FORBIDDEN_VOLUME_ID:
         raise WorkerStageError("VOLUME_FORBIDDEN")
