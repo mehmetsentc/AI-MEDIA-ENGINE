@@ -70,13 +70,46 @@ def browser_route(controller: MediaController, method: str, path: str, body: Opt
     if method == "DELETE" and path == "/v1/session":
         book.sign_out(cookie)
         return 200, {"signed_in": False}
-    guarded = path in {"/v1/account", "/v1/library", "/v1/jobs", "/v1/images/generations"} or path.startswith("/v1/jobs/")
+    guarded = (
+        path in {"/v1/account", "/v1/library", "/v1/jobs", "/v1/images/generations", "/v1/capabilities", "/v1/voices/consent", "/v1/uploads"}
+        or path.startswith("/v1/jobs/")
+        or path.startswith("/v1/capabilities/")
+        or path.startswith("/v1/uploads/")
+    )
     if not guarded:
         return None
     if not user_id:
         return 401, {"error": "SIGN_IN_REQUIRED"}
     if method == "GET" and path == "/v1/account":
         return 200, account_view(controller, user_id)
+    if method == "GET" and path == "/v1/capabilities":
+        from media_engine.models.schema import catalog
+        return 200, catalog()
+    if method == "POST" and path.startswith("/v1/capabilities/"):
+        from media_engine.models.schema import submit_capability
+        try:
+            payload = _object(body)
+        except ValueError as exc:
+            return 400, {"error": str(exc) if str(exc).isidentifier() else "BAD_REQUEST"}
+        return submit_capability(controller, user_id, path.split("/", 3)[-1], payload, book)
+    if method == "POST" and path == "/v1/voices/consent":
+        from media_engine.models.schema import record_consent
+        try:
+            payload = _object(body)
+        except ValueError as exc:
+            return 400, {"error": str(exc) if str(exc).isidentifier() else "BAD_REQUEST"}
+        return record_consent(controller, user_id, payload)
+    if method == "POST" and path == "/v1/uploads":
+        from media_engine.models.schema import accept_upload
+        try:
+            payload = _object(body)
+        except ValueError as exc:
+            return 400, {"error": str(exc) if str(exc).isidentifier() else "BAD_REQUEST"}
+        return accept_upload(controller, user_id, payload)
+    upload = re.fullmatch(r"/v1/uploads/([A-Za-z0-9_]+)", path)
+    if method == "DELETE" and upload:
+        from media_engine.models.schema import delete_upload
+        return delete_upload(controller, user_id, upload.group(1))
     if method == "GET" and path == "/v1/library":
         return 200, {"artifacts": library_for(controller, user_id)}
     if method == "GET" and path == "/v1/jobs":

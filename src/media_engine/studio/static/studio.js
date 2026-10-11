@@ -335,6 +335,7 @@ function bind() {
     });
   });
   document.getElementById("sign-in-form").addEventListener("submit", signIn);
+  document.getElementById("clone-form").addEventListener("submit", recordConsent);
   document.getElementById("image-form").addEventListener("submit", generate);
   document.getElementById("sign-out").addEventListener("click", function () {
     api("DELETE", "/v1/session").catch(function () {}).then(function () {
@@ -347,6 +348,41 @@ function bind() {
   document.getElementById("viewer-close").addEventListener("click", function () {
     document.getElementById("viewer").close();
   });
+}
+
+async function recordConsent(event) {
+  event.preventDefault();
+  const error = document.getElementById("consent-error");
+  error.hidden = true;
+  try {
+    await api("POST", "/v1/voices/consent", {
+      speaker_name: document.getElementById("consent-speaker").value.trim(),
+      statement: document.getElementById("consent-statement").value.trim(),
+      subject_is_owner: true,
+      third_party_impersonation: false,
+    });
+    error.hidden = false;
+    error.textContent = "Voice authorization recorded. Speech generation is still unavailable.";
+  } catch (err) {
+    error.hidden = false;
+    error.textContent = err.code === "IMPERSONATION_REFUSED"
+      ? "Third-party voice impersonation is refused."
+      : "Voice authorization was not recorded.";
+  }
+}
+
+async function loadCapabilities() {
+  const board = document.getElementById("capability-status");
+  if (!state.account || !board) return;
+  try {
+    const catalog = await api("GET", "/v1/capabilities");
+    const waiting = (catalog.capabilities || []).filter(function (item) { return !item.executable; });
+    board.textContent = waiting.length
+      ? "Unavailable until the model is GPU-verified. This screen does not create a result."
+      : "Verified capabilities use the image form.";
+  } catch (err) {
+    board.textContent = "Capability status is unavailable.";
+  }
 }
 
 async function boot() {
@@ -363,6 +399,7 @@ async function boot() {
   }
   renderNav();
   renderAccount();
+  if (state.account) loadCapabilities().catch(function () {});
   if (state.dev) document.getElementById("app").dataset.provider = "development";
 }
 

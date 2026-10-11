@@ -391,7 +391,9 @@ h1 { font-family: Georgia, "Iowan Old Style", serif; font-weight: 500; font-size
 .job-row, .media-card { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
 #viewer { border: 0; border-radius: 16px; background: var(--bg-2); color: var(--ink); padding: 16px; max-width: 90vw; }
 #viewer::backdrop { background: rgba(0, 0, 0, 0.72); }
-.nav-item:disabled { opacity: 0.4; cursor: not-allowed; }
+.nav-item:disabled, #capability-board button:disabled { opacity: 0.4; cursor: not-allowed; }
+#capability-board { margin-top: 28px; display: grid; gap: 16px; }
+#capability-board form { border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
 .status[data-tone="error"] { color: var(--bad); }
 .status[data-tone="done"] { color: var(--good); }
 .status[data-tone="waiting"] { color: var(--wait); }

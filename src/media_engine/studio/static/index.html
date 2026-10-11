@@ -67,6 +67,70 @@
           <p class="dev-flag" id="dev-flag" hidden>Development preview. This file is local development data, not a production image.</p>
           <a id="download" class="text-btn" hidden>Download</a>
         </article>
+        <section id="capability-board">
+          <h2>Other capabilities</h2>
+          <p class="hint" id="capability-status">Unavailable until the model is GPU-verified. This screen does not create a result.</p>
+          <form id="voice-form">
+            <h3>Voice</h3>
+            <label>Text <textarea id="voice-text" maxlength="4000" placeholder="Text to speak"></textarea></label>
+            <label>Language <input id="voice-language" value="English" disabled></label>
+            <label>Voice <input id="voice-name" value="Ryan" disabled></label>
+            <button type="button" class="primary" disabled>Preview voice</button>
+            <p class="hint">Audio preview and download stay off until text-to-speech is GPU-verified.</p>
+          </form>
+          <form id="clone-form">
+            <h3>Voice clone</h3>
+            <label>Statement
+              <textarea id="consent-statement" maxlength="2000" required placeholder="I own this voice and authorize this studio account to clone it."></textarea>
+            </label>
+            <label>Speaker <input id="consent-speaker" required maxlength="80"></label>
+            <button type="submit" class="text-btn">Record voice authorization</button>
+            <p class="form-error" id="consent-error" hidden></p>
+            <p class="hint">Recording authorization does not generate speech. Third-party impersonation is refused.</p>
+          </form>
+          <form id="transcribe-form">
+            <h3>Transcription</h3>
+            <label>Audio upload <input type="file" accept="audio/wav" disabled></label>
+            <button type="button" disabled>Transcribe</button>
+            <p class="hint">Timestamps and subtitle export stay off until speech recognition is GPU-verified.</p>
+          </form>
+          <form id="translate-form">
+            <h3>Translation</h3>
+            <label>Source language <input value="English" disabled></label>
+            <label>Target language <input value="Chinese" disabled></label>
+            <label>Text <textarea maxlength="4000" disabled></textarea></label>
+            <button type="button" disabled>Translate</button>
+          </form>
+          <form id="dub-form">
+            <h3>Dubbing</h3>
+            <label>Media upload <input type="file" disabled></label>
+            <label>Target language <input value="English" disabled></label>
+            <button type="button" disabled>Dub</button>
+            <p class="hint">Synchronized dubbing stays off until transcription, translation, and speech are GPU-verified.</p>
+          </form>
+          <form id="video-form">
+            <h3>Video</h3>
+            <label>Prompt <textarea maxlength="4000" disabled></textarea></label>
+            <label>Aspect ratio <input value="16:9" disabled></label>
+            <label>Duration <input value="5 seconds" disabled></label>
+            <button type="button" disabled>Generate video</button>
+            <p class="hint">Playback and download stay off until video generation is GPU-verified.</p>
+          </form>
+          <form id="music-form">
+            <h3>Music</h3>
+            <label>Prompt <textarea maxlength="4000" disabled></textarea></label>
+            <label>Duration <input value="30 seconds" disabled></label>
+            <label>Style <input value="ambient" disabled></label>
+            <button type="button" disabled>Generate music</button>
+            <p class="hint">Audio playback and download stay off until music generation is GPU-verified.</p>
+          </form>
+          <form id="edit-form">
+            <h3>Image edit</h3>
+            <label>Source image <input type="file" accept="image/png" disabled></label>
+            <label>Instruction <textarea maxlength="4000" disabled></textarea></label>
+            <button type="button" disabled>Edit image</button>
+          </form>
+        </section>
       </section>
       <section id="library-view" hidden>
         <p class="eyebrow">Library</p>
