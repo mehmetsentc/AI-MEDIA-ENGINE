@@ -1,6 +1,7 @@
 """Offline multimodal inference. Runtimes are injected. No weights and no GPU rental."""
 from __future__ import annotations
 
+import array
 import json
 import tempfile
 import unittest
@@ -68,6 +69,21 @@ class VoiceRuntime:
         if not str(ref_audio).endswith(".wav"):
             raise RuntimeError("reference path")
         return [0.1, -0.1, 0.1, -0.1], 24000
+
+
+class BatchedVoiceRuntime:
+    """Returns what the real qwen_tts package returns: a batch, one entry per
+    input text, and each entry an array rather than a list.
+
+    VoiceRuntime above returns a flat list of floats, which is not the package's
+    shape. That difference is why a whole array used to reach float() and raise.
+    array.array stands in for numpy here so the suite stays stdlib-only.
+    """
+
+    def generate_custom_voice(self, *, text, language, speaker):
+        if not text or language != "English" or speaker != "Ryan":
+            raise RuntimeError("bad voice request")
+        return [array.array("f", [0.0, 0.25, -0.25, 0.1, -0.1])], 24000
 
 
 class TranslatorRuntime:
@@ -171,6 +187,27 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(failed_row["credit_status"], "refunded")
         done_row = next(item for item in rows if item["job_id"] == created["job_id"])
         self.assertEqual(done_row["capability"], "audio.transcribe")
+
+    def test_tts_accepts_the_batched_array_shape_the_real_runtime_returns(self) -> None:
+        """A batch of arrays has to survive the trip to WAV.
+
+        The real model returns List[np.ndarray]; the engine only unwrapped a
+        batch whose first entry was a list or tuple, so the array went to
+        float() and raised TypeError after the GPU work was already done.
+        """
+        self.controller.multimodal_runtimes["audio.tts"] = BatchedVoiceRuntime()
+        status, spoken = self._submit("audio.tts", {
+            "text": "A short line", "language": "English", "voice": "Ryan",
+            "idempotency_key": "tts-batched-01",
+        })
+        self.assertEqual(status, 202)
+        self.assertTrue(self.controller.wait_settled())
+        job = self.controller.get_job(spoken["job_id"])
+        wav = self.controller.artifact_bytes(job.artifact_id)
+        self.assertTrue(wav.startswith(b"RIFF"))
+        self.assertIn(b"WAVE", wav[:16])
+        # Five samples at 16 bits, not one frame made from five arrays.
+        self.assertEqual(len(wav), 44 + 5 * 2)
 
     def test_tts_and_voice_clone_require_a_runtime_and_consent(self) -> None:
         self.controller.multimodal_runtimes["audio.tts"] = VoiceRuntime()

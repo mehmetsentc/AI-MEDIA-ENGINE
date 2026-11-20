@@ -263,7 +263,11 @@ def _wav_from_runtime(samples, rate) -> bytes:
         data = bytes(samples)
         decode_wav(data)
         return data
-    if isinstance(samples, (list, tuple)) and samples and isinstance(samples[0], (list, tuple)):
+    # A batch carries one entry per input text. The real runtime returns a list
+    # of numpy arrays rather than of lists, so testing only for list and tuple
+    # let a whole array through to float() below and raised TypeError. Anything
+    # that is not a bare number is a batch entry, whatever sequence type it is.
+    if isinstance(samples, (list, tuple)) and samples and not isinstance(samples[0], (int, float)):
         samples = samples[0]
     if not isinstance(rate, int) or isinstance(rate, bool) or rate <= 0:
         raise AdapterError("AUDIO_INVALID")

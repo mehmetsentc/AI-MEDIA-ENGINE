@@ -40,13 +40,15 @@ def build_controller(root: Path, mode: Optional[str] = None,
     root.mkdir(parents=True, exist_ok=True)
     clock = WallClock()
     if selected == "development":
-        return MediaController(
+        controller = MediaController(
             str(root / "studio.sqlite3"),
             str(root / "artifacts"),
             clock=clock,
             provider=FakeGPUProvider(time.time),
             image_engine=DevImageEngine(),
         )
+        _attach_local_models(controller, environ)
+        return controller
     if selected != "real":
         raise ValueError("STUDIO_MODE")
     source = os.environ if environ is None else environ
@@ -102,7 +104,21 @@ def build_controller(root: Path, mode: Optional[str] = None,
         except Exception:
             media = UnavailableMedia()
         controller.platform = Platform(str(root / "platform.sqlite3"), media=media)
+    _attach_local_models(controller, environ)
     return controller
+
+
+def _attach_local_models(controller: MediaController, environ: Optional[dict]) -> None:
+    """Wire the real local model loaders, when an operator has asked for them.
+
+    The speech, music and video capabilities run here rather than on a rented
+    GPU, so without this the controller has no runtime for them and every such
+    job fails with CAPABILITY_UNAVAILABLE. It stays off by default: these models
+    are gigabytes and the weights have to be staged first.
+    """
+    from media_engine.models.local_bind import attach_local_runtimes
+    source = os.environ if environ is None else environ
+    attach_local_runtimes(controller, source)
 
 
 def _local_credit_platform(root: Path) -> Platform:

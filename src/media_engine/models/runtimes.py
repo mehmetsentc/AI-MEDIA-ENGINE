@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 
 from media_engine.models.errors import AdapterError
 from media_engine.models.registry import get_model
+
+ENV_DTYPE = "MEDIA_ENGINE_LOCAL_DTYPE"
 
 _FILES = {
     "Systran/faster-whisper-large-v3": ("model.bin", "config.json"),
@@ -44,27 +47,35 @@ def load_qwen_tts(weights_dir: str, *, clone: bool = False):
     model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base" if clone else "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     root = weights_ready(model_id, weights_dir)
     module = _import("qwen_tts")
-    return module.Qwen3TTSModel.from_pretrained(str(root), local_files_only=True)
+    return module.Qwen3TTSModel.from_pretrained(
+        str(root), local_files_only=True, dtype=load_dtype(),
+    )
 
 
 def load_translator(weights_dir: str):
     root = weights_ready("Qwen/Qwen2.5-1.5B-Instruct", weights_dir)
     transformers = _import("transformers")
     tokenizer = transformers.AutoTokenizer.from_pretrained(str(root), local_files_only=True)
-    model = transformers.AutoModelForCausalLM.from_pretrained(str(root), local_files_only=True)
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        str(root), local_files_only=True, dtype=load_dtype(),
+    )
     return _ChatModel(model, tokenizer)
 
 
 def load_image_edit(weights_dir: str):
     root = weights_ready("Qwen/Qwen-Image-Edit", weights_dir)
     diffusers = _import("diffusers")
-    return diffusers.QwenImageEditPipeline.from_pretrained(str(root), local_files_only=True)
+    return diffusers.QwenImageEditPipeline.from_pretrained(
+        str(root), local_files_only=True, dtype=load_dtype(),
+    )
 
 
 def load_music(weights_dir: str):
     root = weights_ready("ACE-Step/ACE-Step-v1-3.5B", weights_dir)
     diffusers = _import("diffusers")
-    return diffusers.DiffusionPipeline.from_pretrained(str(root), local_files_only=True)
+    return diffusers.DiffusionPipeline.from_pretrained(
+        str(root), local_files_only=True, dtype=load_dtype(),
+    )
 
 
 def load_wan(weights_dir: str):
@@ -73,7 +84,9 @@ def load_wan(weights_dir: str):
     pipeline = getattr(diffusers, "WanPipeline", None)
     if pipeline is None:
         raise AdapterError("DEPENDENCY_MISSING")
-    return pipeline.from_pretrained(str(root), local_files_only=True)
+    return pipeline.from_pretrained(
+        str(root), local_files_only=True, dtype=load_dtype(),
+    )
 
 
 class _ChatModel:
@@ -97,3 +110,20 @@ def _import(name: str):
         return importlib.import_module(name)
     except ImportError as exc:
         raise AdapterError("DEPENDENCY_MISSING") from exc
+
+
+def load_dtype():
+    """The dtype these checkpoints are stored in, unless an operator says otherwise.
+
+    The published weights are bfloat16. Letting transformers widen them to the
+    default float32 doubles resident memory and buys nothing, which is the
+    difference between fitting in an 8 GB machine and not.
+    """
+    torch = _import("torch")
+    raw = os.environ.get(ENV_DTYPE, "").strip()
+    if not raw:
+        return torch.bfloat16
+    dtype = getattr(torch, raw, None)
+    if dtype is None or not isinstance(dtype, torch.dtype):
+        raise AdapterError("DTYPE_UNSUPPORTED")
+    return dtype
