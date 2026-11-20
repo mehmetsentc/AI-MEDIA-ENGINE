@@ -48,6 +48,20 @@ class WorkerSSH:
             text=True, capture_output=True, timeout=120, check=True,
         )
 
+    def fetch(self, host: str, port: str, remote: str, local: Path) -> None:
+        """Pull one file off the worker. Megabyte payloads belong in a file
+        copy, not in a command's captured stdout."""
+        self._ensure()
+        local.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "scp", "-i", str(self.key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={self.known}",
+                "-P", port, f"root@{host}:{remote}", str(local),
+            ],
+            text=True, capture_output=True, timeout=180, check=True,
+        )
+
     def _ssh(self, host: str, port: str) -> list[str]:
         return [
             "ssh", "-i", str(self.key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
