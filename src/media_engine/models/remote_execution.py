@@ -33,6 +33,7 @@ from media_engine.providers.base import OBSERVE_GONE, WorkerStageError
 from media_engine.providers.execution_authorization import accept_speech_record
 from media_engine.providers.live6_prepare import claim_execution_id
 from media_engine.providers.media_run import (
+    WEIGHTS_ROOT,
     RemoteRunError,
     install_command,
     job_command,
@@ -49,7 +50,6 @@ from media_engine.safety.execution_budget import (
 #: The one switch. Absent or anything but the exact word below means refused.
 RENTAL_ENV = "MEDIA_ENGINE_GPU_RENTAL_APPROVED"
 RENTAL_WORD = "approved"
-WEIGHTS_ROOT = "/models/weights"
 OUT_DIR = "/workspace/media-out"
 IN_DIR = "/workspace/media-in"
 

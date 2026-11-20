@@ -182,3 +182,62 @@ class ResultTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StageTests(unittest.TestCase):
+    """The step that was missing: weights from R2 onto the worker."""
+
+    def test_the_command_never_puts_credentials_on_the_command_line(self):
+        """ps would show them to anything else on the box."""
+        from media_engine.providers.media_run import stage_command
+
+        command = stage_command("Qwen/Qwen3-TTS-12Hz-1.7B-Base", "a" * 40)
+        for secret in ("R2_SECRET_ACCESS_KEY", "R2_ACCESS_KEY_ID", "AKIA", "secret"):
+            self.assertNotIn(secret, command)
+        self.assertIn("media_engine.models.media_remote stage", command)
+        self.assertIn("/models/weights", command)
+
+    def test_a_model_name_cannot_break_out_of_the_command(self):
+        from media_engine.providers.media_run import stage_command
+
+        command = stage_command("evil'; touch /tmp/x; echo '", "a" * 40)
+        self.assertNotIn("\n", command)
+        self.assertRaises(RemoteRunError, stage_command, "bad\nname", "a" * 40)
+
+    def test_a_stage_report_is_read_back(self):
+        from media_engine.providers.media_run import worker_stage_weights
+
+        class _W:
+            def run(self, host, port, command, timeout):
+                return 0, 'noise\nSTAGE_DONE {"status":"COMPLETE","bytes":12}', ""
+
+        report = worker_stage_weights(_W(), "h", "22", "m/x")
+        self.assertEqual(report["status"], "COMPLETE")
+
+    def test_a_stage_failure_becomes_its_code(self):
+        from media_engine.providers.media_run import worker_stage_weights
+
+        class _W:
+            def run(self, host, port, command, timeout):
+                return 6, "STAGE_FAILED CACHE_CORRUPT", ""
+
+        with self.assertRaises(RemoteRunError) as caught:
+            worker_stage_weights(_W(), "h", "22", "m/x")
+        self.assertEqual(caught.exception.code, "CACHE_CORRUPT")
+
+    def test_silence_is_not_a_staged_model(self):
+        from media_engine.providers.media_run import worker_stage_weights
+
+        class _W:
+            def run(self, host, port, command, timeout):
+                return 0, "downloading...\n", ""
+
+        with self.assertRaises(RemoteRunError) as caught:
+            worker_stage_weights(_W(), "h", "22", "m/x")
+        self.assertEqual(caught.exception.code, "STAGE_NO_REPORT")
+
+    def test_the_weights_root_has_one_definition(self):
+        from media_engine.models import remote_execution
+        from media_engine.providers import media_run
+
+        self.assertIs(remote_execution.WEIGHTS_ROOT, media_run.WEIGHTS_ROOT)

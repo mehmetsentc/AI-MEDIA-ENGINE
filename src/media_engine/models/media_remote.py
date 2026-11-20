@@ -254,8 +254,91 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+STAGE_DONE = "STAGE_DONE "
+STAGE_FAILED = "STAGE_FAILED "
+STAGE_RESERVE_BYTES = 2_000_000_000
+
+
+def stage_from_r2(model_id: str, revision: str, root, *, env=None, clock=time.monotonic) -> dict:
+    """Pull one model's pinned tree from R2 onto this worker.
+
+    run_media_job takes this step as a callback and nothing implemented it,
+    which meant the chain would stop on a machine that is already being paid
+    for. It runs here rather than on the control server because the weights
+    belong on the worker: routing gigabytes through the host would pay for the
+    GPU to sit idle while they travel.
+
+    speech_stage does the work, including the per-file SHA-256 and the
+    resumable partials, and writes the manifest that verify_weights reads
+    before anything is loaded.
+    """
+    import os as _os
+
+    from media_engine.engines.image.r2_cache import R2Client, R2Config
+    from media_engine.models import speech_stage
+
+    source = _os.environ if env is None else env
+    config = R2Config(
+        endpoint=str(source.get("R2_ENDPOINT", "")).strip().rstrip("/"),
+        bucket=str(source.get("R2_BUCKET", "")).strip(),
+        access_key_id=str(source.get("R2_ACCESS_KEY_ID", "")),
+        secret_access_key=str(source.get("R2_SECRET_ACCESS_KEY", "")),
+    )
+    if not (config.endpoint and config.bucket and config.access_key_id and config.secret_access_key):
+        raise RemoteJobError("R2_NOT_CONFIGURED")
+    try:
+        spec = speech_stage.target(model_id)
+    except speech_stage.SpeechPrepError as exc:
+        # One error type leaves this module, so the host reads one format.
+        raise RemoteJobError(exc.code) from exc
+    if revision and spec["revision"] != revision:
+        # The authorization pinned a revision; staging another one here would
+        # put unauthorized weights on the machine before anything checks.
+        raise RemoteJobError("REVISION_MISMATCH")
+    destination = Path(root) / model_id
+    free = _free_bytes(Path(root))
+    try:
+        report = speech_stage.stage_from_r2(
+            R2Client(config), model_id, destination,
+            free_disk_bytes=max(free - STAGE_RESERVE_BYTES, 0),
+            clock=clock,
+            allow_weight_transfer=True,
+        )
+    except speech_stage.SpeechPrepError as exc:
+        raise RemoteJobError(exc.code) from exc
+    checked = verify_weights(destination)
+    if not checked.get("complete"):
+        raise RemoteJobError("WEIGHTS_" + str(checked.get("status") or "INCOMPLETE"))
+    report["files_verified"] = checked.get("files_present", 0)
+    report["path"] = str(destination)
+    return report
+
+
+def _free_bytes(path: Path) -> int:
+    import os as _os
+
+    path.mkdir(parents=True, exist_ok=True)
+    stat = _os.statvfs(str(path))
+    return stat.f_bavail * stat.f_frsize
+
+
 def main(argv: list[str]) -> int:
-    """``python -m media_engine.models.media_remote <job.json> <root> <out> [in]``"""
+    """``... run <job.json> <root> <out> [in]`` or ``... stage <model> <rev> <root>``"""
+    if len(argv) >= 2 and argv[1] == "stage":
+        if len(argv) < 5:
+            print("USAGE", flush=True)
+            return 2
+        try:
+            report = stage_from_r2(argv[2], argv[3], argv[4])
+        except RemoteJobError as exc:
+            print(STAGE_FAILED + exc.code, flush=True)
+            return 6
+        except Exception as exc:
+            print(STAGE_FAILED + "STAGE_FAILED " + type(exc).__name__, flush=True)
+            return 7
+        print(STAGE_DONE + json.dumps(report, sort_keys=True, default=str), flush=True)
+        return 0
+    argv = argv[1:] if len(argv) >= 2 and argv[1] == "run" else argv
     if len(argv) < 4:
         print("USAGE", flush=True)
         return 2

@@ -242,3 +242,40 @@ class DriftTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StageFromR2Tests(unittest.TestCase):
+    def test_missing_r2_settings_refuse_before_any_transfer(self):
+        from media_engine.models.media_remote import stage_from_r2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RemoteJobError) as caught:
+                stage_from_r2("m/x", "", Path(tmp), env={})
+            self.assertEqual(caught.exception.code, "R2_NOT_CONFIGURED")
+
+    def test_a_revision_other_than_the_pinned_one_is_refused(self):
+        """Unauthorized weights must not land on the machine at all."""
+        from media_engine.models.media_remote import stage_from_r2
+        from media_engine.models.speech_stage import all_targets
+
+        pinned = all_targets()[0]
+        env = {
+            "R2_ENDPOINT": "https://example.invalid", "R2_BUCKET": "b",
+            "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RemoteJobError) as caught:
+                stage_from_r2(pinned["model_id"], "0" * 40, Path(tmp), env=env)
+            self.assertEqual(caught.exception.code, "REVISION_MISMATCH")
+
+    def test_an_unknown_model_is_refused(self):
+        from media_engine.models.media_remote import stage_from_r2
+
+        env = {
+            "R2_ENDPOINT": "https://example.invalid", "R2_BUCKET": "b",
+            "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RemoteJobError) as caught:
+                stage_from_r2("nobody/nothing", "", Path(tmp), env=env)
+            self.assertEqual(caught.exception.code, "MODEL_UNKNOWN")

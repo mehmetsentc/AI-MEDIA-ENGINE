@@ -23,6 +23,9 @@ import tarfile
 from pathlib import Path
 
 REMOTE_ROOT = "/workspace/pysrc"
+#: Where staged weights live on the worker. Defined once, here, because both
+#: the staging command and the job command name it and two copies would drift.
+WEIGHTS_ROOT = "/models/weights"
 REMOTE_ARCHIVE = "/workspace/media_engine.tgz"
 JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DONE = "JOB_DONE "
@@ -122,6 +125,53 @@ def job_command(
         ),
     ]
     return " && ".join(parts)
+
+
+STAGE_DONE = "STAGE_DONE "
+STAGE_FAILED = "STAGE_FAILED "
+
+
+def stage_command(
+    model_id: str,
+    revision: str,
+    *,
+    weights_root: str = WEIGHTS_ROOT,
+    root: str = REMOTE_ROOT,
+    python: str = "python3",
+) -> str:
+    """Tell the worker to pull one model from R2 onto its own disk.
+
+    The R2 credentials are read from the worker's environment, which the
+    provider sets when it creates the instance; they are never put on a
+    command line, where ``ps`` would show them to anything else on the box.
+    """
+    if not model_id or any(c in model_id for c in "\n\r\x00"):
+        raise RemoteRunError("MODEL_INVALID")
+    return (
+        f"mkdir -p {shlex.quote(weights_root)} && "
+        f"PYTHONPATH={shlex.quote(root)} {shlex.quote(python)} -u "
+        f"-m media_engine.models.media_remote stage "
+        f"{shlex.quote(model_id)} {shlex.quote(revision)} {shlex.quote(weights_root)}"
+    )
+
+
+def worker_stage_weights(worker, host: str, port: str, model_id: str, *, revision: str = "",
+                         timeout_seconds: int = 3600) -> dict:
+    """The stage_weights callback run_media_job asks for.
+
+    Without this the production chain stopped on a machine already being paid
+    for, because nothing implemented the step.
+    """
+    code, out, _err = worker.run(host, port, stage_command(model_id, revision), timeout_seconds)
+    for line in reversed([item.strip() for item in str(out).splitlines() if item.strip()]):
+        if line.startswith(STAGE_DONE):
+            try:
+                return json.loads(line[len(STAGE_DONE):])
+            except json.JSONDecodeError as exc:
+                raise RemoteRunError("STAGE_REPORT_INVALID") from exc
+        if line.startswith(STAGE_FAILED):
+            raise RemoteRunError(line[len(STAGE_FAILED):].strip() or "STAGE_FAILED")
+    raise RemoteRunError("STAGE_NO_REPORT" if code == 0 else "STAGE_FAILED")
 
 
 def parse_result(stdout: str) -> dict:
