@@ -8,6 +8,9 @@ READINESS = frozenset({
     "LICENSE_REVIEWED",
     "INTEGRATED",
     "OFFLINE_TESTED",
+    # Run for real on a CPU: weights loaded, output produced, nothing rented.
+    # Short of GPU_VERIFIED, which is what the paid provider path requires.
+    "CPU_VERIFIED",
     "GPU_VERIFIED",
     "PRODUCTION_READY",
 })
@@ -40,6 +43,10 @@ class ModelSpec:
     role: str
     evidence: str
     ada_fit: str
+    #: Named voices this checkpoint actually has. Empty means the model offers
+    #: no choice of voice. One capability can be served by models with
+    #: different voices, so a single global list would misreport them.
+    voices: tuple[str, ...] = ()
 
     def to_public_dict(self) -> dict:
         return {
@@ -173,6 +180,7 @@ CATALOG: tuple[ModelSpec, ...] = (
         role="primary",
         evidence="Hub license is apache-2.0. No local or GPU run.",
         ada_fit="unmeasured",
+        voices=("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden"),
     ),
     _spec(
         model_id="SWivid/F5-TTS",
@@ -426,6 +434,45 @@ CATALOG: tuple[ModelSpec, ...] = (
     ),
 )
 
+CATALOG = CATALOG + (
+    _spec(
+        model_id="freyavoice/Freya-TTS",
+        capability="audio.tts",
+        revision="d124e07493615208f58bdd21d432736849ee4230",
+        license_name="apache-2.0",
+        license_status="reviewed",
+        commercial_use="allowed",
+        storage_bytes=732_811_956,
+        vram_mib=2560,
+        vram_note="Ran on CPU: 2.03GB resident after load, 2.16GB peak through synthesis.",
+        languages=("Turkish",),
+        voices=("Leyla",),
+        modes=("narration",),
+        runtime="freya-dit",
+        output_format="audio/wav",
+        security_notes=(
+            "One deterministic voice. The model has no speaker conditioning: the noise "
+            "seed is the voice, and the vendor warns other seeds give other, uncurated "
+            "people. Only the pinned seed is offered."
+        ),
+        worker="media_engine.models.invoke",
+        inputs=("text", "language"),
+        outputs=("audio/wav",),
+        defaults=(("voice", "Leyla"),),
+        cost_profile="unpriced",
+        readiness="CPU_VERIFIED",
+        role="primary",
+        evidence=(
+            "Hub license is apache-2.0 and the card lists Turkish only. Run on two CPU "
+            "cores: 4.96s of 48kHz speech from Turkish text, and a second clip at 2.0x "
+            "real time. No GPU, nothing rented. Turkish is why it is here: the Qwen TTS "
+            "checkpoint supports ten languages and Turkish is not one of them."
+        ),
+        ada_fit="unmeasured",
+    ),
+)
+
+
 _BY_ID = {spec.model_id: spec for spec in CATALOG}
 
 
@@ -445,3 +492,36 @@ def primary_for(capability: str) -> ModelSpec | None:
     if not chosen:
         return None
     return chosen[0]
+
+
+def primaries_for(capability: str) -> tuple[ModelSpec, ...]:
+    return tuple(spec for spec in models_for(capability) if spec.role == "primary")
+
+
+def primary_for_language(capability: str, language: str | None) -> ModelSpec | None:
+    """The primary model for this capability that actually speaks this language.
+
+    One capability can need more than one model. No open TTS checkpoint covers
+    every language, so the requested language is what decides which primary
+    serves the job rather than catalogue order. With no language asked for, the
+    first primary is kept, which is what every existing caller expects.
+    """
+    chosen = primaries_for(capability)
+    if not chosen:
+        return None
+    if not language:
+        return chosen[0]
+    for spec in chosen:
+        if language in spec.languages:
+            return spec
+    return None
+
+
+def languages_for(capability: str) -> tuple[str, ...]:
+    """Every language any primary for this capability can speak."""
+    seen: list[str] = []
+    for spec in primaries_for(capability):
+        for language in spec.languages:
+            if language not in seen:
+                seen.append(language)
+    return tuple(seen)

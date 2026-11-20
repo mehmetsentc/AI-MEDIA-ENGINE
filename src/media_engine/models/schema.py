@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from media_engine.models.consent import ConsentError, ConsentStore
 from media_engine.models.cost import estimate
-from media_engine.models.registry import models_for, primary_for
+from media_engine.models.registry import languages_for, models_for, primary_for
 from media_engine.models.uploads import UploadError, UploadStore
 
 KINDS = (
@@ -186,8 +186,12 @@ def _text(value: object, code: str) -> None:
 
 
 def _language(value: object, kind: str) -> None:
-    spec = primary_for(kind)
-    if not isinstance(value, str) or spec is None or value not in spec.languages:
+    """Accept a language any primary for this capability can speak.
+
+    Checking only the first primary's list would refuse Turkish for speech,
+    because the Qwen checkpoint does not have it and a different primary does.
+    """
+    if not isinstance(value, str) or value not in languages_for(kind):
         raise SchemaError("LANGUAGE_UNSUPPORTED")
 
 

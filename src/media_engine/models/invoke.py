@@ -15,6 +15,7 @@ from media_engine.models.audio import (
     to_vtt,
 )
 from media_engine.models.errors import AdapterError
+from media_engine.models.registry import primary_for_language
 from media_engine.models.video import frame_count, frame_size, validate_mp4, write_mp4
 
 SPEAKERS = ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden")
@@ -70,10 +71,23 @@ def invoke_transcribe(runtime, wav: bytes, ctx: Invocation) -> dict:
     }
 
 
+def voices_for_language(language: str) -> tuple[str, ...]:
+    """The voices the model that will actually serve this language has.
+
+    SPEAKERS is the Qwen checkpoint's list. A different primary serves other
+    languages and has its own voices, so validating every request against one
+    global tuple would accept a name the serving model has never heard of.
+    """
+    spec = primary_for_language("audio.tts", language)
+    if spec is not None and spec.voices:
+        return spec.voices
+    return SPEAKERS
+
+
 def invoke_tts(runtime, payload: dict, ctx: Invocation) -> bytes:
     ctx.check()
     speaker = str(payload.get("voice") or "")
-    if speaker not in SPEAKERS:
+    if speaker not in voices_for_language(str(payload.get("language") or "")):
         raise AdapterError("SPEAKER_UNSUPPORTED")
     wavs, rate = runtime.generate_custom_voice(
         text=str(payload["text"]),

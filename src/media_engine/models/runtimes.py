@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import importlib
+import io
+import json
 import os
 from pathlib import Path
 
@@ -9,6 +11,8 @@ from media_engine.models.errors import AdapterError
 from media_engine.models.registry import get_model
 
 ENV_DTYPE = "MEDIA_ENGINE_LOCAL_DTYPE"
+ENV_DEVICE = "MEDIA_ENGINE_LOCAL_DEVICE"
+ENV_AUDIOVAE = "MEDIA_ENGINE_AUDIOVAE_PATH"
 
 _FILES = {
     "Systran/faster-whisper-large-v3": ("model.bin", "config.json"),
@@ -18,6 +22,7 @@ _FILES = {
     "Qwen/Qwen-Image-Edit": ("model_index.json",),
     "ACE-Step/ACE-Step-v1-3.5B": ("config.json",),
     "Wan-AI/Wan2.1-T2V-1.3B": ("config.json",),
+    "freyavoice/Freya-TTS": ("model.safetensors", "config.json"),
 }
 
 
@@ -87,6 +92,78 @@ def load_wan(weights_dir: str):
     return pipeline.from_pretrained(
         str(root), local_files_only=True, dtype=load_dtype(),
     )
+
+
+def load_device() -> str:
+    """Where local models run. CPU unless an operator points elsewhere."""
+    raw = os.environ.get(ENV_DEVICE, "").strip()
+    return raw or "cpu"
+
+
+def _audiovae_path(root: Path) -> Path:
+    """Freya decodes through the VoxCPM2 AudioVAE.
+
+    Its own helper downloads that file from the hub, which this module must not
+    do, so the checkpoint is taken from the staged VoxCPM2 directory beside it.
+    """
+    raw = os.environ.get(ENV_AUDIOVAE, "").strip()
+    if raw:
+        return Path(raw)
+    return Path(root).parents[1] / "openbmb" / "VoxCPM2" / "audiovae.pth"
+
+
+class FreyaVoice:
+    """Gives Freya the interface invoke_tts expects.
+
+    Freya takes neither a speaker nor a language: it is Turkish only, and it has
+    no speaker conditioning at all -- the vendor documents that the noise seed
+    *is* the voice and that other seeds give other, uncurated people. The seed
+    is therefore left at the pinned default, so the one voice on offer is the
+    one the registry names.
+    """
+
+    sample_rate = 48_000
+
+    def __init__(self, pipeline) -> None:
+        self.pipeline = pipeline
+
+    def generate_custom_voice(self, *, text, speaker=None, language=None, **_kwargs):
+        wav = self.pipeline.synthesize(str(text))
+        rate = int(getattr(self.pipeline, "sample_rate", self.sample_rate))
+        return [wav], rate
+
+
+def load_freya(weights_dir: str) -> FreyaVoice:
+    root = weights_ready("freyavoice/Freya-TTS", weights_dir)
+    torch = _import("torch")
+    pipeline_module = _import("freyatts.pipeline")
+    loader = _import("safetensors.torch")
+    audiovae = _import("voxcpm.modules.audiovae")
+
+    with io.open(root / "config.json", encoding="utf-8") as handle:
+        config = json.load(handle)
+    model = pipeline_module.FreyaDiT(
+        vocab=config["vocab"], d=config["d"], depth=config["depth"],
+        heads=config["heads"], ff=config["ff"],
+    )
+    model.load_state_dict(loader.load_file(str(root / "model.safetensors")), strict=True)
+    device = load_device()
+    model = model.to(device).eval()
+
+    checkpoint = _audiovae_path(root)
+    if not checkpoint.is_file():
+        raise AdapterError("WEIGHTS_NOT_PRESENT")
+    vae = audiovae.AudioVAEV2(audiovae.AudioVAEConfigV2())
+    state = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
+    vae.load_state_dict(state.get("state_dict", state), strict=False)
+    vae = vae.to(device).float().eval()
+    for parameter in vae.parameters():
+        parameter.requires_grad = False
+
+    vocabulary = Path(pipeline_module.__file__).parent / "char_vocab.json"
+    with io.open(vocabulary, encoding="utf-8") as handle:
+        char_to_id = json.load(handle)
+    return FreyaVoice(pipeline_module.FreyaTTS(model, vae, char_to_id, device=device))
 
 
 class _ChatModel:

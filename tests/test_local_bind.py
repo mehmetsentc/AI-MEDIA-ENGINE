@@ -10,8 +10,10 @@ from media_engine.models.local_bind import (
     Deferred,
     LazyRuntimes,
     attach_local_runtimes,
+    capabilities,
     weights_dir_for,
 )
+from media_engine.models.registry import get_model
 from media_engine.models.runner import bound_runtime
 
 
@@ -48,11 +50,21 @@ class WeightsDirTests(unittest.TestCase):
             weights_dir_for(root, "audio.tts"), weights_dir_for(root, "audio.voice_clone"),
         )
 
-    def test_every_loader_covers_a_capability_the_schema_accepts(self) -> None:
+    def test_every_loader_names_a_model_the_registry_knows(self) -> None:
         from media_engine.models.schema import KINDS
-        for capability in local_bind.LOADERS:
+        for model_id in local_bind.MODEL_LOADERS:
+            spec = get_model(model_id)
+            self.assertIn(spec.capability, KINDS)
+        for capability in capabilities():
             self.assertIn(capability, KINDS)
-            self.assertIsNotNone(weights_dir_for(Path("/models"), capability))
+
+    def test_language_picks_the_model_that_speaks_it(self) -> None:
+        root = Path("/models")
+        turkish = weights_dir_for(root, "audio.tts", "Turkish")
+        english = weights_dir_for(root, "audio.tts", "English")
+        self.assertEqual(turkish, root / "freyavoice/Freya-TTS")
+        self.assertEqual(english, root / "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+        self.assertNotEqual(turkish, english)
 
 
 class AttachTests(unittest.TestCase):
@@ -107,16 +119,16 @@ class LazyRuntimesTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.table = LazyRuntimes(Path(self.tmp.name))
         self.loads: list[str] = []
-        self._real = dict(local_bind.LOADERS)
+        self._real = dict(local_bind.MODEL_LOADERS)
 
-        def loader(capability):
+        def loader(model_id):
             def load(directory):
-                self.loads.append(capability)
+                self.loads.append(model_id)
                 return _Model()
             return load
 
-        local_bind.LOADERS = {name: loader(name) for name in self._real}
-        self.addCleanup(setattr, local_bind, "LOADERS", self._real)
+        local_bind.MODEL_LOADERS = {name: loader(name) for name in self._real}
+        self.addCleanup(setattr, local_bind, "MODEL_LOADERS", self._real)
 
     def test_an_empty_table_is_still_a_table(self) -> None:
         """bound_runtime reads the table as `getattr(...) or {}`.
@@ -140,7 +152,7 @@ class LazyRuntimesTests(unittest.TestCase):
         # gigabytes must wait for a job that is actually going to run.
         runtime.generate_custom_voice(text="hi")
         self.assertTrue(runtime.loaded())
-        self.assertEqual(self.loads, ["audio.tts"])
+        self.assertEqual(self.loads, ["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"])
 
     def test_a_capability_without_a_loader_returns_the_default(self) -> None:
         self.assertIsNone(self.table.get("image.generate"))
@@ -152,18 +164,33 @@ class LazyRuntimesTests(unittest.TestCase):
         self.assertIs(self.table.get("audio.tts"), injected)
         self.assertEqual(self.loads, [])
 
-    def test_only_one_capability_stays_resident(self) -> None:
+    def test_only_one_model_stays_resident(self) -> None:
         first = self.table.get("audio.tts")
         first.generate_custom_voice(text="hi")
-        self.assertEqual(self.table.resident, "audio.tts")
+        self.assertEqual(self.table.resident, "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
         second = self.table.get("music.generate")
-        self.assertEqual(self.table.resident, "music.generate")
-        self.assertNotIn("audio.tts", self.table)
+        self.assertEqual(self.table.resident, "ACE-Step/ACE-Step-v1-3.5B")
+        self.assertNotIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", self.table)
         self.assertIsNot(first, second)
         # Asking again rebuilds it rather than handing back a dropped model.
         third = self.table.get("audio.tts")
         self.assertIsNot(third, first)
-        self.assertNotIn("music.generate", self.table)
+        self.assertNotIn("ACE-Step/ACE-Step-v1-3.5B", self.table)
+
+    def test_two_models_of_one_capability_do_not_share_a_runtime(self) -> None:
+        """Turkish and English speech are different checkpoints.
+
+        Handing a Turkish job the English runtime would synthesize the wrong
+        language with the wrong voice, so the table answers by model.
+        """
+        english = self.table.for_model("audio.tts", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+        turkish = self.table.for_model("audio.tts", "freyavoice/Freya-TTS")
+        self.assertIsNot(english, turkish)
+        self.assertEqual(turkish.capability, "freyavoice/Freya-TTS")
+        self.assertEqual(self.table.resident, "freyavoice/Freya-TTS")
+
+    def test_an_unknown_model_has_no_runtime(self) -> None:
+        self.assertIsNone(self.table.for_model("audio.tts", "someone/else"))
 
     def test_the_same_capability_is_not_reloaded(self) -> None:
         runtime = self.table.get("audio.tts")
@@ -171,7 +198,7 @@ class LazyRuntimesTests(unittest.TestCase):
         again = self.table.get("audio.tts")
         self.assertIs(again, runtime)
         again.generate_custom_voice(text="again")
-        self.assertEqual(self.loads, ["audio.tts"])
+        self.assertEqual(self.loads, ["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"])
 
     def test_a_runtime_that_is_called_rather_than_addressed_still_resolves(self) -> None:
         runtime = self.table.get("video.text_to_video")

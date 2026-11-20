@@ -14,27 +14,48 @@ from typing import Callable, Optional
 
 from media_engine.models import runtimes
 from media_engine.models.errors import AdapterError
-from media_engine.models.registry import primary_for
+from media_engine.models.registry import get_model, primary_for, primary_for_language
 
 ENV_ENABLED = "MEDIA_ENGINE_LOCAL_MODELS"
 ENV_WEIGHTS_DIR = "MEDIA_ENGINE_WEIGHTS_DIR"
 ENV_TIMEOUT = "MEDIA_ENGINE_MULTIMODAL_TIMEOUT_SECONDS"
 
-#: capability -> loader, each taking that model's own weights directory
-LOADERS: dict[str, Callable[[str], object]] = {
-    "audio.transcribe": runtimes.load_whisper,
-    "audio.tts": runtimes.load_qwen_tts,
-    "audio.voice_clone": lambda directory: runtimes.load_qwen_tts(directory, clone=True),
-    "audio.translate": runtimes.load_translator,
-    "image.edit": runtimes.load_image_edit,
-    "music.generate": runtimes.load_music,
-    "video.text_to_video": runtimes.load_wan,
+#: model id -> loader, each taking that model's own weights directory.
+#: Keyed by model rather than capability because one capability can be served
+#: by more than one model: Turkish speech needs a different checkpoint than
+#: English, and each has its own weights and its own loader.
+MODEL_LOADERS: dict[str, Callable[[str], object]] = {
+    "Systran/faster-whisper-large-v3": runtimes.load_whisper,
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice": runtimes.load_qwen_tts,
+    "Qwen/Qwen3-TTS-12Hz-1.7B-Base": lambda directory: runtimes.load_qwen_tts(directory, clone=True),
+    "freyavoice/Freya-TTS": runtimes.load_freya,
+    "Qwen/Qwen2.5-1.5B-Instruct": runtimes.load_translator,
+    "Qwen/Qwen-Image-Edit": runtimes.load_image_edit,
+    "ACE-Step/ACE-Step-v1-3.5B": runtimes.load_music,
+    "Wan-AI/Wan2.1-T2V-1.3B": runtimes.load_wan,
 }
 
 
-def weights_dir_for(root: Path, capability: str) -> Path:
-    """Where this capability's primary model keeps its files."""
-    spec = primary_for(capability)
+def capabilities() -> tuple[str, ...]:
+    """Capabilities some loadable model can serve."""
+    found: list[str] = []
+    for model_id in MODEL_LOADERS:
+        try:
+            capability = get_model(model_id).capability
+        except KeyError:
+            continue
+        if capability not in found:
+            found.append(capability)
+    return tuple(found)
+
+
+def weights_dir_for(root: Path, capability: str, language: str | None = None) -> Path:
+    """Where the model serving this capability keeps its files.
+
+    With a language, the model that speaks it decides the directory, so Turkish
+    speech does not get pointed at the English checkpoint's weights.
+    """
+    spec = primary_for_language(capability, language) if language else primary_for(capability)
     if spec is None:
         raise AdapterError("CAPABILITY_UNAVAILABLE")
     return Path(root) / spec.model_id
@@ -96,25 +117,39 @@ class LazyRuntimes(dict):
         """
         return True
 
-    def get(self, capability, default=None):  # type: ignore[override]
-        present = super().get(capability)
+    def for_model(self, capability, model_id, default=None):
+        """The runtime for one named model of this capability."""
+        injected = super().get(capability)
+        if injected is not None:
+            return injected
+        key = str(model_id)
+        present = super().get(key)
         if present is not None:
             return present
-        name = str(capability)
-        loader = LOADERS.get(name)
+        loader = MODEL_LOADERS.get(key)
         if loader is None:
             return default
         # One model at a time. The controller's own gate already refuses a
         # second capability while one is resident, so keeping the previous
         # model would hold gigabytes nothing can reach.
-        if self.resident is not None and self.resident != capability:
+        if self.resident is not None and self.resident != key:
             super().pop(self.resident, None)
             self.resident = None
-        directory = str(weights_dir_for(self.root, name))
-        runtime = Deferred(name, lambda: loader(directory))
-        self[capability] = runtime
-        self.resident = name
+        directory = str(Path(self.root) / key)
+        runtime = Deferred(key, lambda: loader(directory))
+        self[key] = runtime
+        self.resident = key
         return runtime
+
+    def get(self, capability, default=None):  # type: ignore[override]
+        injected = super().get(capability)
+        if injected is not None:
+            return injected
+        spec = primary_for(str(capability))
+        if spec is None:
+            return default
+        found = self.for_model(capability, spec.model_id, default)
+        return default if found is None else found
 
 
 def attach_local_runtimes(controller, source: Optional[dict] = None) -> bool:

@@ -22,7 +22,7 @@ from media_engine.models.invoke import (
     invoke_video,
     invoke_voice_clone,
 )
-from media_engine.models.registry import primary_for
+from media_engine.models.registry import primary_for, primary_for_language
 from media_engine.models.schema import _upload_store
 from media_engine.storage.artifacts import Artifact
 
@@ -89,7 +89,10 @@ def execute_multimodal(controller, job: Job) -> None:
     body = json.loads(job.task or "{}")
     kind = str(body.get("kind") or "")
     payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
-    spec = primary_for(kind)
+    # The language decides which model serves the job: no open speech
+    # checkpoint covers every language we offer.
+    language = str(payload.get("language") or "") if isinstance(payload, dict) else ""
+    spec = primary_for_language(kind, language) or primary_for(kind)
     gate = _gate(controller)
     if spec is None or gate["resident"] not in (None, spec.model_id):
         controller._fail(job, "MODEL_BUSY" if spec is not None else "CAPABILITY_UNAVAILABLE")
@@ -109,7 +112,7 @@ def execute_multimodal(controller, job: Job) -> None:
         except Exception as exc:
             controller._fail(job, getattr(exc, "code", "BILLING_UNAVAILABLE"))
             return
-        runtime = bound_runtime(controller, kind)
+        runtime = bound_runtime(controller, kind, getattr(spec, "model_id", None))
         timeout = float(getattr(controller, "multimodal_timeout", 30.0))
         cancel = getattr(controller, "multimodal_cancel", None)
         if cancel is None:
@@ -147,8 +150,25 @@ def execute_multimodal(controller, job: Job) -> None:
             gate["resident"] = None
 
 
-def bound_runtime(controller, kind: str):
-    table = getattr(controller, "multimodal_runtimes", None) or {}
+def bound_runtime(controller, kind: str, model_id: str | None = None):
+    """The runtime bound for this capability, or for one named model of it.
+
+    A table is absent only when it is None. Reading it as `or {}` discarded an
+    empty but perfectly real table, which made a lazily loading table report
+    every capability as unavailable.
+
+    When a capability is served by more than one model, the caller passes the
+    model it chose, so a Turkish request cannot be handed the English model's
+    runtime. A plain dict has no per-model view and keeps answering by
+    capability, which is what an injected runtime wants.
+    """
+    table = getattr(controller, "multimodal_runtimes", None)
+    if table is None:
+        return None
+    if model_id is not None:
+        for_model = getattr(table, "for_model", None)
+        if for_model is not None:
+            return for_model(kind, model_id)
     return table.get(kind)
 
 
@@ -181,8 +201,11 @@ def _precheck(controller, user_id: str, kind: str, payload: dict) -> None:
     elif kind == "image.edit":
         _owned_bytes(controller, user_id, payload.get("source_upload_id"), "image")
     elif kind == "audio.tts":
-        from media_engine.models.invoke import SPEAKERS
-        if payload.get("voice") not in SPEAKERS:
+        # Validate against the voices the model that will serve this language
+        # actually has. A single global list both accepted names the serving
+        # model has never heard of and refused the ones it does have.
+        from media_engine.models.invoke import voices_for_language
+        if payload.get("voice") not in voices_for_language(str(payload.get("language") or "")):
             raise AdapterError("SPEAKER_UNSUPPORTED")
 
 
