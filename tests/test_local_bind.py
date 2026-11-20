@@ -58,6 +58,36 @@ class WeightsDirTests(unittest.TestCase):
         for capability in capabilities():
             self.assertIn(capability, KINDS)
 
+    def test_every_diffusers_model_is_checked_for_its_pipeline_index(self) -> None:
+        """A diffusers repository without model_index.json cannot be loaded.
+
+        DiffusionPipeline reads its pipeline class from that file, so a
+        repository laid out any other way fails at load time, which on the paid
+        path means after a GPU has been rented. Requiring the file in the
+        readiness check turns that into a refusal that costs nothing. This is
+        exactly how the video model was found pointing at the original Wan
+        layout rather than the -Diffusers one.
+        """
+        from media_engine.models.runtimes import _FILES
+        checked = 0
+        for model_id in local_bind.MODEL_LOADERS:
+            spec = get_model(model_id)
+            if "diffusers" not in spec.runtime:
+                continue
+            self.assertIn("model_index.json", _FILES[model_id], model_id)
+            checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_the_music_loader_refuses_instead_of_attempting_diffusers(self) -> None:
+        """ACE-Step has no diffusers pipeline, so the loader says so plainly."""
+        from media_engine.models.errors import AdapterError
+        from media_engine.models.runtimes import load_music
+        with self.assertRaises(AdapterError) as refused:
+            load_music("/nonexistent-weights-dir")
+        # The weights check runs first, so a missing directory still reports
+        # that; the dependency is what blocks it once the weights are staged.
+        self.assertIn(refused.exception.code, {"WEIGHTS_NOT_PRESENT", "DEPENDENCY_MISSING"})
+
     def test_language_picks_the_model_that_speaks_it(self) -> None:
         root = Path("/models")
         turkish = weights_dir_for(root, "audio.tts", "Turkish")

@@ -21,7 +21,10 @@ _FILES = {
     "Qwen/Qwen2.5-1.5B-Instruct": ("model.safetensors", "config.json"),
     "Qwen/Qwen-Image-Edit": ("model_index.json",),
     "ACE-Step/ACE-Step-v1-3.5B": ("config.json",),
-    "Wan-AI/Wan2.1-T2V-1.3B": ("config.json",),
+    # model_index.json is what DiffusionPipeline reads to find its pipeline
+    # class. A repository without it cannot be loaded at all, so requiring it
+    # here turns a late runtime failure into a readiness check.
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": ("model_index.json",),
     "freyavoice/Freya-TTS": ("model.safetensors", "config.json"),
 }
 
@@ -76,15 +79,22 @@ def load_image_edit(weights_dir: str):
 
 
 def load_music(weights_dir: str):
-    root = weights_ready("ACE-Step/ACE-Step-v1-3.5B", weights_dir)
-    diffusers = _import("diffusers")
-    return diffusers.DiffusionPipeline.from_pretrained(
-        str(root), local_files_only=True, dtype=load_dtype(),
-    )
+    """ACE-Step does not load through diffusers, so this refuses early.
+
+    DiffusionPipeline finds its pipeline class in model_index.json, and the
+    ACE-Step repository has no such file: its own config.json declares
+    ACEStepTransformer2DModel, a class diffusers does not contain, and there is
+    no acestep package on PyPI either. Running it means installing ACE-Step
+    from its own repository and calling its pipeline. Until that exists,
+    refusing here is honest; attempting the load would fail later with a
+    diffusers error that says nothing about the real cause.
+    """
+    weights_ready("ACE-Step/ACE-Step-v1-3.5B", weights_dir)
+    raise AdapterError("DEPENDENCY_MISSING")
 
 
 def load_wan(weights_dir: str):
-    root = weights_ready("Wan-AI/Wan2.1-T2V-1.3B", weights_dir)
+    root = weights_ready("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", weights_dir)
     diffusers = _import("diffusers")
     pipeline = getattr(diffusers, "WanPipeline", None)
     if pipeline is None:

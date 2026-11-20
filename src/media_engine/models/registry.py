@@ -308,13 +308,13 @@ CATALOG: tuple[ModelSpec, ...] = (
         ada_fit="unmeasured",
     ),
     _spec(
-        model_id="Wan-AI/Wan2.1-T2V-1.3B",
+        model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         capability="video.text_to_video",
-        revision="37ec512624d61f7aa208f7ea8140a131f93afc9a",
+        revision="0fad780a534b6463e45facd96134c9f345acfa5b",
         license_name="apache-2.0",
         license_status="reviewed",
         commercial_use="allowed",
-        storage_bytes=46_519_465_450,
+        storage_bytes=28_935_653_511,
         vram_mib=8190,
         vram_note="Model card says the 1.3B text-to-video model requires 8.19GB. This engine did not remeasure it.",
         languages=("en", "zh"),
@@ -327,9 +327,15 @@ CATALOG: tuple[ModelSpec, ...] = (
         outputs=("video/mp4",),
         defaults=(("resolution", "480p"), ("duration_seconds", "5"), ("fps", "16")),
         cost_profile="wan-t2v-5s",
-        readiness="OFFLINE_TESTED",
+        readiness="LICENSE_REVIEWED",
         role="primary",
-        evidence="Hub license is apache-2.0 and the revision is pinned. No local or GPU run.",
+        evidence=(
+            "The repository this capability pointed at, Wan-AI/Wan2.1-T2V-1.3B, has no "
+            "model_index.json, so DiffusionPipeline.from_pretrained cannot load it at "
+            "all: that is the original Wan layout, not the diffusers one. The -Diffusers "
+            "repository does have it. Hub license is apache-2.0 and the hub reports 28.94 "
+            "GB across 31 files. Nothing has been run against it."
+        ),
         ada_fit="documented",
     ),
     _spec(

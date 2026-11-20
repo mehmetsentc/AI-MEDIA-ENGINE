@@ -32,7 +32,7 @@ MODEL_LOADERS: dict[str, Callable[[str], object]] = {
     "Qwen/Qwen2.5-1.5B-Instruct": runtimes.load_translator,
     "Qwen/Qwen-Image-Edit": runtimes.load_image_edit,
     "ACE-Step/ACE-Step-v1-3.5B": runtimes.load_music,
-    "Wan-AI/Wan2.1-T2V-1.3B": runtimes.load_wan,
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": runtimes.load_wan,
 }
 
 
