@@ -1,8 +1,8 @@
 {
   "repository": "ghcr.io/mehmetsentc/ai-media-engine-speech-worker",
-  "tag": "",
-  "digest": "",
-  "pinned_reference": "",
+  "tag": "sha-4abbe0db80ad7a546ec1e4e9859be326d1f7c312",
+  "digest": "sha256:0dd7a3fefe9a42e5584abe17c33a86d8fa2de9317f8886eb8d7b414ffff754b1",
+  "pinned_reference": "ghcr.io/mehmetsentc/ai-media-engine-speech-worker@sha256:0dd7a3fefe9a42e5584abe17c33a86d8fa2de9317f8886eb8d7b414ffff754b1",
   "previous_digest": "",
   "cuda_gpu_support": false
 }

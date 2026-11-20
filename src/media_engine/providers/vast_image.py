@@ -781,7 +781,11 @@ class VastImageProvider(GPUProvider):
             return Quote(hourly_price_usd=self.hourly_amount, provider="vast")
         if self._live7_bound():
             return self._quote_live7(owner)
-        if not self._volume_ready():
+        # The warm volume is an optimisation, not a precondition. When it is
+        # gone but cold staging is configured, the R2 path can still serve the
+        # model, so refusing here would strand a working provider.
+        self._volume_ready_flag = self._volume_ready()
+        if not self._volume_ready_flag and not (cold_stage_allowed() and _r2_configured()):
             raise WorkerStageError("PROVIDER_CAPACITY_UNAVAILABLE")
         chosen = self._select_offer()
         if chosen is None:
@@ -1887,7 +1891,21 @@ class VastImageProvider(GPUProvider):
         self._attach_and_wait(self._resource_id)
 
     def _fetch_png(self) -> bytes:
-        code, out, _err = self._remote("base64 /workspace/phase2d_output.png", 120)
+        # A 1024x1024 PNG is megabytes; streaming it as base64 through a
+        # command's stdout over a proxied SSH hop is what failed in the live
+        # run. Copy the file first and keep the old path as a fallback.
+        if self._host and self._port:
+            try:
+                from media_engine.providers.vast_ssh import WorkerSSH
+                worker = getattr(self, "_worker_ssh", None) or WorkerSSH(self.runtime)
+                target = Path(self.runtime) / "phase2d_output.png"
+                worker.fetch(self._host, self._port, "/workspace/phase2d_output.png", target)
+                data = target.read_bytes()
+                if data.startswith(b"\x89PNG\r\n\x1a\n"):
+                    return data
+            except Exception:
+                pass
+        code, out, _err = self._remote("base64 /workspace/phase2d_output.png", 300)
         if code != 0 or not out.strip():
             raise WorkerStageError("ARTIFACT_TRANSFER_FAILED")
         import base64
@@ -1974,7 +1992,7 @@ class VastImageProvider(GPUProvider):
                 "gpu_ram": {"gte": MIN_VRAM_MIB},
             }),
             volume_machine=MACHINE_ID,
-            volume_ready=True,
+            volume_ready=getattr(self, "_volume_ready_flag", False),
             max_hourly=self.limits.max_hourly_price_usd,
             operation_budget=active_operation_budget(),
             allow_cold_stage=False,
@@ -1991,7 +2009,7 @@ class VastImageProvider(GPUProvider):
                 "order": [["dph_total", "asc"]],
             }),
             volume_machine=MACHINE_ID,
-            volume_ready=True,
+            volume_ready=getattr(self, "_volume_ready_flag", False),
             max_hourly=self.limits.max_hourly_price_usd,
             operation_budget=active_operation_budget(),
             allow_cold_stage=True,
@@ -2367,6 +2385,27 @@ class ImageChoice:
     reliability: float
     transfer_seconds: float = 0.0
     cost_before_generation: Decimal = Decimal("0")
+    verified: bool = False
+
+
+def min_reliability() -> float:
+    """Operator floor for a host's measured reliability. Vast reports this as
+    reliability2; the default rejects hosts that visibly drop jobs."""
+    raw = os.environ.get("MEDIA_ENGINE_MIN_RELIABILITY", "").strip()
+    if not raw:
+        return 0.95
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.95
+    if value < 0 or value > 1:
+        return 0.95
+    return value
+
+
+def is_verified(row: dict) -> bool:
+    """Vast marks audited hosts as verification == "verified"."""
+    return str(row.get("verification") or "").strip().casefold() == "verified"
 
 
 def supports_bf16(name: str) -> bool:
@@ -2659,6 +2698,13 @@ def choose_offer(
             reliability = float(row.get("reliability2") or 0)
         except (WorkerStageError, TypeError, ValueError):
             continue
+        # Apply the floor only when the provider actually reported a figure.
+        # A missing field means "unknown", not "unreliable", and dropping those
+        # offers would refuse every marketplace that does not publish the
+        # metric at all.
+        if row.get("reliability2") not in (None, "") and reliability < min_reliability():
+            continue
+        verified = is_verified(row)
         if on_warm:
             window = warm_verify_window(hourly, operation_budget)
             if not window["fits"]:
@@ -2688,18 +2734,21 @@ def choose_offer(
             reliability=reliability,
             transfer_seconds=transfer,
             cost_before_generation=before,
+            verified=verified,
         )
         (warm if on_warm else cold).append(choice)
     affordable = [item for item in warm if item.hourly <= max_hourly]
     if affordable:
-        affordable.sort(key=lambda item: (item.hourly, -item.reliability))
+        # An unverified host that cannot pull the image costs a whole failed
+        # run, which dwarfs the few cents saved by picking the cheapest offer.
+        affordable.sort(key=lambda item: (0 if item.verified else 1, item.hourly, -item.reliability))
         return affordable[0]
     if not allow_cold_stage:
         return None
     pool = [item for item in cold if item.hourly <= max_hourly] or cold
     if not pool:
         return None
-    pool.sort(key=lambda item: (item.projected_cost, -item.reliability))
+    pool.sort(key=lambda item: (0 if item.verified else 1, item.projected_cost, -item.reliability))
     return pool[0]
 
 

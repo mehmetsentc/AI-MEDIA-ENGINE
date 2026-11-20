@@ -292,10 +292,15 @@ class SpeechExecutionTests(unittest.TestCase):
         self.assertNotIn("faster-whisper", dockerfile)
         self.assertNotIn("speech_probe", dockerfile)
         self.assertFalse((ROOT / "deploy" / "worker" / "speech" / "image_ref.json").read_text(encoding="utf-8").find("sha256:be2c96a09947") >= 0)
+        # The speech image is built and published, so the committed ref now
+        # pins it by digest and has to pass every pin check. It must still not
+        # claim CUDA: that is proven by a GPU probe, never by a file.
         committed = load_image_ref(speech_image_ref_path())
-        with self.assertRaises(WorkerStageError) as unverified:
-            assess_speech_image_ref(committed)
-        self.assertEqual(unverified.exception.code, "IMAGE_UNVERIFIED")
+        self.assertEqual(assess_speech_image_ref(committed), committed)
+        self.assertIs(committed.get("cuda_gpu_support"), False)
+        with self.assertRaises(WorkerStageError) as claimed:
+            assess_speech_image_ref(dict(committed, cuda_gpu_support=True))
+        self.assertEqual(claimed.exception.code, "IMAGE_UNVERIFIED")
         with self.assertRaises(WorkerStageError) as mutable:
             assess_speech_image_ref({
                 "repository": SPEECH_REPOSITORY,
@@ -348,16 +353,25 @@ class SpeechExecutionTests(unittest.TestCase):
         self.assertIn("platforms: linux/amd64", workflow)
         self.assertIn("file: deploy/worker/speech/Dockerfile", workflow)
         tags = [line for line in workflow.splitlines() if line.strip().startswith("tags:")]
+        # The tag has to name the commit that was actually built. This workflow
+        # is dispatch-only and checks out inputs.source_sha, so github.sha is the
+        # branch the dispatch came from, not the build input -- tagging with it
+        # would label the image with a commit it does not contain. The workflow
+        # asserts HEAD == source_sha before building, which makes source_sha the
+        # only honest tag.
         self.assertEqual(tags, [
-            "          tags: ghcr.io/${{ github.repository_owner }}/ai-media-engine-speech-worker:sha-${{ github.sha }}",
+            "          tags: ghcr.io/${{ github.repository_owner }}/ai-media-engine-speech-worker:sha-${{ inputs.source_sha }}",
         ])
         self.assertIn("secrets.GITHUB_TOKEN", workflow)
         self.assertNotIn("echo ${{ secrets.GITHUB_TOKEN }}", workflow)
         self.assertIn("speech-image-ref", workflow)
+        # A digest that is not the one committed for the speech image is refused.
+        # Before the image was built this failed earlier, at the reference check;
+        # now the reference verifies and the mismatch itself is what stops it.
         issued = _speech(authorization_id="speech-auth-unverified", execution_id="speech-run-unverified")
-        with self.assertRaises(WorkerStageError) as unverified:
+        with self.assertRaises(WorkerStageError) as mismatched:
             accept_speech_record(issued, now=5_000, code_sha=SHA, recorded_digest=DIGEST)
-        self.assertEqual(unverified.exception.code, "IMAGE_UNVERIFIED")
+        self.assertEqual(mismatched.exception.code, "IMAGE_DIGEST")
         with self.assertRaises(WorkerStageError) as mutable_digest:
             _speech(worker_digest="latest")
         self.assertEqual(mutable_digest.exception.code, "IMAGE_DIGEST")
