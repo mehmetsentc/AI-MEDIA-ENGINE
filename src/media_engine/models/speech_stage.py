@@ -13,7 +13,7 @@ from pathlib import Path
 
 from media_engine.infra.volume_audit import VOLUME_ID
 from media_engine.models.lifecycle import SCRATCH_BYTES
-from media_engine.models.speech_inventory import TARGETS
+from media_engine.models.speech_inventory import EXTRA_TARGETS, TARGETS
 
 CHUNK = 1024 * 1024
 SPEECH_PREFIX = "speech"
@@ -28,11 +28,22 @@ class SpeechPrepError(Exception):
 
 
 def targets() -> tuple[dict, ...]:
+    """The speech session's pinned pair.
+
+    Deliberately not every stageable model: the authorization pins one model
+    per capability from this and the staging disk budget sums it, so anything
+    extra here reads as model substitution or inflates the budget.
+    """
     return TARGETS
 
 
+def all_targets() -> tuple[dict, ...]:
+    """Every model that can be staged. No budget or pin is derived from this."""
+    return TARGETS + EXTRA_TARGETS
+
+
 def target(model_id: str) -> dict:
-    for item in TARGETS:
+    for item in all_targets():
         if item["model_id"] == model_id:
             return item
     raise SpeechPrepError("MODEL_UNKNOWN")
