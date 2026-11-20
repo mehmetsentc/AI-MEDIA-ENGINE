@@ -52,6 +52,30 @@ class WorkerSSH:
             path = Path(module.__file__)
             self._copy(host, port, path, "/workspace/" + path.name)
 
+    def stage_media(self, host: str, port: str) -> dict:
+        """Ship the whole package so the worker runs the same dispatch we do.
+
+        The image path copies two files and lets the worker script re-import
+        them by path. Media needs invoke, the registry and the audio and video
+        helpers, so copying file by file would mean a second set of import
+        fallbacks to keep in step. The package is a few hundred kilobytes.
+        """
+        from media_engine.providers.media_run import (
+            REMOTE_ARCHIVE,
+            install_command,
+            package_archive,
+        )
+
+        self._ensure()
+        source = Path(__file__).resolve().parents[1]
+        report = package_archive(source, self.runtime / "media_engine.tgz")
+        self.run(host, port, "mkdir -p /workspace", 30)
+        self._copy(host, port, Path(report["path"]), REMOTE_ARCHIVE)
+        code, out, err = self.run(host, port, install_command(), 120)
+        if code != 0 or "REMOTE_READY" not in out:
+            raise WorkerStageError("REMOTE_INSTALL_FAILED")
+        return report
+
     def _copy(self, host: str, port: str, local: Path, remote: str) -> None:
         subprocess.run(
             [
