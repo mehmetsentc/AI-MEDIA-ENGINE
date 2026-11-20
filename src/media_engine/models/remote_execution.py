@@ -83,10 +83,23 @@ def authorized_models(authorization) -> set[tuple[str, str]]:
     return pairs
 
 
-def run_media_job(
+def run_media_job(authorization, *, job: dict, artifact_path, **kwargs) -> dict:
+    """One job on one instance. A thin wrapper over the batch below."""
+    report = run_media_jobs(
+        authorization, jobs=[job], artifact_paths=[artifact_path], **kwargs,
+    )
+    first = report["jobs"][0]
+    merged = dict(report)
+    merged.pop("jobs", None)
+    merged.update(first)
+    merged["status"] = report["status"]
+    return merged
+
+
+def run_media_jobs(
     authorization,
     *,
-    job: dict,
+    jobs: list,
     provider,
     worker,
     platform,
@@ -101,22 +114,29 @@ def run_media_job(
     clock,
     host: str,
     port: str,
-    artifact_path: Path,
+    artifact_paths: list,
     stage_weights,
     volume_id: int | None = None,
     image_ref: dict | None = None,
     env: dict | None = None,
     run_timeout: int = 900,
 ) -> dict:
-    """Run one media job on a rented worker and bring the artifact home."""
+    """Run several jobs on ONE rented worker and bring every artifact home.
+
+    One instance, not one per job. Renting a second machine for the second
+    capability would double the bill and break the authorization's own
+    max_creates=1; the rehearsal has always run both models on one instance
+    and the paid path has to match it.
+    """
     if not rental_approved(env):
         # Before create. Nothing is rented, nothing is billed, nothing to undo.
         raise SpeechPrepError("GPU_RENTAL_REFUSED")
 
-    capability = str(job.get("capability") or "")
-    model_id = str(job.get("model_id") or "")
-    if not capability or not model_id:
+    if not jobs or len(jobs) != len(artifact_paths):
         raise SpeechPrepError("JOB_INCOMPLETE")
+    for job in jobs:
+        if not str(job.get("capability") or "") or not str(job.get("model_id") or ""):
+            raise SpeechPrepError("JOB_INCOMPLETE")
 
     accept_speech_record(
         authorization,
@@ -126,12 +146,22 @@ def run_media_job(
         volume_id=volume_id,
         image_ref=image_ref,
     )
-    if (model_id, str(job.get("revision") or "")) not in authorized_models(authorization):
+    allowed = authorized_models(authorization)
+    for job in jobs:
         # The authorization names the checkpoints, revision and all. Matching
         # on the model name alone would let a different revision of the same
         # repository run on a machine this authorization paid for, which is
         # exactly the substitution the pins exist to prevent.
-        raise SpeechPrepError("MODEL_NOT_PINNED")
+        if (str(job["model_id"]), str(job.get("revision") or "")) not in allowed:
+            raise SpeechPrepError("MODEL_NOT_PINNED")
+    # The distinct models decide how many stages this instance needs. No
+    # separate cap is checked here: the pin list above already bounds the set,
+    # and accept_speech_record checks the stage allowance itself. A third
+    # check that can never fire would read as protection without being any.
+    wanted = []
+    for job in jobs:
+        if str(job["model_id"]) not in wanted:
+            wanted.append(str(job["model_id"]))
     if (int(machine_id), int(offer_id)) not in authorization.allowed_pairs:
         raise WorkerStageError("MACHINE_SCOPE")
     claim_execution_id(claim_path, authorization.execution_id)
@@ -153,41 +183,52 @@ def run_media_job(
     report: dict = {
         "rehearsal": False,
         "resource_id": created.resource_id,
-        "capability": capability,
-        "model_id": model_id,
         "creates": getattr(provider, "create_calls", 1),
+        "models": tuple(wanted),
         "deleted": False,
         "status": "FAILED",
+        "jobs": [],
     }
     try:
         _guard(budget, clock)
         package = worker.stage_media(host, port)
         report["package_sha256"] = package["sha256"]
 
-        _guard(budget, clock)
-        staged = stage_weights(worker, host, port, model_id)
+        staged: dict = {}
+        for model_id in wanted:
+            _guard(budget, clock)
+            staged[model_id] = stage_weights(worker, host, port, model_id)
         report["weights"] = staged
 
-        _guard(budget, clock)
-        command = job_command(
-            job, weights_root=WEIGHTS_ROOT, out_dir=OUT_DIR, in_dir=IN_DIR,
-            timeout_seconds=run_timeout,
-        )
-        code, out, err = worker.run(host, port, command, run_timeout)
-        if code != 0 and not out:
-            raise WorkerStageError("WORKER_FAILED")
-        receipt = parse_result(out)
-        report["receipt"] = receipt
+        for job, artifact_path in zip(jobs, artifact_paths):
+            _guard(budget, clock)
+            entry = {
+                "id": str(job.get("id") or ""),
+                "capability": str(job["capability"]),
+                "model_id": str(job["model_id"]),
+                "status": "FAILED",
+            }
+            report["jobs"].append(entry)
+            command = job_command(
+                job, weights_root=WEIGHTS_ROOT, out_dir=OUT_DIR, in_dir=IN_DIR,
+                timeout_seconds=run_timeout,
+            )
+            code, out, _err = worker.run(host, port, command, run_timeout)
+            if code != 0 and not out:
+                raise WorkerStageError("WORKER_FAILED")
+            receipt = parse_result(out)
+            entry["receipt"] = receipt
 
-        _guard(budget, clock)
-        remote = remote_artifact_path(OUT_DIR, receipt)
-        artifact_path = Path(artifact_path)
-        worker.fetch(host, port, remote, artifact_path)
-        data = artifact_path.read_bytes()
-        verify_artifact(data, receipt)
-        report["bytes"] = len(data)
-        report["sha256"] = receipt["sha256"]
-        report["artifact_path"] = str(artifact_path)
+            _guard(budget, clock)
+            remote = remote_artifact_path(OUT_DIR, receipt)
+            artifact_path = Path(artifact_path)
+            worker.fetch(host, port, remote, artifact_path)
+            data = artifact_path.read_bytes()
+            verify_artifact(data, receipt)
+            entry["bytes"] = len(data)
+            entry["sha256"] = receipt["sha256"]
+            entry["artifact_path"] = str(artifact_path)
+            entry["status"] = "COMPLETED"
         report["status"] = "COMPLETED"
     finally:
         # The machine goes away whether or not the job worked.

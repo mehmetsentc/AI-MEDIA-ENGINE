@@ -15,6 +15,7 @@ from pathlib import Path
 
 from media_engine.models.remote_execution import (
     RENTAL_ENV,
+    run_media_jobs,
     authorized_models,
     rental_approved,
     run_media_job,
@@ -271,6 +272,92 @@ class RemoteExecutionTests(unittest.TestCase):
             self._run(job={"id": "job1", "model_id": TTS, "revision": TTS_REVISION})
         self.assertEqual(caught.exception.code, "JOB_INCOMPLETE")
         self.assertEqual(self.provider.create_calls, 0)
+
+
+class BatchTests(unittest.TestCase):
+    """Two capabilities belong on ONE rented machine, not two."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.clock = _Clock()
+        self.provider = FakeGPUProvider(self.clock.now, hourly_price=decimal.Decimal("0.74"))
+        self.staged: list[str] = []
+
+    def _stage(self, worker, host, port, model_id):
+        self.staged.append(model_id)
+        return {"status": "COMPLETE", "model_id": model_id}
+
+    def _jobs(self):
+        return [
+            {"id": "j1", "capability": "audio.transcribe", "model_id": WHISPER,
+             "revision": WHISPER_REVISION, "input": "a.wav", "payload": {}},
+            {"id": "j2", "capability": "audio.tts", "model_id": TTS,
+             "revision": TTS_REVISION,
+             "payload": {"text": "merhaba", "language": "Turkish", "voice": "Vivian"}},
+        ]
+
+    def _run(self, worker=None, jobs=None, authorization=None):
+        jobs = jobs or self._jobs()
+        return run_media_jobs(
+            authorization or _speech(),
+            jobs=jobs,
+            artifact_paths=[self.root / "out" / (j["id"] + ".bin") for j in jobs],
+            provider=self.provider, worker=worker or _Worker(), platform=None,
+            user_id="nahaber", now=5_000, code_sha=SHA, recorded_digest=DIGEST,
+            claim_path=self.root / "claims", machine_id=501, offer_id=1001,
+            instance_id="i-1", clock=self.clock, host="1.2.3.4", port="22",
+            stage_weights=self._stage, image_ref=_verified_ref(), env=APPROVED,
+        )
+
+    def test_two_jobs_rent_one_machine_and_stage_each_model_once(self):
+        worker = _Worker()
+        report = self._run(worker)
+        self.assertEqual(report["status"], "COMPLETED")
+        self.assertEqual(self.provider.create_calls, 1, "a second machine was rented")
+        self.assertEqual(self.provider.terminate_calls, 1)
+        self.assertEqual(self.staged, [WHISPER, TTS])
+        self.assertEqual(len(worker.commands), 2)
+        self.assertEqual([j["status"] for j in report["jobs"]], ["COMPLETED", "COMPLETED"])
+
+    def test_two_jobs_on_one_model_stage_it_once(self):
+        jobs = self._jobs()
+        jobs[0] = dict(jobs[1], id="j0")
+        self._run(jobs=jobs)
+        self.assertEqual(self.staged, [TTS])
+
+    def test_a_model_outside_the_pins_stops_the_batch_before_create(self):
+        """What actually bounds the batch: the pin list, not a stage counter.
+
+        A narrowed max_model_stages is refused by the issuer and again by
+        accept_speech_record, so the batch size is bounded by how many models
+        the authorization names - two, for a speech session.
+        """
+        jobs = self._jobs()
+        jobs.append({
+            "id": "j3", "capability": "audio.tts", "model_id": "someone/else",
+            "revision": TTS_REVISION, "payload": {"text": "x"},
+        })
+        with self.assertRaises(SpeechPrepError) as caught:
+            self._run(jobs=jobs)
+        self.assertEqual(caught.exception.code, "MODEL_NOT_PINNED")
+        self.assertEqual(self.provider.create_calls, 0)
+        self.assertEqual(self.staged, [], "nothing was staged")
+
+    def test_a_failure_in_the_second_job_keeps_the_first_result_and_deletes(self):
+        class _Flaky(_Worker):
+            def run(self, host, port, command, timeout):
+                self.commands.append(command)
+                if len(self.commands) == 1:
+                    return _Worker.run(self, host, port, command, timeout)[0:1] + (
+                        _Worker.run(self, host, port, command, timeout)[1], "")
+                raise WorkerStageError("WORKER_TIMEOUT")
+
+        worker = _Flaky()
+        with self.assertRaises(WorkerStageError):
+            self._run(worker)
+        self.assertEqual(self.provider.terminate_calls, 1)
 
 
 if __name__ == "__main__":
